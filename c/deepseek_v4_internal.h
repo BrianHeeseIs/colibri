@@ -708,6 +708,12 @@ int coli_v4_expert_store_open_planned(
 ColiSafetensorsIndex *coli_v4_engine_target_index(ColiV4Engine *engine);
 ColiExpertStore *coli_v4_engine_expert_store(ColiV4Engine *engine);
 
+/* Persist the learned expert-usage history now, instead of only on engine destroy.
+ * Defined in the hot rows16 expert-store unit; called from the serve epilogue so a
+ * SIGINT/crash between turns no longer discards the session's routing history.
+ * Save-only: never repins, prewarms, loads or prefetches. Non-fatal on failure. */
+void coli_v4_expert_store_flush_usage(ColiExpertStore *store);
+
 /* Head-cache aware safetensors read (engine NULL => plain coli_st_read_at). */
 int coli_st_read_at_engine(ColiV4Engine *engine,
                            const ColiSafetensorsIndex *index, int shard,
@@ -721,9 +727,19 @@ int coli_st_read_at_engine(ColiV4Engine *engine,
 extern int coli_v4_test_fail_expert_store_open;
 extern int coli_v4_test_skip_expert_store_open;
 extern int coli_v4_test_closed_owned_index;
+/* Forces coli_v4_session_generate() to fail immediately AFTER prefill has run, so the
+ * expert lookups have already incremented policy->usage and the history written by the
+ * error-path flush is non-vacuous. Defined in the RUNTIME unit, checked in GENERATE_STATS. */
+extern int coli_v4_test_fail_generate_after_prefill;
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);
+/* Test-only forwarder to the static v4_flush_usage_epilogue() in the SAME translation
+ * unit as v4_serve_one. A separate test file cannot reference a static symbol, and the
+ * test MUST exercise the production epilogue body rather than calling
+ * coli_v4_expert_store_flush_usage() directly -- doing so would bypass the epilogue and
+ * prove nothing about the serve path. */
+void coli_v4_test_flush_usage_epilogue(ColiV4Engine *engine);
 #endif /* COLI_V4_TEST_HOOKS */
 
 #endif /* COLIBRI_DEEPSEEK_V4_INTERNAL_H */

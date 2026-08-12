@@ -363,13 +363,15 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
-TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership \
+               test_v4_generate_error_flush
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
+             tests/test_v4_generate_error_flush$(EXE)
 endif
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
@@ -901,6 +903,33 @@ $(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c deepseek_v4.h deepseek_
 
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
+
+# Error-path learning-cache flush test.
+# Unlike the ownership target's minimal four-object link set, this test drives
+# coli_v4_session_generate() and the v4_serve_one epilogue, so it needs the FULL
+# V4 unit set -- compiled here with -DCOLI_V4_TEST_HOOKS so the fault-injection flag
+# and the same-TU epilogue forwarder are present. Separate object dir keeps these
+# hook-enabled objects away from the production build.
+V4_FLUSH_DIR = build/flush
+# The main CFLAGS lack the V4-specific bits: -include pthread.h (the amalgamation calls
+# pthread_* directly, which the ownership target never hits with its 4-unit link set) and
+# _FILE_OFFSET_BITS/_DARWIN_C_SOURCE. Mirror Makefile.deepseek-v4's CFLAGS additions here.
+V4_FLUSH_CFLAGS = $(CFLAGS) -D_FILE_OFFSET_BITS=64 -include pthread.h \
+                  -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+                  -DCOLI_V4_TEST_HOOKS -DCOLI_V4_SKIP_GENERATE_MAIN
+V4_FLUSH_OBJS = $(addprefix $(V4_FLUSH_DIR)/,$(addsuffix .o,$(V4_TARGET_UNITS)))
+
+$(V4_FLUSH_DIR):
+	mkdir -p $(V4_FLUSH_DIR)
+
+$(V4_FLUSH_DIR)/%.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
+	deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
+	native_quant.h native_quant_batch.h native_quant_dual.h \
+	native_quant_fp4_rows16.h Makefile | $(V4_FLUSH_DIR)
+	$(CC) $(V4_FLUSH_CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+tests/test_v4_generate_error_flush$(EXE): tests/test_v4_generate_error_flush.c $(V4_FLUSH_OBJS)
+	$(CC) $(V4_FLUSH_CFLAGS) $< $(V4_FLUSH_OBJS) -o $@ -pthread $(LDFLAGS)
 
 endif
 

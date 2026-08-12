@@ -5615,6 +5615,30 @@ static V4HotPolicy *hot_find(ColiExpertStore *store) {
     return policy;
 }
 
+/* Persist the learned expert-usage history WITHOUT waiting for engine destroy.
+ *
+ * V4 previously wrote .coli_usage from exactly one site -- destroy_hot() below --
+ * so SIGINT, a crash or an OOM discarded the whole session's routing history and
+ * the history_total >= 5000 seed threshold could never be reached across restarts.
+ * GLM already flushes per turn ("la cache che impara non deve aspettare l'uscita").
+ *
+ * Save-only by design: no repin, no prewarm, no load, no prefetch -- this must not
+ * alter placement behaviour mid-run. Lock order: resolve the policy first (hot_find
+ * takes hot_policies_mutex and releases it), then take state->mutex. Callers invoke
+ * this outside any locked region, so there is no deadlock with lookup_hot/release/
+ * prefetch/stats, which all take the same state->mutex. Holding it here also stops a
+ * concurrent lookup_hot from tearing policy->usage while it is being written out.
+ * hot_usage_save() itself takes no locks and is void -- failure is non-fatal. */
+void coli_v4_expert_store_flush_usage(ColiExpertStore *store) {
+    if (!store || !store->state) return;
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy) return;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    hot_usage_save(policy, state);
+    pthread_mutex_unlock(&state->mutex);
+}
+
 #ifndef COLI_V4_PIN_RAMP_REQUESTS
 #define COLI_V4_PIN_RAMP_REQUESTS 0
 #endif
@@ -6290,6 +6314,10 @@ void coli_v4_layer_resident_reference_free(ColiV4Engine *engine,
 int coli_v4_test_fail_expert_store_open = 0;
 int coli_v4_test_skip_expert_store_open = 0;
 int coli_v4_test_closed_owned_index = 0;
+/* Set by the error-path flush test. Checked in the GENERATE_STATS unit immediately
+ * after prefill succeeds -- see coli_v4_session_generate(). Defined here alongside the
+ * other hooks; the two units link against this single non-static definition. */
+int coli_v4_test_fail_generate_after_prefill = 0;
 #endif
 
 void coli_v4_engine_attach_session(ColiV4Engine *engine) {
@@ -7819,6 +7847,19 @@ int coli_v4_session_generate(ColiV4Session *session,
     }
     session->state = state;
     session->next = next;
+#ifdef COLI_V4_TEST_HOOKS
+    /* Fault injection for the error-path flush test. Deliberately placed AFTER prefill
+     * has succeeded and AFTER the session has taken ownership of state/next:
+     *   - after prefill, so lookup_hot() has already incremented policy->usage and the
+     *     history the epilogue writes is non-vacuous rather than an empty file;
+     *   - after the ownership transfer, so returning here frees through the normal
+     *     session teardown instead of leaking the prefill buffers. */
+    if (coli_v4_test_fail_generate_after_prefill) {
+        if (error && error_size)
+            snprintf(error, error_size, "test: forced failure after prefill");
+        return -1;
+    }
+#endif
     /* The batch holds only the fresh tail, so the final row is at fresh-1
      * even though its absolute position is prompt_count-1. */
     const float *last = state + (size_t)(fresh - 1) * hd;
@@ -8386,6 +8427,25 @@ static int v4_serve_token(void *user_data, int token, float logit,
     return 0;
 }
 
+/* Common epilogue for a served turn: persist the learning cache exactly once per
+ * request, covering BOTH the success path and the generate-error early return.
+ *
+ * Deliberately static -- production encapsulation is preserved. The error-path test
+ * reaches this body through coli_v4_test_flush_usage_epilogue() below, which lives in
+ * this same translation unit (a separate test file cannot reference a static symbol).
+ * The test must go through THIS function: calling coli_v4_expert_store_flush_usage()
+ * directly would bypass the epilogue and prove nothing about the serve path. */
+static void v4_flush_usage_epilogue(ColiV4Engine *engine) {
+    if (engine && engine->experts)
+        coli_v4_expert_store_flush_usage(engine->experts);
+}
+
+#ifdef COLI_V4_TEST_HOOKS
+void coli_v4_test_flush_usage_epilogue(ColiV4Engine *engine) {
+    v4_flush_usage_epilogue(engine);   /* forwards to the production body above */
+}
+#endif
+
 static void v4_serve_error(const char *id, const char *message) {
     char clean[512];
     snprintf(clean, sizeof(clean), "%s", message && *message ? message : "engine request failed");
@@ -8440,6 +8500,11 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
     double elapsed = spec_now() - started;
+    /* The ONE production flush site. Placed before the error branch on purpose so a
+     * single call covers both exits: the early return below and the success path at
+     * the end of the function. A success-only flush would lose the counts accumulated
+     * during prefill whenever a request fails mid-generation. */
+    v4_flush_usage_epilogue(engine);
     if (result) {
         v4_serve_error(request->id, error);
         return;
