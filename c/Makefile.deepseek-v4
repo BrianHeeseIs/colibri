@@ -1,5 +1,8 @@
-# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux and Windows/MSYS2 only.
-# Uses GNU ld -Wl,--wrap and gcc -march; do not invoke from macOS/PowerPC
+# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux, Windows/MSYS2, macOS arm64.
+# NOTE: the historical comment claimed a GNU ld -Wl,--wrap dependency; there is none
+# in this file (LDFLAGS are just -lm -fopenmp -pthread). macOS support added by
+# mirroring c/Makefile's Apple-clang handling: -mcpu instead of -march, Homebrew
+# libomp for OpenMP, no _GNU_SOURCE.
 # `make check` (the parent Makefile gates COLI_V4_SUPPORTED).
 
 ifeq ($(OS),Windows_NT)
@@ -19,13 +22,46 @@ else ifeq ($(UNAME_S),Linux)
 ifneq (,$(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)))
 COLI_V4_OK := 1
 endif
+else ifeq ($(UNAME_S),Darwin)
+ifneq (,$(filter x86_64 arm64,$(UNAME_M)))
+COLI_V4_OK := 1
+IS_DARWIN := 1
+endif
 endif
 
 ifneq ($(COLI_V4_OK),1)
-$(error Makefile.deepseek-v4 supports only x86-64/aarch64 Linux and Windows/MSYS2)
+$(error Makefile.deepseek-v4 supports only x86-64/aarch64 Linux, Windows/MSYS2, and macOS)
 endif
 
-ifneq ($(IS_WIN),)
+ifneq ($(IS_DARWIN),)
+# --- macOS (Apple clang) ---
+# No -D_GNU_SOURCE (glibc-only). arm64 clang uses -mcpu, not -march.
+# OpenMP comes from Homebrew libomp exactly as in c/Makefile.
+CC = clang
+V4_OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+ifneq ($(and $(V4_OMPDIR),$(wildcard $(V4_OMPDIR)/include/omp.h),$(wildcard $(V4_OMPDIR)/lib/libomp.*)),)
+V4_OMPC = -Xclang -fopenmp -I$(V4_OMPDIR)/include
+V4_OMPL = -L$(V4_OMPDIR)/lib -lomp
+else
+$(warning libomp not found: DeepSeek V4 will build single-threaded. brew install libomp)
+V4_OMPC =
+V4_OMPL =
+endif
+CFLAGS = -D_DARWIN_C_SOURCE -D_FILE_OFFSET_BITS=64 -O3 $(V4_OMPC) -pthread \
+	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
+	-Wno-misleading-indentation -Wno-unused-function \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24
+ifneq ($(ARCH),)
+ifeq ($(UNAME_M),arm64)
+CFLAGS += -mcpu=$(ARCH)
+else
+CFLAGS += -march=$(ARCH)
+endif
+endif
+LDFLAGS = -lm $(V4_OMPL) -pthread
+V4_BINARY := deepseek_v4
+else ifneq ($(IS_WIN),)
 CC = gcc
 ARCH ?= x86-64-v3
 CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \

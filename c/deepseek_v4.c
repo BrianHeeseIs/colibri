@@ -642,6 +642,9 @@ void coli_v4_layer_free(ColiV4Engine *engine,
 #include <windows.h>
 #else
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>   /* host_statistics64: macOS equivalent of MemAvailable (#macos-port) */
+#endif
 #endif
 
 #define MIB UINT64_C(1048576)
@@ -684,9 +687,25 @@ uint64_t coli_v4_os_available_memory(void) {
         fclose(stream);
         if (kib) return (uint64_t)kib * 1024;
     }
+#ifdef __APPLE__
+    /* macOS has no _SC_AVPHYS_PAGES and no /proc/meminfo. Mirror colibri.c's
+     * mem_available_gb(): free + inactive + purgeable pages are the pages
+     * reclaimable without swapping, i.e. the same semantics as MemAvailable. */
+    {
+        mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+        vm_statistics64_data_t vm;
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                              (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return 0;
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) return 0;
+        return ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count +
+                (uint64_t)vm.purgeable_count) * (uint64_t)page_size;
+    }
+#else
     long pages = sysconf(_SC_AVPHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_size <= 0) return 0;
     return (uint64_t)pages * (uint64_t)page_size;
+#endif
 #endif
 }
 

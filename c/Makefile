@@ -344,6 +344,9 @@ ifneq (,$(AARCH64))
 ifneq (,$(LINUX))
 COLI_V4_SUPPORTED := 1
 endif
+ifneq (,$(DARWIN))
+COLI_V4_SUPPORTED := 1
+endif
 endif
 
 # Gates are exactly the tests that have a build rule further down -- derived from those
