@@ -1,0 +1,9 @@
+n,ts,wall_s,tokens,tok_s,question
+1,13:56:16,132,24,0.1818,"What is a mixture-of-experts model?"
+2,13:58:12,116,24,0.2069,"How does the router choose which experts to activate?"
+3,14:01:13,181,24,0.1326,"Why do MoE models activate only a few experts per token?"
+4,14:03:00,107,24,0.2243,"What is expert capacity and why does it matter in MoE?"
+5,14:04:42,102,24,0.2353,"How does MoE compare to a dense transformer of equal size?"
+6,14:06:33,111,24,0.2162,"What causes load imbalance between experts during MoE training?"
+7,14:08:28,115,24,0.2087,"How is an auxiliary loss used to balance MoE expert routing?"
+8,14:10:20,112,24,0.2143,"What are the memory trade-offs of serving an MoE model?"

@@ -1,0 +1,2 @@
+n,ts,wall_s,tokens,tok_s,prompt_tok,footprint_gb,rss_gb,gap_gb,comp_start_gb,comp_end_gb,gate,prewarm
+1,13:26:56,829,128,0.1544,124,64,63.6,0.4,2.5,2.1,ok,1
