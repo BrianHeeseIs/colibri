@@ -52,22 +52,24 @@ run_arm(){ # $1=draft $2=keep $3=label
   for P in "$P1" "$P2" "$P3" "$P4"; do
     n=$((n+1))
     cp "$SNAP" "$MODEL/.coli_usage"
-    local C0=$(comp) S=$(date +%s)
-    local OUTTXT
+    local C0 S OUTTXT
+    C0=$(comp); S=$(date +%s)
     OUTTXT=$(timeout 2400 env V4_DRAFT=$D V4_NGRAM=1 V4_NGRAM_PARTIAL_KEEP=$K \
       COLI_V4_SAVE_USAGE=0 ./c/deepseek_v4 "$MODEL" "$P" --max-tokens $NTOK --memory-gb $MEM 2>&1)
-    local E=$(date +%s) W=$((E-S)) C1=$(comp)
-    local T=$(echo "$OUTTXT" | grep -oE 'generated=[0-9]+' | head -1 | cut -d= -f2); T=${T:-0}
-    local SP=$(echo "$OUTTXT" | grep -oE 'attempts=[0-9]+ drafted=[0-9]+ accepted=[0-9]+ acceptance=[0-9.]+%? adaptive_disabled=[0-9]+' | tail -1)
-    local AT=$(echo "$SP"|grep -oE 'attempts=[0-9]+'|cut -d= -f2); AT=${AT:-0}
-    local DR=$(echo "$SP"|grep -oE 'drafted=[0-9]+'|cut -d= -f2); DR=${DR:-0}
-    local AC=$(echo "$SP"|grep -oE 'accepted=[0-9]+'|cut -d= -f2); AC=${AC:-0}
-    local AP=$(echo "$SP"|grep -oE 'acceptance=[0-9.]+'|cut -d= -f2); AP=${AP:-0}
-    local DIS=$(echo "$SP"|grep -oE 'adaptive_disabled=[0-9]+'|cut -d= -f2); DIS=${DIS:-NA}
-    local SHA=$(echo "$OUTTXT" | grep -m1 'generated_text=' | shasum -a256 | cut -c1-12)
-    local R=$(python3 -c "print(f'{$T/max(1,$W):.4f}')")
-    local CMAX=$(awk -v a="$C0" -v b="$C1" 'BEGIN{print (a>b)?a:b}')
-    local G=ok; awk -v c="$CMAX" 'BEGIN{exit !(c<20)}' || G=GATE_FAIL
+    local E W C1
+    E=$(date +%s); W=$((E-S)); C1=$(comp)
+    local T SP AT DR AC AP DIS SHA R CMAX G
+    T=$(echo "$OUTTXT" | grep -oE 'generated=[0-9]+' | head -1 | cut -d= -f2); T=${T:-0}
+    SP=$(echo "$OUTTXT" | grep -oE 'attempts=[0-9]+ drafted=[0-9]+ accepted=[0-9]+ acceptance=[0-9.]+%? adaptive_disabled=[0-9]+' | tail -1)
+    AT=$(echo "$SP"|grep -oE 'attempts=[0-9]+'|cut -d= -f2); AT=${AT:-0}
+    DR=$(echo "$SP"|grep -oE 'drafted=[0-9]+'|cut -d= -f2); DR=${DR:-0}
+    AC=$(echo "$SP"|grep -oE 'accepted=[0-9]+'|cut -d= -f2); AC=${AC:-0}
+    AP=$(echo "$SP"|grep -oE 'acceptance=[0-9.]+'|cut -d= -f2); AP=${AP:-0}
+    DIS=$(echo "$SP"|grep -oE 'adaptive_disabled=[0-9]+'|cut -d= -f2); DIS=${DIS:-NA}
+    SHA=$(echo "$OUTTXT" | grep -m1 'generated_text=' | shasum -a256 | cut -c1-12)
+    R=$(python3 -c "print(f'{$T/max(1,$W):.4f}')")
+    CMAX=$(awk -v a="$C0" -v b="$C1" 'BEGIN{print (a>b)?a:b}')
+    G=ok; awk -v c="$CMAX" 'BEGIN{exit !(c<20)}' || G=GATE_FAIL
     echo "$L,$D,$K,p$n,$W,$T,$R,$AT,$DR,$AC,$AP,$DIS,$SHA,$CMAX,$G" | tee -a "$OUT"
   done
 }
