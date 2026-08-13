@@ -1,0 +1,807 @@
+# DeepSeek-V4 Metal Backend — Experiments & Results
+
+Branch `ft-deepmetal`. Host: Apple M3 Max, 40 GPU cores, Metal 4, 128 GiB unified (137.4 GB
+decimal), macOS 26.6.1. Model: `models/deepseek-v4-flash` (48 shards, hidden=4096,
+moe_intermediate=2048, 256 routed experts, top-6, 43 layers, swiglu_limit=10.0).
+
+**Reading guide.** Every experiment below states its method, its raw numbers, and its verdict.
+Where a later experiment overturned an earlier claim, the retraction is kept inline rather than
+edited out — the retractions are the most useful part of this document.
+
+---
+
+## Context: why this work exists
+
+An earlier verdict said a Metal backend for V4 should be DEFERRED, on three stated blockers:
+V4's MoE math differs from the existing GLM Metal path (B1), CPU determinism makes exactness a
+hard requirement (B2), and a tensor-format allowlist appeared to exclude V4's weights (B3).
+
+The user overrode DEFER and asked for the backend to be built and measured. All three blockers
+were dissected and found **costly, not fatal** — B3 in particular turned out to be a red herring
+(the allowlist is real but irrelevant: V4 uses `COLI_TENSOR_FP4_NATIVE_BLOCK` + `COLI_SCALE_UE8M0`
+with `block_columns=32`, which is not the code path the allowlist gates).
+
+One structural fact drove the whole design: **V4's FP4 `block_columns` = 32 = the device's
+`threadExecutionWidth`.** One quantization block maps exactly onto one SIMD group.
+
+---
+
+## Part 1 — Feasibility probes
+
+### E1. Metal toolchain availability
+**Method.** `xcodebuild -downloadComponent MetalToolchain`, then compile a trivial `.metal` both
+offline (`metal` → `.air` → `metallib`) and at runtime (`newLibraryWithSource:`).
+**Result.** Toolchain installed (687.9 MB, exit 0). `metal 32023.883`, target
+`air64-apple-darwin25.6.0`. **Both** compilation paths work.
+**Verdict.** No toolchain blocker. Runtime source compilation is available as a fallback that
+needs no install path — this later became load-bearing.
+
+### E2. FP4 (E2M1) + UE8M0 decode on GPU
+**Method.** Decode FP4 weights with UE8M0 scales on GPU, compare bit patterns against the CPU
+decoder over all 8 test vectors.
+**Result.** **Bit-exact, 8/8.**
+**Verdict.** The quantization format itself is not a source of divergence.
+
+### E3. Reduction determinism (tree vs serial)
+**Method.** Run a `simd_sum` tree reduction 64 times on identical input; separately run a
+serial-chain kernel and compare to CPU.
+**Result.** `simd_sum` is **bit-reproducible across all 64 runs** (rel err 6.481e-06 vs CPU).
+The serial-chain kernel is **bit-identical to CPU** (`0x493c59f0`).
+**Verdict.** Both a fast-approximate and an exact kernel are achievable. This is what made a
+runtime-selectable `ordered` / `simd` pair possible.
+
+### E4. FMA contraction — the hypothesis that was WRONG
+**Method.** The planning pass ranked FMA contraction as the #1 bit-exactness risk (if CPU and
+GPU contract `a*b+c` differently, no amount of ordering control helps). Probed across
+`MTLMathMode` Safe / Relaxed / Fast, with both benign inputs (1+k·2⁻¹²) and inputs at float
+epsilon (1+k·2⁻²³).
+**Result.**
+- Benign inputs: CPU split == CPU explicit `fma` == GPU on **all three math modes** (`0x4100480d`).
+- Epsilon inputs: a 1-ULP gap appeared (`0x41000009` vs `0x4100000a`), but `contract(fast)` ==
+  `contract(off)` on CPU and Fast == Safe on GPU — **math mode changed nothing**.
+- Also learned: `fastMathEnabled` is deprecated since macOS 15; `MTLMathMode` {Safe=0, Relaxed=1,
+  Fast=2} is the current API.
+
+**Verdict — RECORDED AS A MISS.** FMA contraction is **not** the bit-exactness blocker. The plan
+ranked it first; probing found it irrelevant. The real blocker (E6) was something nobody had
+ranked. *Reasoning identified the wrong suspect; measurement found the right one.*
+
+---
+
+## Part 2 — Primitive ports (the arithmetic floor)
+
+Every primitive was ported RED→GREEN: the probe was written and run **before** the kernel
+existed (confirming it fails for the right reason), then the port was written.
+
+### E5. Five core primitives
+**Method.** `validation/metal/probe_primitives.m` — compare GPU vs CPU bit patterns.
+Exhaustive where cheap (256/256 for anything keyed on a `uint8`).
+
+| primitive | coverage | result |
+|---|---|---|
+| `mx4_lut` | 16/16 | **bit-exact** — incl. index 8 = **negative zero** (`0x80000000`), distinct from +0 |
+| `mx4_scale` | **256/256 exhaustive** | **bit-exact** — incl. s=0 → +0 and s=255 → +inf |
+| `e4m3fn_decode` | **256/256 exhaustive** | **bit-exact** — incl. NaN encodings |
+| `bf16_round` | 32/32 | **bit-exact** — incl. NaN, ±Inf, denormals, round-to-even ties |
+| `sigmoid` | 32 | **FAILS 4/32** |
+
+**Key detail.** `mx4_scale(s)` must be the bit-trick `as_type<float>(uint(s)<<23)`, **not**
+`ldexp` — they diverge at s=0 (+0 vs 2⁻¹²⁷). Separately, `e8m0_decode` **is** `ldexp(1, s-127)`.
+Two superficially similar scale decoders with different semantics; substituting one for the
+other silently corrupts results.
+
+### E6. The real blocker: sigmoid's transcendental
+**Method.** Sweep 8192 points over [-40, 40], compare `precise::exp`-based GPU sigmoid vs libm.
+**Result.**
+- **18.87% of values differ** (1546/8192), max **2 ULP**, max rel err **1.611e-07**
+- Two distinct causes: (A) GPU **flushes denormal results to zero** — `exp(-88)` gives CPU
+  6.05e-39, GPU +0; (B) `precise::exp` ≠ libm `expf`.
+
+**Why it matters.** `sigmoidf_stable` is on the **SwiGLU hot path** (`deepseek_v4.c:1394`), so it
+executes for every expert activation — not a corner case.
+
+**Verdict.** This, not FMA, is the reason end-to-end bit-identity cannot be assumed. It also
+forced a naming change: the variants were renamed **`exact`→`ordered`** and **`fast`→`simd`**,
+because "exact" would have been a false claim in the source tree.
+
+### E7. FP8 activation QDQ — the hardest primitive
+**Method.** Port `coli_fp8_activation_qdq_ref` (steps 1 and 5 of the expert chain). Test vector
+deliberately spanned every sub-path: wide values, the subnormal E4M3 encode region (<0.015625),
+the near-448 clamp, values near the 1e-4 max floor.
+**Result.** **Bit-exact: scales 0 bad, outputs 0/768, maxULP 0.**
+Four sub-primitives came along: `ceil_log2_positive` (frexp, incl. the fraction==0.5 boundary),
+`e8m0_decode`, `e4m3fn_encode` (**both** arms — subnormal, and normal with round-to-nearest-even
+including the `rounded==16` carry into the exponent), `e4m3fn_decode`.
+**Verdict.** The most intricate primitive in the chain reproduces exactly, including its rounding.
+
+### E8. Matmul `matmul_mxfp4`
+**Reference correction found here.** `c/quant.h` contains **two** implementations. The AVX2 one is
+`#ifdef __AVX2__` and **never compiles on Apple silicon** — the arm64 ground truth is the scalar
+path at `quant.h:1401-1412`. Its accumulation is **two-level** and the order is load-bearing:
+`ga` accumulates serially within a 32-column group, then `a += ga*sc` with the scale applied
+**once per group, after it closes**. A flat reduction over I is *not* equivalent.
+
+**Result.**
+| variant | shapes | result |
+|---|---|---|
+| `ordered` | S=2 I=64, S=2 I=48 (**tail**), S=1 I=32 | **BIT-EXACT, maxULP 0** |
+| `simd` | same | diverges, maxRel 7.44e-06 / 4.59e-06 |
+
+The tail case (I=48) matters: it exercises the `glen` clamp and the guarded odd-column path,
+which is where ports usually break silently. `simd`'s error agreed with the independently
+measured `simd_sum` figure (6.481e-06) — two independent measurements agreeing.
+
+### E9. SwiGLU
+**Preserved asymmetry** (deliberate in the CPU source, easy to "tidy" away): `gate` is clamped
+**only from above** (`fmin`), `up` is clamped **both sides**; product associates left-to-right.
+**Result.** Over 4096 gate values in [-100, 100]: 19.65% differ (no clamp) / 19.48% (limit=7),
+260 denormal-flush cases, **maxRel (non-flush) 2.64e-07**.
+Clamping barely moves the rate — as expected, since divergence clusters at *negative* gate and
+gate is not clamped from below.
+
+**On the 260 flush cases.** Their relative error is 100%, which is true and completely
+misleading. The absolute error is what matters: gate=-88 → CPU ≈ -5.3e-36 vs GPU 0. Harmless by
+~36 orders of magnitude against activations of order 1. They are counted separately, never
+merged into the relative-error statistic.
+
+### E10. rows16 "hot" layout
+**Method.** `packed[(tile*stride+col)*16+lane]`, tile=row/16, lane=row%16, applied to **both**
+weights (stride=rb) and scales (stride=ng).
+**Result.** **hot == cold == cpu, bit-identical** on all shapes: O=32, O=48, O=16, and O=17
+(**ragged tile**).
+**Cost of learning it.** A `Trace/BPT trap 5` (heap OOB). rows16 requires output rows **padded to
+a multiple of 16** — the packed buffer is `((O+15)/16)*16 * stride`, not `O*stride`. This is
+precisely why the engine's fixtures use `STORAGE_HIDDEN=128` (padded from 64). **Any host glue
+allocating hot weight/scale storage must pad O to a multiple of 16 and zero the pad.**
+
+---
+
+## Part 3 — End-to-end expert forward
+
+### E11. Full 7-step chain, tiny dims
+**Chain.** `fp8_qdq → matmul(gate,up) → bf16 → swiglu → ×route_weight → bf16 → fp8_qdq →
+matmul(down) → bf16`.
+**Method.** Independent CPU and GPU chains from identical input, hidden=64/intermediate=128,
+12 seeds, both clamp modes, route weights 0.257–1.183.
+**Result.** step1 qdq bit-exact; step2 gate bit-exact; step4 swiglu diverges 9/128 (maxRel
+1.1e-07); **end-to-end output diff = 0/64 on 12/12 seeds** — for `ordered` **and** for `simd`.
+
+**Mechanism (verified, not assumed).** swiglu's output is immediately re-quantized to FP8 E4M3
+before the down matmul. The transcendental error sits far below the E4M3 quantization step, so
+both CPU and GPU swiglu outputs map to the **same FP8 codes**. The requantization *absorbs* the
+divergence.
+
+### E12. The retraction — absorption at REAL dims
+**Method.** Re-measure the absorption claim at production shapes (4096→2048, 2048→4096) instead
+of the 64-wide toy fixture, and check what survives each quantization stage.
+
+| shape | simd raw diff | maxRel | after bf16 | after fp8 |
+|---|---|---|---|---|
+| gate/up 4096→2048 | 1634/2048 | **4.03e-04** | **1/2048 survives** | 0 |
+| down 2048→4096 | 3149/4096 | **2.64e-04** | **2/4096 survives** | 0 |
+
+**RETRACTION.** The E11 claim "simd is bit-exact end-to-end, 12/12" **does not generalise and is
+withdrawn.** `simd_sum` error grows with **reduction length**: the toy fixture reduced over 64
+elements, production reduces over 4096 — 64x longer — and the error grew from 7.4e-06 to
+**4.03e-04, ~54x worse**. The toy fixture was *structurally incapable* of exposing this.
+
+**Corrected mechanism.** Absorption is only **half** true. FP8 requantize (~6% granularity)
+absorbs it fully. **bf16 (~0.2% granularity) does not.** Step 7 is a bf16 round straight to the
+output, so ~2/4096 final values differ by 1 bf16 ULP.
+- `simd`: **not** bit-exact end-to-end at production scale.
+- `ordered`: unaffected — it reproduces CPU accumulation order regardless of reduction length,
+  and stayed bit-exact at all real shapes.
+
+**METHOD LESSON (the most portable result here).** Numerical fixtures **must match production
+reduction lengths**. Correctness-at-tiny-dims does not imply correctness-at-real-dims for
+anything involving accumulation. Every parity claim in this project must now state the reduction
+length it was measured at.
+
+---
+
+## Part 4 — Performance at real dims
+
+CPU baseline is the real engine path: 16-thread OpenMP `matmul_mxfp4`.
+
+### E13. First pass (best-of-5) — later found too noisy
+| shape | CPU | ordered | hot | simd |
+|---|---|---|---|---|
+| gate/up S=1 | 0.418 | 1.618 | 0.720 | **0.075** |
+| down S=1 | 0.383 | 0.299 | 0.421 | **0.044** |
+| gate/up S=8 | 2.941 | 0.758 | 1.088 | **0.097** |
+
+Read at the time as: bit-exact `ordered` is *slower than CPU* at batch-1 (0.26x), `hot` is not a
+consistent win, `simd` is 5–30x.
+
+### E14. Diagnosis of the batch-1 deficit
+Not compute-bound — a **memory-access** problem, in two parts:
+1. **Coalescing.** In the cold kernel, thread `o` reads `w[o*rb + …]`, so adjacent threads read
+   addresses rb=2048 B apart — worst-case uncoalesced. rows16 fixes exactly this, and the data
+   agreed (0.720 vs 1.618 = 2.2x).
+2. **Redundant activation traffic (the larger one).** Every thread read the **entire** input
+   vector from device memory: 2048 threads × 16 KB = **~32 MB of redundant reads against a 4 MB
+   weight matrix** — x traffic was 8x the weights.
+
+**Fix.** Stage x in **threadgroup memory** once per threadgroup (16 KB of the 32 KB budget).
+This preserves bit-exactness *perfectly* — identical values, identical accumulation order; it is
+purely a data-placement change.
+
+**Structural constraint discovered.** Bit-exactness **forbids splitting a row's reduction across
+threads** (it changes the association and therefore the rounding), so `ordered`'s thread count is
+capped at O. Parallelism cannot be raised further without abandoning exactness — x-staging works
+*within* that cap by cutting traffic ~8x instead of adding threads.
+
+### E15. D1 settled (n=20, mean±sd, first iteration dropped as warmup)
+| shape | CPU | ord | hot | **ord+xc** | hot+xc | simd |
+|---|---|---|---|---|---|---|
+| gate/up S=1 | 0.449±0.065 | 0.883±0.432 | 0.638±0.045 | **0.407±0.018** | 0.501±0.032 | **0.075±0.030** |
+| down S=1 | 0.437±0.008 | 0.208±0.012 | 0.252±0.010 | **0.199±0.034** | 0.259±0.039 | **0.064±0.038** |
+| gate/up S=8 | 3.114±0.213 | 0.449±0.027 | 0.514±0.044 | **0.429±0.041** | 0.487±0.015 | **0.374±0.041** |
+
+`ord == cpu` **bit-exact on all three shapes.**
+
+**RETRACTION.** The E13 reading "bit-exact is 0.77x, slower than CPU at batch-1" is **withdrawn**
+— it came from best-of-7 on an unstable variant. With n=20 the bit-exact path is 0.407 vs CPU
+0.449.
+
+**x-staging did two things**, and the second is arguably more important:
+- speed: batch-1 gate/up 0.883 → 0.407; batch-8 gate/up 0.449 → 0.429
+- **stability: batch-1 sd 0.432 → 0.018 (~24x tighter).** Raw `ordered` was too unstable to ship.
+
+**Honest reading (deliberately not overclaimed).**
+- gate/up S=1: CPU [0.384, 0.514] vs ord+xc [0.389, 0.425] — **error bars overlap. This is
+  parity, not a win.**
+- down S=1 (**2.20x**) and gate/up S=8 (**7.26x**) are clear wins; bars do not overlap.
+- `simd` remains **5.4x faster than ord+xc at batch-1** (0.075 vs 0.407) — and batch-1 *is*
+  decode, where a chat workload lives.
+
+**Where this leaves the choice.** No longer "exact vs regression" but "exact-at-parity vs 5.4x
+at 1-bf16-ULP on ~0.05% of decode outputs". For scale: FP4 weight quantization already carries
+~6e-2 error — **~230x larger** than simd's 2.6e-04. Bit-exactness buys *reproducibility against
+the CPU reference*, not accuracy against ground truth.
+
+---
+
+## Part 5 — Build integrity
+
+### E16. Metal wiring does not perturb the default build
+**Method.** Forced dry run (`make -n -B`), METAL off vs on, plus durable object manifests.
+**Result.** METAL=0 → 27 commands, **26 objects, 0 Metal artifacts**. METAL=1 → 39 commands,
+**27 objects**, 5 Metal artifacts. Delta is exactly **one** object: `backend_metal_v4.o`.
+Manifests before == after (SHA `e7b07731…`).
+
+**Why 26→27 is the decisive number.** The engine compiles `deepseek_v4.c` **once per unit** (26
+units, each `-DCOLI_V4_UNIT_*`). `backend_metal_v4.mm` must compile **exactly once** and never be
+swept into that loop, or you get 26 duplicate ObjC++ objects and duplicate-symbol link failures.
+26→27 proves it compiles once.
+
+**RETRACTION recorded.** An earlier check of this claimed "object list byte-identical" by
+comparing `make -n` output of a `.orig` Makefile against the live one. Both lists were **empty** —
+the `.orig` aborts on Darwin (rc=2) and the live run said "up to date". **Two empty sets were
+compared and called a pass.** Withdrawn and redone properly. (Also established: the `.orig` was a
+stale snapshot, 44 lines adrift from HEAD — never a valid baseline.)
+
+### E17. Two silent-failure bugs worth recording
+1. **`COLI_METAL` guard on `.metal` files.** Guarding shader sources made them preprocess to an
+   *empty translation unit* under runtime `newLibraryWithSource:` (where the macro is undefined).
+   Compilation **succeeds** on nothing, and the failure only surfaces later as "entry point
+   missing". Proof: `.air` was 2384 B without `-DCOLI_METAL`, 4272 B with. The guard belongs on
+   host `.mm`/`.h`, which the C build actually sees; a `.metal` file is only ever read by the
+   Metal compiler, so the guard defends against a scenario that cannot occur.
+2. **Guard scope swallowing a kernel.** `swiglu.metal` had its sigmoid `#ifndef` closed by an
+   `#endif` at **EOF**, so the whole file — struct and kernel included — sat inside the guard.
+   Standalone it compiled (macro undefined); after `decode.metal` defined the macro in a combined
+   source, the entire kernel silently vanished. Diagnosed by preprocessing: `swiglu refs after
+   preprocess = 0`.
+
+Both share a shape: **a clean compile that produced nothing.**
+
+### E18. Probe exit semantics
+`probe_primitives` originally gated on total bit-equality, so it was **permanently red** (sigmoid
+legitimately diverges). A permanently-red test trains people to ignore it and would mask a real
+regression. It now asserts: the four bit-exact groups stay bit-exact; sigmoid stays within its
+documented bound (≤2 ULP, ≤5e-07 rel); denormal-flush count ≤ 2.
+The first attempt at that bound was *also* wrong — it applied ULP distance to the denormal-flush
+class and read `maxULP 4320708`. Flush is now counted separately and excluded from ULP/rel stats.
+
+---
+
+## Current status
+
+**Suite: 9/9 green** — `probe_primitives`, `probe_matmul`, `probe_swiglu`, `probe_fp8qdq`,
+`probe_hot`, `probe_fp4_runtime`, `probe_reduction_parity`, `parity_v4`, `probe_expert`.
+
+**Proven.** Every V4 MoE arithmetic primitive on GPU; `ordered` matmul bit-exact at real dims;
+cold and rows16-hot bit-identical; build wiring inert when Metal is off.
+
+**Not yet done.** The four **fused** single-dispatch MoE kernels the benchmark rows expect
+(`coli_v4_moe_expert_fp4_{ordered|simd}_{cold|hot}`) — the constituent pieces are proven, the
+fused entries are not written. Host glue is a stub. The live GPU seam is unwired pending the
+`slot->slab` decision (now settled: **synchronous v1**). **No end-to-end model measurement has
+been taken** — every number above is kernel-level.
+
+## Side thread: PREWARM A/B (deprioritized by user, kept for the record)
+Re-run of the `COLI_V4_PREWARM` 0-vs-1 A/B at `--ram 64`. Arm 0 completed 4/4 gate-clean
+(mean **0.1595 tok/s**); arm 1 reached 1/4 (**0.1544** vs arm 0's 0.1353 on the same cold prompt,
+**+14.1%** — the first evidence the prewarm branch does anything, since it was unreachable before
+the per-turn flush commit). A `--ram 96` re-run was started and then stopped when the user
+redirected to Metal.
+Validity note carried forward: this re-run's arm 0 was ~25% slower than the frozen overnight arm A
+(946s vs 712s on prompt 1) purely from machine-state differences — which is exactly why both arms
+must be run on one machine state, and why the frozen arm A must not be compared against a
+fresh arm B.
+
+---
+
+## E19. Ship-candidate bit-exactness (gap found in my own work, then closed)
+
+**The gap.** E15 benchmarked `ord+xc` for *speed* and reported `ord==cpu bit-exact` on the same
+line — but that mismatch check only ever ran against the plain `ordered` kernel's output buffer.
+**The xcache variants had never been checked for correctness**, and they are the ones that would
+ship. Caught during a routine regression pass, not by a test.
+
+**Method.** Extend `probe_matmul` to assert the xcache variants bit-exact, and — per the E12
+method lesson — include a case at the **production reduction length** (I=4096, ng=128 groups),
+not just toy fixtures. `hot_xcache` needed a dedicated runner (rows16 packing + O padded to a
+multiple of 16).
+
+**Result.**
+
+| variant | shape | result |
+|---|---|---|
+| `ordered_xcache` | S=2 I=64 O=8 | BIT-EXACT 0/16 |
+| `ordered_xcache` | S=2 I=48 O=8 (tail) | BIT-EXACT 0/16 |
+| `ordered_xcache` | **S=1 I=4096 O=64 (REAL, ng=128)** | **BIT-EXACT 0/64** |
+| `ordered_hot_xcache` | S=2 I=64 O=32 | BIT-EXACT 0/64 |
+| `ordered_hot_xcache` | **S=1 I=4096 O=64 (REAL)** | **BIT-EXACT 0/64** |
+| `ordered` (cold) | **S=1 I=4096 O=64 (REAL)** | **BIT-EXACT 0/64** — regression intact |
+| `simd` | S=2 I=64 / I=48 | MISMATCH, maxRel 7.44e-06 / 4.59e-06 (expected) |
+
+**Verdict.** The threadgroup-staging optimisation preserves bit-exactness **at production
+reduction length**, confirming it is purely a data-placement change. Both exact ship candidates
+(`ordered_xcache`, `ordered_hot_xcache`) are now validated on correctness *and* measured on speed.
+
+**Process note.** A benchmark that prints a correctness verdict for one variant while timing
+five is a trap — the verdict reads as if it covers the row it sits on. Correctness assertions
+belong in the probe, not the benchmark.
+
+## Suite status after E19
+**9/9 green**, and all five matmul kernels are exposed through the **offline metallib** path
+(`.air` 9232 B → `.metallib` 25661 B), not just runtime source compilation.
+
+---
+
+## E20. S4 — CPU regression check (both halves PASS)
+
+**Build half.** METAL=0 → 26 objects, 0 Metal artifacts; durable object manifests before ==
+after (SHA `e7b07731…`). Metal adds exactly one object (`backend_metal_v4.o`) and only under
+METAL=1.
+
+**Functional half.** The underlying test scripts were invoked directly rather than via
+`make deepseek-v4-tiny-check` (safe: the binary is newer than its source, so the 26-unit rebuild
+the target performs was unnecessary).
+
+> **RETRACTED CLAIM.** This section originally asserted that `make deepseek-v4-tiny-check` hits a
+> "Darwin SKIP stub" and validates nothing on macOS. **That was wrong.** See E21 — the gate does
+> support Darwin, the real target fires, and the SKIP stub is in a dead `else` branch. The claim
+> came from grepping the SKIP line without checking which branch was live.
+
+| test | result |
+|---|---|
+| `tests/test_deepseek_v4_tiny.py` | **exit 0** — teacher-forcing + greedy **token-exact**; compressed, long, session, CLI (>512-tok prompt) and serve SUBMIT/DATA/DONE protocol all PASS |
+| `tests/test_deepseek_v4_prefix.py` | **exit 0** — prefix reuse / repeat / reset all PASS |
+
+**Verdict.** CPU engine semantics are unaffected by the Metal work.
+
+**Fixture note.** `c/deepseek_v4_tiny/{config,ref}.json` show modified vs HEAD, but the diff is
+**only version strings** (`transformers` 5.14.1→5.15.0, `torch_version`). The reference
+logits/tokens are unchanged — a regeneration under newer transformers reproduced identical
+numerics, which is mildly reassuring in its own right.
+
+**Side effect for teardown.** The tiny test writes `c/deepseek_v4_tiny/.coli_usage`
+(selections 6228 → 6318).
+
+### Scenario contract status
+| id | scenario | status |
+|---|---|---|
+| S1 | fused MoE kernel matches CPU expert ref at real dims | **pending** (kernels not yet written) |
+| S2 | error characterised at real reduction length | **partial** — matmul done (E19), fused pending |
+| S3 | `slot->slab` reuse cannot race the GPU | **pending** (synchronous v1 decided, not yet built) |
+| S4 | CPU-only build unchanged | **PASS** (this section) |
+| S5 | end-to-end Metal ON vs OFF tok/s on the real model | **pending** — the actual user ask |
+
+---
+
+## E21. Is macOS actually excluded from the V4 build? (No — and a real hazard found)
+
+**Question.** The skip message reads "V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2".
+This host is aarch64 — so is the gate on architecture, or on OS?
+
+**Method.** Stop reading the Makefile and ask `make` what it resolves (`make -n`, `make -p`).
+
+**Result — macOS is NOT excluded.**
+```
+COLI_V4_SUPPORTED := 1      DARWIN := darwin      AARCH64 := arm64
+X86_64 :=                   LINUX  :=             IS_WIN :=
+```
+`make -n deepseek-v4-tiny-check` expands the **real** recipe (generate → clean → build → run both
+test scripts), rc=0. The gate at `c/Makefile:343-350` grants support to `AARCH64 && LINUX` **and,
+separately, to `AARCH64 && DARWIN`**. The SKIP stub at :524 sits in the `else` branch of
+`ifeq ($(COLI_V4_SUPPORTED),1)` and is **dead code on this host**.
+
+**So the real issue is stale documentation, not a platform gate:**
+1. The explanatory comment at `c/Makefile:333-336` still claims the engine runs on "x86-64
+   Linux/Windows and aarch64 Linux" — it never mentions Darwin, even though the code three lines
+   below enables it.
+2. The `else`-branch message repeats the same stale claim, and is the string a developer will
+   grep for and believe.
+3. `git diff` confirms the Darwin branch is **committed**; the only uncommitted change to
+   `c/Makefile` is the 2-line `METAL=$(METAL)` passthrough.
+
+**My error, recorded.** I grepped the SKIP string, matched it, and concluded the target was inert
+on macOS — without checking whether that branch was live. The stale message was *designed* to be
+misleading in exactly this way, but the failure was mine: `make -n` answers this in one command
+and I reached for `grep` instead.
+
+**Hazard uncovered by asking make instead of reading it.** The real target's first action is
+`deepseek-v4-clean`, which deletes `deepseek_v4` **and all 31 unit objects** (the clean list
+includes `backend_metal_v4.o`, so it is Metal-aware), then rebuilds with `ARCH=` **empty** —
+`PORTABLE_ARCH` is defined as `$(if $(X86_64),x86-64-v3,)`, so on arm64 it resolves to nothing,
+i.e. a **baseline build rather than `-mcpu=native`**. Running the target mid-campaign would have
+destroyed the benchmarked binary and replaced it with a potentially slower one, silently
+invalidating comparisons against every number measured so far.
+
+**Actionable follow-ups** (documentation defects, not code defects):
+- Update the comment at `c/Makefile:333-336` to include aarch64 Darwin.
+- Update the `else`-branch message so it stops asserting something false on a supported host.
+
+---
+
+## E22. Industry practice: is bit-exact quantized matvec on Apple GPU actually achievable?
+
+**Why this was asked.** E15 left a genuine fork: the bit-exact path reaches only *parity* with CPU
+at batch-1 (decode), while the reordered path is 5.4x faster. Before accepting that tradeoff it
+was worth knowing whether anyone else solves this, or whether parity-at-batch-1 is the known
+ceiling.
+
+**Method.** Literature/source review of the two production Metal LLM backends (llama.cpp, MLX)
+plus Apple's own guidance, focused on the exact shape in question: 4-bit quantized matvec,
+batch=1, I=4096→O=2048.
+
+**What upstream actually does at batch=1**
+
+| project | structure | reduction |
+|---|---|---|
+| llama.cpp Metal | 1 simdgroup = 32 lanes, 2 simdgroups/threadgroup, **4 output rows per simdgroup** (`mul_vec_q_n_f32_impl`, `ggml-metal.metal` L3547-3632) | per-thread partials → `simd_sum` |
+| MLX | `dispatch_qmv()` routes M=1 to qmv; `num_simdgroups=2`, `results_per_simdgroup=4`, `packs_per_thread=1-2` (`quantized.h` L751-815) | final `simd_sum` |
+
+**The decisive finding.** *No upstream fast Metal quantized-matvec path preserves CPU summation
+order.* Both buy their speed precisely by parallelizing across K and reducing with `simd_sum` /
+split-K. Correctness is validated by **tolerance, not bitwise equality**:
+- llama.cpp: NMSE with `max_nmse_err()` default **1e-7** (`test-backend-ops.cpp` L1145-1172)
+- MLX: differential tolerances; recent GPU-vs-reference sweeps gated at **1e-3**
+
+**How that reframes this project's numbers.** The `simd` variant's real-dim error is **2.64e-04
+relative** — comfortably inside MLX's 1e-3 production gate. So reordered reduction is not a
+compromise invented here; it is the industry-standard engineering choice, and this project is
+currently holding itself to a *stricter* standard than either upstream backend.
+
+**Order-preserving levers that remain unused** (these keep bit-exactness):
+1. **Multiple output rows per thread/simdgroup** — upstream consensus is 4. Amortizes the staged
+   activation read across N rows. Rows are independent, so per-row accumulation order is
+   untouched. Not yet tried here; the single most promising remaining lever.
+2. **Vectorized loads** (`uchar4`, packed nibble) — order-preserving if unpack order is exact.
+3. **Wider row tiling per threadgroup** — occupancy only, does not touch single-row order.
+
+**Order-breaking, therefore excluded from the exact variant:** simdgroup reduction across K,
+split-K, `simdgroup_matrix`/tensor-op tiles. Apple's own guidance for custom quantized formats
+(WWDC26 session 330) points at dequantizing into threadgroup memory / cooperative tensors — but
+explicitly for *throughput*, not for exact accumulation order.
+
+**Apple occupancy guidance, applied.** Threadgroup size should be a multiple of
+`threadExecutionWidth`; `dispatchThreads` vs `dispatchThreadgroups` is about nonuniform
+threadgroups, not occupancy. The relevant read for this kernel: 2048 threads is not the binding
+constraint — memory reuse is. That is consistent with E14, where the bottleneck turned out to be
+redundant activation traffic rather than thread count.
+
+**Verdict.** Bit-exact *and* fast is not something upstream achieves on Apple silicon. Parity at
+batch-1 for the exact path is therefore a credible ceiling, not a defect — but levers 1 and 2 are
+untried here and are now scheduled (backlog T11/T12) precisely because closing that gap would
+make the accuracy question disappear rather than merely be accepted.
+
+---
+
+## E23. Codebase reconnaissance: the `slot->slab` hazard is smaller than the design doc implied
+
+**Why this was asked.** The live GPU seam was blocked on a stated hazard: `slot->slab` is
+overwritten in place for a different expert, so a refill racing an in-flight GPU read would make
+the GPU consume *another expert's weights* — silently wrong output, no crash.
+
+**Method.** Direct source reconnaissance of the seam, the expert-store slot lifecycle, and the
+threading model.
+
+**Findings (file:line):**
+
+| aspect | finding |
+|---|---|
+| seam | `moe_token_pipeline()` `c/deepseek_v4.c:3579`; GPU seam `:3763-3768` — calls `coli_v4_expert_forward_ref`, then `coli_expert_release` `:3766`, then accumulates `:3767-3768`. **Three** sites total: `:3763-3766`, `:3730-3733` (dual-loader), `:3167-3170` (serial `moe_token`) |
+| slot struct | `V4ExpertSlot {expert, references, used, slab, aligned_slab}` `:5078-5084` |
+| **refcount** | base eviction requires `!slots[i].references` `:5227-5232`; hot path likewise `:5886-5896` |
+| overwrite | `slot->slab = malloc(record_bytes)` `:5238-5245` — **not page-aligned**; hot path has `aligned_slab` `:5902-5911` |
+| threading | **no OpenMP in the MoE expert loops** — experts are processed serially (`:3707-3736`, `:3744-3768`). Loader pthreads (`:3360`, `:3473`, `:3484`, `:3508`) do refill **I/O only**. Store mutex guards lookup/release metadata only |
+| accumulation | per-expert output is bf16-rounded inside the ref chain, but the MoE accumulator sums 6 experts + shared in **fp32** and rounds **once** at the end (`:3775-3777`) |
+
+**The hazard is already 90% mitigated by existing code.** Lease refcounting means an in-use slot
+*cannot* be evicted — eviction explicitly skips any slot with `references != 0`. The residual
+window is therefore narrow and precise: **only if the GPU is still reading after
+`coli_expert_release`**. Synchronous v1 collapses to a single requirement — the GPU must complete
+before that release call — rather than the architectural change the design note implied.
+
+**Consequence for the accuracy question.** The fp32 accumulate-then-round-once structure
+(`:3775-3777`) matters for rule F: a 1-bf16-ULP per-expert difference is summed in fp32 across 6
+experts and rounded once, so whether it survives to flip a *token* under greedy decoding is an
+empirical question — it only matters if it crosses an argmax boundary. That is why the D1 verdict
+is deferred to an end-to-end token-exactness measurement rather than decided from kernel-level ULP
+counts.
+
+**Host-side patterns available for reuse** (`c/backend_metal.mm`, the existing GLM backend):
+device/queue/library init `:621-633`; return 0 to signal CPU fallback `:1094-1099`;
+`MTLResourceStorageModeShared` `:473`; grow-only scratch `ensure()` `:584-589`; `wrap()`
+zero-copies **only** if pointer and length are 16 KiB aligned, else copies `:613-619`;
+`newBufferWithBytesNoCopy` for registered slabs `:691-710`; and — directly relevant — `moe_submit`
+already batches gate GEMV + up GEMV + SILU + down GEMV into **one command buffer with barriers**
+`:1198-1285`, with `moe_finish` waiting and scatter-adding `:1288-1305`. That is the exact fused
+pattern V4 needs, already proven in-tree.
+
+**Practical consequence.** Because the base slab is plain `malloc`, zero-copy upload is not
+available on the base path (GLM's `wrap()` would silently copy anyway). v1 therefore uses an
+explicit copy into grow-only scratch, with zero-copy via `aligned_slab` deferred behind a
+profiling gate.
+
+---
+
+## E24. T5 — END-TO-END MEASUREMENT: Metal is currently 2.1–2.3x SLOWER
+
+**This is the answer to the question the whole campaign exists to answer, and it is negative.**
+
+**Method.** Real model (`models/deepseek-v4-flash`), `--ram 96`, 8 tokens, identical prompt,
+`COLI_V4_SAVE_USAGE=0` with `.coli_usage` restored from the frozen snapshot before each arm so
+both arms seed from identical history (29127 B / 14190 selections).
+
+| arm | ttft | after_first | dispatches | output |
+|---|---|---|---|---|
+| Metal OFF | **10.037s** | **6.731s** | 0 | `The capital of France is **Paris**.` |
+| Metal ON (`ordered_cold`) | 21.194s | 15.466s | 2396 | `The capital of France is **Paris**.` |
+
+**2.11x slower on time-to-first-token, 2.30x slower on generation.** Output byte-identical, so
+the correctness chain holds all the way to real routing — the regression is purely performance.
+
+**A first smoke run also mutated `.coli_usage` (14190 → 18318 selections).** That run was
+discarded and the snapshot restored; the table above is the clean paired measurement. Worth
+recording because it is exactly the confound the PREWARM work identified, and it appeared
+immediately in a context where it had not been anticipated.
+
+### Why the kernel benchmarks lied — two confirmed causes
+
+**Cause 1: occupancy collapse from the fusion design (the big one).**
+The glue dispatches `dispatchThreads(N)` with `threadsPerThreadgroup(N)` — i.e. **exactly one
+threadgroup**, at `backend_metal_v4.mm:266-267`. One threadgroup occupies **one** of the 40 GPU
+cores; 39 sit idle. The microbenchmarks in E13/E15 dispatched O=2048 threads spread across many
+threadgroups, which is where the 1.1–7.3x came from.
+
+This is not an implementation slip — it is **forced by the fusion decision**. The fused kernel
+keeps every intermediate (qdq'd input, gate, up) in threadgroup memory, and threadgroup memory is
+private to one threadgroup. Fusing the 7 steps therefore *requires* single-threadgroup execution.
+The 32 KB budget that made fusion look elegant is the same constraint that caps it at 1/40 of the
+device.
+
+**Cause 2: 32 GB of redundant weight copying per 8-token run.**
+Per dispatch at real dims: gate 4.19 MB + up 4.19 MB + down 4.19 MB + scales 0.79 MB =
+**13.37 MB**. Times 2396 dispatches = **32.0 GB** copied host→scratch, which the GPU then re-reads
+from unified memory. The underlying weights are only ~12 MB per expert; they are re-copied on
+every single use because the glue has no cache keyed on expert identity.
+This was a deliberate v1 simplification (decision C: copy-upload, because the base slab is plain
+`malloc` and not 16 KiB aligned). Profiling now says it is not viable — T10 moves from
+*conditional* to *required*.
+
+**Cause 3 (indicated, NOT yet root-caused): only 58% GPU coverage.**
+`expert_requests=4128` (= 43 layers x 6 top-k x 16 steps), `hits=2394`, `misses=1734`,
+`dispatches=2396`. Dispatches track *hits* almost exactly, and the shortfall (~1732) matches
+*misses* to within 2. All three seam sites are confirmed wired, so the likely explanation is the
+glue's strict byte-validation (`backend_metal_v4.mm:87-93`, requiring
+`data_bytes == rows*row_bytes` and `scale_bytes == rows*groups`) rejecting tensor views produced
+by the hot `aligned_slab` path (`deepseek_v4.c:5902-5911`) rather than the base `slab` path.
+**Unconfirmed.** Needs a diagnostic that logs which validation branch returns -1. Do not state
+this as fact until measured.
+
+### What this changes
+
+The plan assumed fusion was the right shape and that variants (T6 simd, T7 hot, T8 batching)
+would layer speed on top. **That assumption is now falsified**: no variant fixes single-threadgroup
+occupancy, and T8 (batching 6 experts into one command buffer) would not either — it reduces
+command-buffer count but each expert still runs in one threadgroup.
+
+The correct pivot is the opposite of fusion: **multi-dispatch using the already-proven,
+high-occupancy `ordered_xcache` matmul kernels** (measured 1.10x / 2.20x / 7.26x at real dims,
+bit-exact at I=4096), with the fused single-threadgroup kernel retained purely as the bit-exact
+oracle it has already served as. That trades on-chip intermediate reuse for ~40x more parallelism —
+and the E14 diagnosis already showed this workload is memory-bound, not on-chip-reuse-bound.
+
+**Honest framing for the record:** the kernel work was not wasted — every primitive and the
+ordered matmul are bit-exact at production reduction length, and the seam, glue, counter and race
+invariant are all proven. What was wrong was a single architectural choice (fuse everything into
+one threadgroup), and it was only detectable end-to-end. Kernel microbenchmarks measured the
+matmul in isolation with full occupancy; the fused kernel never had that occupancy. That gap
+between "the kernel is fast" and "the engine is faster" is the entire lesson of this section.
+
+### E24b. Cause 3 root-caused, and a zero-copy blocker found
+
+**rows16 packing is LIVE on the real model.** `hot_pack_slot_locked` (called from `lookup_hot`
+when `hot_is_pinned` is true) repacks pinned experts into the rows16 layout, and views are then
+filled by `hot_fill_view` — a *different* function from the base `fill_tensor_view`. The smoke run
+confirms it is active: **`v4_rows16 packed_slots=491`**.
+
+My glue validates for the **cold** layout only (`block_columns == 32`, `data_bytes ==
+rows*row_bytes`). A rows16-packed view will not satisfy that, so it returns -1 and the caller falls
+back to CPU. That is the most likely mechanism behind the 58% coverage — and it reframes T7 (hot
+variants) from "optional perf polish" to **required for coverage**, since a meaningful fraction of
+the hot path is pinned/packed by design (`pin_slots_per_layer=16`).
+
+**Zero-copy blocker: 4 KiB vs 16 KiB.** The hot store allocates with
+`posix_memalign((void**)&slot->slab, 4096, capacity)` — 4 KiB alignment. Apple Silicon uses
+**16 KiB pages**, which is precisely why GLM's `wrap()` requires pointer AND length to be 16 KiB
+aligned before it will use `newBufferWithBytesNoCopy` (`backend_metal.mm:613-619`). So the existing
+`aligned_slab` is *not* sufficient for true zero-copy; the allocation constant would have to move
+4096 → 16384.
+
+This matters because on Apple Silicon the weights are **already in unified memory**. Copying them
+into a Metal scratch buffer is pure waste — 32 GB of it per 8-token run. The fix is not a smarter
+cache, it is not copying at all: align the slab to 16 KiB and wrap it in place.
+
+### Revised plan (supersedes the T6→T9 ordering in experiments-backlog.md)
+
+| priority | change | why |
+|---|---|---|
+| **P0** | Multi-dispatch instead of one fused threadgroup | Recovers ~40x parallelism. Reuse the already-proven `ordered_xcache` kernels (1.10x/2.20x/7.26x, bit-exact at I=4096). One command buffer, barriers between stages — GLM's `moe_submit` pattern (`backend_metal.mm:1198-1285`) is the in-tree precedent. |
+| **P0** | 16 KiB-align the expert slab + `newBufferWithBytesNoCopy` | Eliminates 32 GB/run of memcpy outright rather than caching it. |
+| **P1** | Accept rows16 views in the glue (was T7) | Required for coverage, not polish — 491 slots are packed on the real model. |
+| **P2** | simd variant (was T6) | Only meaningful once occupancy is fixed; currently it would also run at 1/40 occupancy. |
+| **dropped** | T8 token-level batching | Reduces command-buffer count but each expert still runs in one threadgroup, so it does not address the actual bottleneck. |
+
+The fused kernel is **retained as the bit-exact oracle** — it earned that role (12,288 outputs,
+3 real seeds, 0 differing bits) and remains the reference any faster path must match.
+
+---
+
+## E25. P0b + the prefill test: Metal cannot win through this seam. Structural, not fixable by tuning.
+
+### P0b results (zero-copy + qdq occupancy)
+Landed: expert slab aligned to 16384 (Apple Silicon page size), `newBufferWithBytesNoCopy` with
+per-tensor offsets, cached wrapper keyed on slab pointer, **zero copy-fallbacks**. `fp8_qdq`
+rewritten from one-thread-per-block to one 128-thread threadgroup per block with an `fmax` tree
+reduction — and it stayed **bit-exact** (`fmax` is associative/commutative for non-NaN, unlike a
+sum, so a tree is legitimate here; the probe proved it rather than the argument being trusted).
+
+Per-stage profile (`COLI_V4_METAL_PROFILE=1`):
+
+| stage | ms/expert | % |
+|---|---:|---:|
+| host weight memcpy | **0.0215** | 0.52 |
+| matmul gate | 1.1597 | 27.83 |
+| matmul up | 0.0452 | 1.08 |
+| matmul down | 0.5537 | 13.29 |
+| fp8_qdq in / down_input | 0.0366 / 0.0245 | 1.5 |
+| swiglu / weighted_bf16 / bf16 x2 | ~0.081 | 2.0 |
+| submit+wait | 2.2444 | 53.87 |
+
+**Two corrections to earlier claims, both mine:**
+1. **Copy was never the bottleneck** — 0.52%. I estimated ~0.84 ms from 18.69 GiB; actual is
+   0.0215 ms, wrong by ~40x. On unified memory those "copies" were largely cache-resident. P0b was
+   therefore the right *engineering* change (32 GB of pointless traffic removed) but it bought
+   almost no time, and I predicted otherwise.
+2. **The profile's GPU attribution does not reconcile with production and must not be quoted as a
+   decomposition.** Stages sum to 1.922 ms — *below* CPU's 2.919 ms — so if the split were literal,
+   Metal would already win. Profile mode issues ~10 command buffers instead of 1, inflating
+   whichever dispatch lands first; that is why `matmul gate` reads 1.1597 ms against
+   `matmul up` 0.0452 ms on **identical shapes** (25.7x). The gate "excess" alone (2.66 s/run)
+   exceeds the entire measured gap (0.825 s), which is self-refuting. The host memcpy figure IS
+   reliable (CPU timer, granularity-independent); the GPU stage split is not.
+
+Trajectory across all three fixes: **2.30x slower → 1.17x → 1.118x slower.** Clear diminishing returns.
+
+### The decisive experiment: prefill
+Hypothesis: batch-1 decode is weight-bandwidth-bound with ~zero weight reuse (each expert's ~8 MB
+used once per token), and on unified memory the GPU has no bandwidth advantage over the CPU — so
+GPU should only win where arithmetic intensity rises, i.e. prefill. The microbenchmarks supported
+this: batch-1 gate/up = parity, batch-8 gate/up = 7.26x.
+
+Measured, 799-token prompt, paired, frozen history:
+
+| arm | ttft | dispatches | coverage |
+|---|---|---|---|
+| Metal OFF | **708.143s** | 0 | — |
+| Metal ON | 753.030s | 36740 | 36740 / 206916 = **17.8%** |
+
+**HYPOTHESIS FALSIFIED — 1.063x slower on prefill as well.**
+
+**Why.** 799 tokens x 43 layers x 6 top-k = 206,142 ≈ the 206,916 observed expert_requests. The
+engine walks prefill **token by token through the same per-expert seam**. Every call is S=1.
+Prefill is not batched at the expert level — it is simply *more* batch-1 calls. Arithmetic
+intensity never rises, so the batch-8 advantage is **unreachable through this seam**.
+
+The seam signature makes this structural, not incidental:
+```c
+int coli_v4_metal_expert_forward(float *out, const ColiExpertView *expert,
+                                 const float *input, float route_weight, float swiglu_limit);
+```
+One input vector, one output vector. **There is no token dimension to batch over.**
+
+### Verdict on the original question
+
+**Does Metal make DeepSeek-V4 faster on this hardware? No — not through an expert-level seam.**
+Best achieved: 1.118x slower on decode, 1.063x slower on prefill, with correctness perfect
+throughout (byte-identical output in every paired run).
+
+The causes are structural and stack against the GPU:
+1. **S=1 per call** — no arithmetic intensity; the 7.26x batch-8 result cannot be reached.
+2. **Unified memory** — the GPU has no bandwidth advantage; both processors read the same DRAM.
+3. **~Zero weight reuse** — top-6 of 256 experts, ~8 MB of weights per ~0.5 MFLOP. Pure bandwidth.
+4. **Per-call dispatch + synchronous wait** — real overhead the CPU path simply does not pay.
+
+Remaining backlog items would improve the *margin*, not the *sign*: P1 (rows16 coverage — currently
+only 17.8% of forwards reach the GPU) and T11/T12 (order-preserving occupancy levers) make the GPU
+faster and more-used, but none of them changes S=1 or unified-memory bandwidth.
+
+**What would actually be needed:** batch the token dimension *inside* the expert call — i.e. gather
+all tokens routed to expert E in a layer and issue one S=N matmul. That is an **engine-level
+change** to the MoE scheduler (`moe_token_pipeline`), not a backend change, and it is exactly the
+shape the 7.26x microbenchmark was measuring. That is the honest recommendation, and it is a
+substantially larger piece of work than this campaign scoped.
+
+### What the campaign did establish (not wasted)
+- Every V4 MoE arithmetic primitive is **bit-exact on GPU**, several exhaustively, all at production
+  reduction length (I=4096 / 2048).
+- A fused single-dispatch expert kernel bit-exact across 12,288 outputs, 3 real seeds.
+- A working, race-free seam (synchronous v1) with the lease invariant verified at all three sites.
+- A dispatch counter that caught a silent CPU fallback which would have made every number a lie.
+- Build integrity preserved throughout: default build byte-identical, 26 objects, token-exact.
+- The measurement discipline itself: frozen history, paired interleaving, and stating reduction
+  length — each of which caught a real error in this campaign.
+
+---
+
+## E26. PREWARM A/B — KILL verdict, and a process gap worth fixing
+
+Full detail in `RESULTS.md` §13 and `cache-design.md` §7. Summary:
+
+**Result.** `--ram 64`, both arms one machine state, frozen history, zero gate failures:
+paired mean **−29.7%** (per-prompt −18.2 / −27.3 / −32.7 / −38.7%), worsening monotonically.
+
+**The interesting part.** Hit rate *improved* +9.98pp (57.728 → 67.708%), so the anticipated
+failure mode — warming the wrong experts — did **not** occur. Persistence and pin selection both
+work. The economics are what fail: 412 misses avoided x 13.37 MB = ~5.51 GB saved, against
+`warmed=688 bytes=8.566GiB` = ~9.20 GB read eagerly. **Net ~+3.69 GB more I/O**, landing during
+prefill. Prediction only has to be wrong ~40% of the time for 688 speculative 13.37 MB reads to
+lose against on-demand loading.
+
+So §7's gate resolved **both ways**: the flush/persistence mechanism is justified and stays; the
+eager-warming consumer is killed. Those were always two different things, and the gate as written
+only measured one of them.
+
+**Two false leads recorded** (see §13e): a *partial* arm1 on an older binary under compression
+contamination showed **+14.1%** — the opposite sign — and would have justified keeping a 29.7%
+regression had it been reported. And an entire `--ram 64` run was invalidated by ambient load
+(non-engine 43–44 GB, outside §11's 18–31 GB band): compressor hit 25.0 GB with `gap_gb=20.1`.
+Rerun at 21.9 GB non-engine went 901s → 793s (**+13.6%**) with `gap_gb` 0.4.
+
+## E27. Process gap: probe binaries can go stale and report phantom failures
+
+Final teardown showed `probe_fp8qdq` FAILING. It was not a regression: the probe *source* had been
+correctly updated (15:31) to `dispatchThreadgroups(NB) x threadsPerThreadgroup(BLK)` for the
+rewritten kernel (15:33, now one 128-thread threadgroup per block with an `fmax` tree), but the
+compiled binary on disk dated from **02:45** — before the ABI change. Rebuilt: BIT-EXACT 0/768.
+
+**No make target rebuilds `validation/metal/probe_*`.** A kernel ABI change therefore leaves stale
+binaries that fail for a reason unrelated to correctness — or worse, could *pass* stale and hide a
+real break. Recommended: add a `metal-probes` target, or always rebuild before trusting the suite.
+The suite is 10/10 green with every probe rebuilt from current source.

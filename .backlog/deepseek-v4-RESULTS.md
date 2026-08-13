@@ -691,3 +691,228 @@ of measuring it.**
 install artifact (`make -C c install`, or copy `c/deepseek_v4` to `libexec/colibri/`), point
 the harness at `c/coli`, or set `COLI_ENGINE` explicitly. A one-line guard in each harness —
 print the resolved engine path and its mtime at startup — turns this from silent into obvious.
+
+## 11. Budget ceiling: ~100 GB total, not what the naive formula says
+
+Established 2026-08-12 by getting it wrong twice in one night.
+
+I sized `--ram` with `engine_footprint + non_engine_RSS + 8 GB OS <= 137`. That formula said
+`--ram 80` would fit at 124 GB. It did not: the engine filled to its full 80 GB budget and
+macOS immediately compressed **38 GB of it** (rss collapsed 80 → 41.6 GB) while also squeezing
+other applications from 29.9 → 16.8 GB. Compressor went 0.7 → 47.2 GB mid-run and the arm had
+to be discarded.
+
+| budget | engine fp | + non-engine | total | outcome |
+|---|---|---|---|---|
+| `--ram 64` | ~64 GB | ~31 GB | **~95 GB** | ran clean, gap 0.4 GB at full budget |
+| `--ram 64` | ~64 GB | ~18 GB | **~86 GB** | ran clean, 4/4 rows gate-green |
+| `--ram 80` | ~80 GB | ~30 GB | **~110 GB** | **compressed 38 GB of the engine** |
+| `--ram 96` | ~94 GB | ~18 GB | ~112 GB | compressed (aborted prefetch arm, §4d) |
+
+**Working rule: keep `engine + non-engine` at or under ~100 GB on this 137 GB host.** The
+missing term in the naive formula is that macOS needs far more than 8 GB of slack — wired
+memory, the compressor's own working set, and file-backed pages it is unwilling to drop all
+compete before it will leave a large anonymous allocation resident.
+
+Consequence: `--ram 96` is only reachable when the machine is genuinely quiet (non-engine
+under ~15 GB), which is how §4b/§4c were measured. At a normal working desktop load of 18-31 GB,
+**`--ram 64` is the largest budget that reliably stays uncompressed.**
+
+### Absolute throughput is not comparable across sessions
+
+The same `--ram 64` cold prompt #1 measured 0.2306 tok/s at 19:51 and 0.1798 tok/s at 01:24 —
+**22% apart with no configuration change**, both gate-green with 0.4 GB gaps. Ambient load
+alone moved it. Only paired within-session deltas are valid; any cross-session comparison of
+absolute tok/s in this document should be treated as indicative, not measured.
+
+---
+
+## 12. Metal GPU backend — built, proven correct, and MEASURABLY SLOWER (2026-08-13)
+
+A Metal backend for the V4 routed-expert path was built end-to-end and measured on the real
+model. **Verdict: it does not make V4 faster on this hardware through an expert-level seam.**
+Correctness is perfect; performance regresses. The reasons are structural, and the honest fix is
+an engine change rather than a backend one.
+
+All numbers below are **paired within-session** measurements per §8/§11 discipline: same binary,
+`.coli_usage` restored from a frozen 29127 B / 14190-selection snapshot before every arm, and
+`COLI_V4_SAVE_USAGE=0` so neither arm mutates history. Absolute values are not comparable across
+sessions; only the within-pair deltas are.
+
+### 12a. End-to-end results
+
+Decode, 8 tokens, `--ram 96`, prompt "The capital of France is":
+
+| arm | ttft | generation | dispatches | output |
+|---|---|---|---|---|
+| Metal OFF | 9.850–10.376 s | **6.560–6.980 s** | 0 | `**Paris**.` |
+| Metal ON (final) | 11.241–11.454 s | 7.805–7.992 s | 2391 | `**Paris**.` |
+
+**Best achieved: 1.118x SLOWER on generation.** Output byte-identical in every paired run.
+
+Prefill, 799-token prompt:
+
+| arm | ttft | dispatches | GPU coverage |
+|---|---|---|---|
+| Metal OFF | **708.143 s** | 0 | — |
+| Metal ON | 753.030 s | 36740 | 36740 / 206916 = **17.8%** |
+
+**1.063x slower on prefill as well.**
+
+Progression across three architectural fixes: **2.30x slower → 1.17x → 1.118x.** Diminishing
+returns are obvious; the trend does not extrapolate to a win.
+
+### 12b. Why — four causes that stack against the GPU
+
+1. **Every expert call is S=1.** The seam is
+   `coli_v4_metal_expert_forward(float *out, const ColiExpertView*, const float *input, ...)` —
+   one input vector, one output vector. There is **no token dimension to batch over**.
+2. **Prefill does not help.** 799 tokens x 43 layers x 6 top-k = 206,142 ≈ the 206,916 observed
+   `expert_requests`. The engine walks prefill **token by token through the same S=1 seam**, so
+   prefill is merely *more* batch-1 calls. Arithmetic intensity never rises.
+3. **Unified memory gives the GPU no bandwidth advantage.** Both processors read the same DRAM.
+   This workload is bandwidth-bound, not compute-bound.
+4. **~Zero weight reuse.** Top-6 of 256 experts, ~8 MB of weights per ~0.5 MFLOP of work. Plus the
+   GPU pays per-call dispatch and a synchronous wait that the CPU path does not.
+
+The isolated matmul microbenchmarks *did* show real GPU wins at real dims — **7.26x at batch-8**
+(gate/up 4096→2048, n=20, mean±sd, bit-exact). That result is genuine but **structurally
+unreachable through this seam**, because the seam never presents more than one token.
+
+### 12c. What would actually be needed
+
+Batch the token dimension **inside** the expert call: gather all tokens routed to expert E within a
+layer and issue one S=N matmul. That is a change to the MoE scheduler (`moe_token_pipeline`,
+`deepseek_v4.c:3579`), **not** to the backend — and it is precisely the shape the 7.26x
+microbenchmark measured. Until that exists, no backend tuning changes the sign.
+
+Backlog items that were deliberately **not** pursued because they move the margin and not the sign:
+GPU coverage is only 17.8% (rows16-packed pinned experts are rejected by cold-layout validation —
+`v4_rows16 packed_slots=491`, `pin_slots_per_layer=16`); a `simd_sum` variant; and two
+order-preserving occupancy levers (multiple output rows per thread, `uchar4` vectorized loads).
+Each would make the GPU faster and more-used; none removes S=1 or unified-memory bandwidth.
+
+### 12d. What was established, and is reusable
+
+Correctness, all verified at **production reduction length** (gate/up I=4096 with ng=128; down
+I=2048 with ng=64) — per §8, every parity claim states the reduction length it was measured at:
+
+| component | result |
+|---|---|
+| `mx4_scale`, `e4m3fn` decode | **bit-exact, exhaustive 256/256** |
+| `e4m3fn` encode | bit-exact across both arms (subnormal <0.015625, and normal with round-to-nearest-even incl. the `rounded==16` exponent carry) |
+| `bf16_round` | bit-exact incl. NaN, ±Inf, denormals, round-to-even ties |
+| `fp8_activation_qdq` | bit-exact incl. subnormal-encode, near-448 clamp, 1e-4 floor |
+| `matmul_mxfp4` ordered / xcache / hot_xcache | **bit-exact at I=4096, ng=128** (real reduction length, O=64). Tail (I=48) and ragged-tile (O=17) shapes verified bit-exact **separately at small dims** — the two results should not be conflated: no ragged-O case was run at I=4096 |
+| fused single-dispatch expert kernel | **bit-exact, 12,288 outputs / 3 real seeds / 0 differing bits** |
+| host glue vs `coli_v4_expert_forward_ref` | **bit-exact 0/4096** at real dims, with cap-fallback returning -1 |
+| `sigmoid` | **NOT** bit-exact — 18.87% differ, ≤2 ULP, 1.611e-07 rel (`precise::exp` ≠ libm `expf`, plus GPU denormal-result flush) |
+
+The sigmoid divergence is fully **absorbed** by the FP8 requantize before the down projection (the
+error sits far below E4M3 granularity), which is why the fused kernel is bit-exact end-to-end
+despite containing a non-exact primitive.
+
+Infrastructure: seam wired at all three call sites (`:3173/3180`, `:3744/3752`, `:3786/3794`) with
+the lease invariant verified — blocking `waitUntilCompleted` precedes every `coli_expert_release`,
+so a refill cannot race an in-flight GPU read. Default build integrity preserved throughout: 26
+objects with `METAL=0`, 27 with `METAL=1`, manifests byte-identical, tiny oracle token-exact with
+Metal both ON and OFF.
+
+### 12e. Two measurement traps worth carrying forward
+
+**A dispatch counter is mandatory.** The first working seam appeared to pass every test while
+silently falling back to CPU on every call — Metal was never initialized at runtime. Without
+`metal_dispatches`, "token-exact and fast enough" would have been indistinguishable from "Metal
+never ran", and every subsequent number would have been a lie.
+
+**Profile-mode attribution is not production attribution.** A per-stage profile reported
+`matmul gate` at 1.1597 ms against `matmul up` at 0.0452 ms — **25.7x apart on identical shapes** —
+and a `submit+wait` share of 53.87%. Neither survives arithmetic: the stages sum to 1.922 ms, below
+the CPU's 2.919 ms, so a literal reading would mean Metal already wins; and the gate "excess" alone
+(2.66 s/run) exceeds the entire measured gap (0.825 s). Profile mode issues ~10 command buffers
+instead of 1, inflating whichever dispatch lands first. The host-memcpy figure from that profile
+*is* reliable (CPU timer, granularity-independent) and showed copying was only **0.52%** — refuting
+a prior estimate of ~0.84 ms by roughly 40x, and with it the assumption that weight upload was the
+bottleneck.
+
+---
+
+## 13. `COLI_V4_PREWARM` A/B — VERDICT: KILL (2026-08-13, `--ram 64`)
+
+First clean, complete, gate-green A/B of `COLI_V4_PREWARM=0` vs `=1`. Both arms: same binary
+(`sha f84813a9`), same frozen seed history (29127 B / 14190 selections) restored before each arm,
+`COLI_V4_SAVE_USAGE=0` so neither arm mutates it, 4 prompts x 128 tokens, `target_slots=104`.
+**Zero gate failures across all 8 rows** (compressor 2.2–2.6 GB against a 20 GB limit,
+`gap_gb=0.4` throughout — no engine compression).
+
+### 13a. Result: prewarm is actively harmful
+
+| prompt | OFF tok/s | ON tok/s | delta |
+|---|---|---|---|
+| 1 (cold) | 0.1614 | 0.1321 | **−18.2%** |
+| 2 | 0.1753 | 0.1275 | **−27.3%** |
+| 3 | 0.2058 | 0.1385 | **−32.7%** |
+| 4 | 0.1836 | 0.1125 | **−38.7%** |
+| **mean** | **0.1815** | **0.1277** | **−29.7%** (paired mean −29.2%, sd 8.7pp) |
+
+The delta **worsens monotonically**, so this is not a one-off startup cost being amortised — it
+degrades steady state as well.
+
+### 13b. The kill condition fired, but not the way §5/§6b predicted
+
+The stated condition was: *if hit rate does not improve, the limit is pin policy, not persistence.*
+Measured directly (the harness does not capture hit rate; this was measured separately at `--ram 64`,
+8 tokens, same frozen history):
+
+| | hits | misses | hit_rate |
+|---|---|---|---|
+| PREWARM=0 | 2383 | 1745 | 57.728% |
+| PREWARM=1 | 2795 | 1333 | **67.708%** |
+
+**Hit rate IMPROVED by +9.98pp.** So persistence is genuinely working, and the warmed experts are
+genuinely useful — 412 fewer misses. The anticipated failure mode (warming the *wrong* experts)
+did **not** occur.
+
+### 13c. Why a better hit rate still loses — I/O accounting
+
+An expert record at real dims is 4.19 (gate) + 4.19 (up) + 4.19 (down) + 0.79 (scales) = **13.37 MB**.
+
+- misses avoided: 412 x 13.37 MB = **~5.51 GB of on-demand reads saved**
+- eager warming cost: `v4_autopin warmed=688 requested=688 bytes=8.566GiB` = **~9.20 GB read up front**
+- **net: ~+3.69 GB MORE I/O with prewarm enabled**
+
+Prewarm spends ~9.2 GB eagerly to avoid ~5.5 GB on demand. It is a **net I/O loss**, and the eager
+reads land at the worst possible moment — competing with prefill for SSD bandwidth and page cache.
+The improved hit rate is real, it is simply **bought for more than it saves**.
+
+### 13d. Verdict
+
+**KILL `COLI_V4_PREWARM`.** Leave the default at 0 and treat the branch as dead weight.
+
+The limitation is **neither** pin policy **nor** persistence, which is why the original
+justify/kill framing did not anticipate this outcome:
+- persistence works — history survives restarts and seeds correctly (14190 selections)
+- pin selection works — the warmed experts really are the ones subsequently wanted (+9.98pp)
+- **the economics do not work** — eager bulk reading costs more I/O than the misses it prevents,
+  because prediction only needs to be *wrong 40% of the time* to make 688 speculative
+  13.37 MB reads a losing trade against on-demand loading
+
+§5's learning cache is therefore **not** unlocked by prewarm and should not be justified on its
+basis. If eager warming is revisited, the requirement is not better prediction — it is warming
+**far fewer** experts (only the highest-confidence pins) so that saved misses exceed bytes read.
+A useful next experiment would sweep the warm count (e.g. 64/128/256 instead of 688) and find the
+break-even point, rather than warming everything the history suggests.
+
+### 13e. Two false leads on the way here, recorded
+
+**A partial arm is worse than no arm.** An earlier partial run (different binary, `sha 7406b1fd`)
+showed arm1 prompt #1 at **+14.1%** — the exact opposite sign of the final result. It was a single
+row of a 4-row arm, measured under compression contamination. Had it been reported as a result,
+it would have justified keeping a feature that costs 29.7%.
+
+**Ambient load silently invalidated an entire run.** A `--ram 64` attempt gate-failed at prompt #2
+with the compressor at **25.0 GB** and `gap_gb=20.1` (20 GB of the engine compressed). Cause was
+non-engine RSS at **43–44 GB** — outside the 18–31 GB band §11 says keeps `--ram 64` uncompressed.
+The same config then ran clean at 21.9 GB non-engine: prompt #1 went 901s → 793s (**+13.6%**) with
+`gap_gb` 20.1 → 0.4. Before quoting any V4 throughput number, check `gap_gb` and the compressor;
+the budget headroom is part of the measurement, not context around it.

@@ -350,3 +350,58 @@ NOT tok/s — OS page-cache warming can inflate a second run's throughput regard
 - Unify V4 onto shared `route_trace.h` so fixes reach all engines (D6).
 - Optional signal handling for mid-turn Ctrl-C durability (§4).
 - Revisit whether `COLI_V4_PREWARM` should default on once persistence works.
+
+---
+
+## 7. RESOLVED (2026-08-13) — persistence JUSTIFIED, `COLI_V4_PREWARM` KILLED
+
+Measured at `--ram 64`, both arms on one machine state, same binary (`sha f84813a9`), frozen seed
+history (29127 B / 14190 selections) restored before each arm, `COLI_V4_SAVE_USAGE=0`, 4 prompts x
+128 tokens, `target_slots=104`, **zero gate failures** (compressor 2.2–2.6 GB vs a 20 GB limit,
+`gap_gb=0.4` throughout). Full detail: `deepseek-v4-RESULTS.md` §13.
+
+### The gate resolves BOTH ways, because it was gating two different things
+
+**§7 "Justify" criteria — MET.** The `v4_autopin history=` line appears on restart with
+`selections=14190`, and hit rate **improved by +9.98pp**:
+
+| | hits | misses | hit_rate |
+|---|---|---|---|
+| PREWARM=0 | 2383 | 1745 | 57.728% |
+| PREWARM=1 | 2795 | 1333 | **67.708%** |
+
+So the **per-turn flush + persistence mechanism (T1–T4) is VINDICATED**. History survives restarts,
+seeds correctly, and the pins it produces are genuinely the ones subsequently wanted — 412 fewer
+misses. The `Kill/defer` branch does **not** fire: the limiting factor is *not* pin policy, and it is
+*not* persistence. Both work.
+
+**`COLI_V4_PREWARM` is nonetheless KILLED**, on economics the §7 gate did not measure:
+
+| prompt | OFF | ON | delta |
+|---|---|---|---|
+| 1 (cold) | 0.1614 | 0.1321 | −18.2% |
+| 2 | 0.1753 | 0.1275 | −27.3% |
+| 3 | 0.2058 | 0.1385 | −32.7% |
+| 4 | 0.1836 | 0.1125 | −38.7% |
+| **mean** | **0.1815** | **0.1277** | **−29.7%** |
+
+I/O accounting (expert record = 4.19 gate + 4.19 up + 4.19 down + 0.79 scales = **13.37 MB**):
+- 412 misses avoided x 13.37 MB = **~5.51 GB saved**
+- `v4_autopin warmed=688 bytes=8.566GiB` = **~9.20 GB read eagerly**
+- **net ~+3.69 GB MORE I/O**, landing during prefill where it contends for SSD bandwidth
+
+Prewarm buys a real hit-rate gain for more than it is worth. Prediction only has to be wrong ~40%
+of the time for 688 speculative 13.37 MB reads to lose against on-demand loading.
+
+### Consequences for this document
+
+- **§7 gate: CLOSED.** Persistence justified; keep the flush (T1–T4 stay).
+- **§8 open item "revisit whether `COLI_V4_PREWARM` should default on once persistence works":
+  ANSWERED — NO.** Persistence working is exactly the condition under which prewarm was measured,
+  and it lost by 29.7%. Default stays 0. Treat the branch as dead weight.
+- **§5's learning cache is NOT unlocked by prewarm** and must not be justified on its basis. The
+  persistence half is sound; the eager-consumption half is not.
+- **If eager warming is ever revisited**, the fix is not better prediction — it is warming **far
+  fewer** experts so that saved misses exceed bytes read. Concrete next experiment: sweep the warm
+  count (64 / 128 / 256 vs today's 688) and locate the break-even, rather than warming everything
+  history suggests.
