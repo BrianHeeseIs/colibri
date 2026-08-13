@@ -1040,3 +1040,25 @@ expert until the router has chosen it, so more threads cannot help. Only *knowin
 
 **Process note:** this is the second time in the campaign that a first-run measurement was
 cold-cache inflated. Warm-up is now mandatory before any timing row.
+
+### E34b. Retraction + methodology fix: short runs cannot measure cache policy
+
+While scoping M7 I asserted the cache policy was "performing worse than uniform-random" because
+`hit_rate=57.7 %` sat below the `164/256 = 64.1 %` residency capacity. **That was my error and is
+retracted.** The uniform-random baseline assumes a *saturated* cache. Ours is not:
+
+- cache capacity = 164 slots/layer x 43 layers = **7052 expert records**
+- bytes read 23.33 GB / 13.37 MB = **1745 distinct loads == 1745 misses** (1 load per miss, no churn)
+- => cache ends the run **24.7 % full**
+
+So nearly every miss in a 17-token run is **compulsory**, not a policy failure. With only a quarter
+of slots populated, 57.7 % is evidence that autopin's 16 pins/layer plus routing skew are working,
+not failing.
+
+**Two consequences:**
+1. Any M7/M6 cache experiment must first run long enough to **saturate** the cache; measured on an
+   8-token benchmark it would be noise-fitting cold-start behaviour.
+2. `expert_wait = 17.9 %` of decode is **cold-start-inflated** and overstates steady-state I/O for
+   long generations. The matvec results (E31-E33) are unaffected - they are pure compute - but the
+   *ranking* that promoted the I/O lane was built on a cold-start number and must be re-derived
+   from a saturated run before any I/O work is justified.
