@@ -805,3 +805,32 @@ compiled binary on disk dated from **02:45** — before the ABI change. Rebuilt:
 binaries that fail for a reason unrelated to correctness — or worse, could *pass* stale and hide a
 real break. Recommended: add a `metal-probes` target, or always rebuild before trusting the suite.
 The suite is 10/10 green with every probe rebuilt from current source.
+
+---
+
+## E28. M1 `spec_keep` — KILLED (branch ft-spec_keep)
+
+First experiment of the performance campaign; kill-test pre-registered in
+`performance-boost-research.md` before the run.
+
+**Design.** 5 arms x 4 coding prompts x 64 tok, ram96, paired, frozen history,
+`COLI_V4_SAVE_USAGE=0`, engaged-counter = `v4_dspark attempts`, text_sha per row.
+
+| arm | config | mean tok/s | paired Δ | acceptance by prompt |
+|---|---|---|---|---|
+| base | no speculation | 0.4474 | — | — |
+| d4k0 | DRAFT=4 (self-disabling default) | 0.4381 | −2.1 % | 0/0/75/0 % |
+| d4k1 | DRAFT=4 + PARTIAL_KEEP=1 | 0.4098 | **−8.1 %** | 31/0/54/0 % |
+| d2k1 | DRAFT=2 + KEEP | 0.4277 | −4.3 % | 40/0/69/0 % |
+| d8k1 | DRAFT=8 + KEEP | 0.4101 | −7.9 % | 25/0/34/0 % |
+
+Token-exact: p1 text_sha identical across ALL arms (single unique sha). Gates: all `ok`.
+
+**Verdict: KILL.** The kill condition ("no (D,KEEP) beats baseline ≥5 %") fired maximally —
+nothing beat baseline. More KEEP = more wasted verify+replay on undraftable text; the adaptive
+self-disable is doing exactly its job. The historical +18.5 % (24-tok Q&A, older binary) does
+not transfer to this regime — a regime-dependence finding worth more than the method.
+
+**Process notes.** One harness bug cost one run: `local E=$(date +%s) W=$((E-S))` under
+`set -u` — arithmetic expansion referenced `E` before binding. Split declarations; re-ran from
+scratch. M12's priority drops accordingly (its premise weakened).

@@ -91,7 +91,19 @@ S=group matmul → scatter.
 ## 1. Candidate methods
 (Gain = expected effect; Work = S/M/L; each QA block runs under the standing contract above.)
 
-### M1 · `spec_keep` — stop speculation self-disabling; retune draft depth  [Work: S]
+### M1 · `spec_keep` — KILLED 2026-08-13 (pre-registered kill-test fired)
+**Result (ft-spec_keep, 20 runs, ram96, 64 tok, paired, token-exact everywhere, gates ok):**
+base 0.4474 tok/s; d4k0 −2.1 %; **d4k1 (the hypothesis) −8.1 %**; d2k1 −4.3 %; d8k1 −7.9 %.
+Acceptance was 0 % on 3 of 4 prompts (only p3 drafted well, 34-75 %, and still didn't beat
+baseline wall time). KILL condition was "no (D,KEEP) beats baseline ≥5 %" — nothing beat it at
+all. **The self-disable heuristic is protective in this regime, not a bug.** Secondary finding:
+even the previously-recommended `V4_DRAFT=4 V4_NGRAM=1` is −2.1 % here — the historical +18.5 %
+came from a 24-token Q&A regime on an older binary and does NOT transfer to 64-token coding
+prompts. Evidence: `.backlog/spec_keep_sweep.csv`. Consequence: M12 (MTP economics) drops in
+priority — its premise (speculation pays if replay is cheap) now needs the M4 batch first.
+<details><summary>original method text</summary>
+
+### M1 (original) — stop speculation self-disabling; retune draft depth  [Work: S]
 **Mechanism.** n-gram speculation measured **+18.5 %** here, but ONE partial rejection sets
 `spec_disabled=1` for the rest of the generation (:8077-8081) — observed live (`attempts=1
 drafted=4 accepted=0 → adaptive_disabled=1`). `V4_NGRAM_PARTIAL_KEEP=1` exists. Sweep
@@ -110,6 +122,8 @@ for KEEP in 0 1; do for D in 2 4 8; do
 Engaged-counter: `v4_dspark attempts>0` on every arm. PASS = best (D,KEEP) beats `V4_DRAFT=0`
 baseline by ≥10 % paired-mean tok/s with identical `generated_text`. KILL = no (D,KEEP) beats
 baseline ≥5 %.
+
+</details>
 
 ### M15 · `cpu_expert_kernel` — speed the B=1 CPU expert forward itself  [Work: M]  (NEW, Oracle)
 **Mechanism.** §0.1 says warm decode ≈ 88 % expert-forward chain, yet v2 had no method for it.
