@@ -127,3 +127,33 @@ vLLM/SGLang moe_align_block_size: stable sort, pad per expert to BLOCK_SIZE_M, -
   topk weights applied AFTER expert GEMM, separate moe_sum. Small batches skip sort entirely.
 Determinism: upstream engines accept tolerance (assert_close), NOT bitwise — because their
   combine order changes. OURS CAN BE BITWISE because existing order is already ascending-expert.
+
+## PLAN AGENT VERDICT 2026-08-14 01:45 (ses_002821028fferuyKQ5BiBztjK9)
+Plan agent found an ERROR IN MY REASONING and it reframes M4:
+  I called the expert op "bandwidth bound" at 5.34 GB/s. But 5.34 GB/s is ~20x BELOW this
+  machine's DRAM bandwidth (~120 GB/s). The op is NOT memory-saturated. It is DEQUANT +
+  scalar-column-accumulation bound (fp4 dequant).
+  => M4 wins ONLY IF coli_fp4_matmul_batch_ref dequantizes each weight block ONCE and reuses it
+     across the S columns. If it re-dequants per column, f(S) ~ S*f(1) and speedup_op ~ 1.0.
+  => THIS IS THE GATE. Testable standalone with ZERO model code. If it fails we abandon M4 free.
+
+Also useful: FFN ops = 258 * 2.502ms = 645.5 ms/token ~= 100% of the 0.6455 s/token prefill.
+So overall prefill speedup ~= FFN speedup. Single clean lever.
+
+### Gate thresholds (G0), adopted
+projected FFN speedup = sum(S_i * f(1)) / sum(f(S_i)) over the REAL group-size distribution.
+  GO       >= 1.25x
+  GRAY     1.10-1.25x  -> minimal impl only (keep chunk 64, batch the unfused ref path)
+  ABANDON  < 1.10x
+  SKEW VETO: also require >=50% of selections in groups S>=2 AND speedup_op(2) >= 1.6
+G3 (post-impl): SHIP if byte-identical AND canaries green AND real >=1.25x (or >=1.10x if GRAY).
+  ROLLBACK if <1.10x OR byte-identity fails with unavoidable reassociation.
+  EXPLICIT: do NOT ship an opt-in tolerance flag here. Byte-identical or abandon.
+  (Contrast E37 --fast-sparse-attn, which we accepted as opt-in. Not repeating that for M4.)
+
+### Wave 1 LAUNCHED (parallel, both measurement-only, no model behavior change)
+- bg_32c65abb  T0a  ultrabrain     : batch primitive f(S) curve + dequant-amortization source read
+                                     + which forward path prefill uses (ref :9444 vs rows16 :6452)
+- bg_3ac594bd  T0b  unspecified-high+ast-grep : COLI_M4_TRACE gated prefill group-size histogram
+                                     on p064/p256 + raw routing trace dump for re-binning
+Next after both: T0c re-bin @64/128/256 + buffer audit, then G0 decision.
