@@ -1062,3 +1062,51 @@ not failing.
    long generations. The matvec results (E31-E33) are unaffected - they are pure compute - but the
    *ranking* that promoted the I/O lane was built on a cold-start number and must be re-derived
    from a saturated run before any I/O work is justified.
+
+---
+
+## E35. Steady-state profile (220 tokens) — the short-run profile was misleading twice
+
+Ran 220 tokens to saturate the expert cache, per the E34b methodology fix.
+
+**Cache reaches steady state:** `hit_rate 57.7 % -> 88.406 %` (61662 requests, 7149 misses).
+
+**`expert_wait` collapses 17.9 % -> 6.0 % of decode** (119.1 -> 41.3 ms/token, -65 %). The I/O
+lane promoted in E33 was chasing a cold-start artifact; **de-promoted, M6/M7 not pursued.**
+Every other phase is within 3 % per-token of the short run, so the 8-token benchmark remains valid
+for *compute* work — it is only the I/O share it distorts.
+
+**`attention` is a PARENT phase.** Its children sum to 64048 ms vs its own 63909 ms, which is why
+a naive sort showed cumulative >100 %. Corrected non-overlapping top level (sums to the reported
+98.7 % accounted):
+
+| top level | ms | % |
+|---|---|---|
+| attention (parent) | 63908.9 | 42.2 |
+| expert_forward | 40261.2 | 26.6 |
+| expert_wait | 9048.5 | 6.0 |
+| shared_expert | 8739.8 | 5.8 |
+| head | 7410.0 | 4.9 |
+| router | 7212.1 | 4.8 |
+| hc_norm | 6110.7 | 4.0 |
+| indexer | 3746.1 | 2.5 |
+| compressor | 2914.5 | 1.9 |
+
+**Leaf ranking — and the finding:**
+
+| leaf | ms | % | optimized |
+|---|---|---|---|
+| expert_forward | 40261.2 | 26.6 | v4 4-row |
+| attn_out | 27418.7 | 18.1 | v4 4-row |
+| **attn_sparse** | **22639.5** | **15.0** | **never touched** |
+| attn_qkv | 13547.3 | 8.9 | v4 4-row |
+| expert_wait | 9048.5 | 6.0 | I/O, de-promoted |
+| shared_expert | 8739.8 | 5.8 | v4 4-row |
+| head | 7410.0 | 4.9 | no - 33.84 ms/token, 1 call/token |
+| router | 7212.1 | 4.8 | no |
+
+`attn_sparse` (2.4041 ms/call x 9417) is **the largest unoptimized leaf in the engine** and was
+invisible in every 8-token profile because I had only ever grepped attn_out/attn_qkv. Steady
+throughput 1.446 tok/s (691.4 ms/token).
+
+**Next lane is attn_sparse, on evidence.**
