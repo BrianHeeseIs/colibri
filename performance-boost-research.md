@@ -238,7 +238,12 @@ currently intra-layer only).
 # phase 2: standing ram64 pair; PASS = hit_rate +>=3pp AND tok/s +>=8%.
 ```
 
-### M7 · `cache_policy` — frequency+recency eviction instead of LRU  [Work: S–M]
+### M15b · `matvec_rows4` — **DONE, cumulative 1.38-1.42x** (ft-matvec_rows4)
+Row-block 2->4. attn_out -47.1 %, attn_qkv -51.6 %, shared_expert -52.0 %, expert_forward
+-34.3 % vs pre-M15; decode 6684 -> 4693-4838 ms, byte-identical. **Shifted the bottleneck**:
+expert_wait 6.2 % -> 17.9 %, promoting M6/M7 to the next lane. See E33.
+
+### M7 · `cache_policy` — frequency+recency eviction instead of LRU  [Work: S–M]  **<- NEXT LANE (expert_wait 17.9 %)**
 **Mechanism.** Eviction is pure-LRU (:5261-5297); skew is extreme; literature (Least-Stale,
 SpecMD) shows LRU collision-misses. Add decayed hit-count to victim score.
 **Gain:** +hit-rate at fixed RAM; each avoided miss saves a 13.37 MB read. **Risk:** low.
