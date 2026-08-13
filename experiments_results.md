@@ -1007,3 +1007,42 @@ argument for having built the profiler first: without per-phase attribution this
 New ranking: matvec 59.4 % · **expert_wait 17.9 %** · everything else 22.7 %.
 That promotes M6/M7 (expert prefetch + cache policy) from "medium" to the next lane, on data
 rather than on the plan's original guess.
+
+---
+
+## E36. `attn_sparse` root cause — clang emits vector-multiply + lane-extract + SERIAL scalar adds
+
+`attn_sparse` is 15.0 % of steady-state decode (22639.5 ms / 9417 calls / 2.4041 ms per call) and
+is the largest never-optimized leaf. Hot path is `coli_v4_sparse_attention_ref` (`c/deepseek_v4.c:3061`).
+Shape: 64 heads x 512 head_dim, MQA (`num_key_value_heads=1`), `index_topk=512`, `sliding_window=128`.
+
+Build uses **`-O3` with no `-ffast-math`** (verified across the full CFLAGS continuation), so LLVM
+may not legally reassociate the FP reduction at `:3086`.
+
+**Disassembled what it actually emits** (`clang -O3 -mcpu=apple-m1`):
+
+```
+ldp   q1, q2, [x10, #-32]     ; vector loads
+fmul.4s v1, v1, v5            ; vector MULTIPLY only
+mov   s5,  v1[3]              ; extract lane 3 -> scalar
+mov   s17, v1[2]              ; extract lane 2 -> scalar
+mov   s18, v1[1]              ; extract lane 1 -> scalar
+...                            ; then a strict serial scalar fadd chain
+```
+
+Greps for accumulators (`fmla.4s`/`fadd.4s` targets) and for a horizontal reduce (`faddp`/`addv`)
+both return **empty**. So the compiler pays vector load + vector multiply cost, **adds** 3
+lane-extract `mov`s per 128-bit vector, and **still** serializes the accumulation. The dependency
+chain on the single `float score` is fully intact and is the binding constraint (~4-cycle FMA
+latency per element, no ILP).
+
+The sibling AXPY at `:3106` has no reduction dependency and vectorizes cleanly - it is not the problem.
+
+**Lever:** hand-written NEON with 4 independent `fmla.4s` accumulators + one final horizontal
+reduce breaks the latency chain and deletes the lane-extract overhead. Secondary: `:3069`
+`malloc`/`free` of `scores` runs **once per call** (9417 mallocs per 220-token run), and the kv rows
+are walked twice (score pass, then value pass).
+
+**Caveat that must be tested, not assumed:** multiple accumulators change FP summation order, so
+this is *not* automatically bit-exact. The campaign gate is token-exact output; that must be
+verified empirically, with an order-preserving fallback if it fails.
