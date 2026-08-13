@@ -487,7 +487,7 @@ all: colibri$(EXE)
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 deepseek-v4:
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) METAL=$(METAL) deepseek-v4
 
 deepseek-v4-clean:
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean

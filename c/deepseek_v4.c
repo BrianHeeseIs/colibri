@@ -3035,6 +3035,9 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
 #include "deepseek_v4_internal.h"
 #include "deepseek_v4_internal.h"
 #include "native_quant.h"
+#ifdef COLI_V4_METAL_SEAM
+#include "backend_metal_v4_seam.h"
+#endif
 
 static int set_error(char *error, size_t size, const char *format, ...) {
     if (error && size) {
@@ -3164,9 +3167,16 @@ static int moe_token(float *output,
             result = -1;
             break;
         }
-        result = coli_v4_expert_forward_ref(expert_output, &expert, input,
-                                             route_weights[rank],
-                                             config->swiglu_limit);
+        int done = 0;
+#ifdef COLI_V4_METAL_SEAM
+        if (coli_v4_metal_enabled() &&
+            coli_v4_metal_expert_forward(expert_output, &expert, input,
+                                         route_weights[rank],
+                                         config->swiglu_limit) == 0) done = 1;
+#endif
+        if (!done) result = coli_v4_expert_forward_ref(
+            expert_output, &expert, input, route_weights[rank],
+            config->swiglu_limit);
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -3727,9 +3737,18 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active[slot] = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
-            expert_output, &expert, input, expert_weights[current],
-            config->swiglu_limit);
+        if (!result) {
+            int done = 0;
+#ifdef COLI_V4_METAL_SEAM
+            if (coli_v4_metal_enabled() &&
+                coli_v4_metal_expert_forward(expert_output, &expert, input,
+                                             expert_weights[current],
+                                             config->swiglu_limit) == 0) done = 1;
+#endif
+            if (!done) result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+        }
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -3760,9 +3779,18 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
-            expert_output, &expert, input, expert_weights[current],
-            config->swiglu_limit);
+        if (!result) {
+            int done = 0;
+#ifdef COLI_V4_METAL_SEAM
+            if (coli_v4_metal_enabled() &&
+                coli_v4_metal_expert_forward(expert_output, &expert, input,
+                                             expert_weights[current],
+                                             config->swiglu_limit) == 0) done = 1;
+#endif
+            if (!done) result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+        }
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -5080,8 +5108,14 @@ typedef struct {
     unsigned references;
     uint64_t used;
     unsigned char *slab;
+    size_t slab_bytes;
     int aligned_slab;
 } V4ExpertSlot;
+
+#ifdef COLI_V4_METAL_SEAM
+void coli_v4_metal_register_slab(void *base, size_t length);
+void coli_v4_metal_unregister_slab(void *base);
+#endif
 
 typedef struct {
     ColiSafetensorsIndex *index;
@@ -5356,13 +5390,18 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
+#ifdef COLI_V4_METAL_SEAM
+            if (state->slots[i].slab && state->slots[i].slab_bytes)
+                coli_v4_metal_unregister_slab(state->slots[i].slab);
+#endif
             /* aligned_slab means posix_memalign, which on Windows is
              * _aligned_malloc and must not reach free(). */
             if (state->slots[i].aligned_slab)
                 compat_aligned_free(state->slots[i].slab);
             else
                 free(state->slots[i].slab);
+        }
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);
@@ -5900,14 +5939,25 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         return -1;
     }
     if (!slot->slab) {
+        const size_t page = 16384u;
         size_t capacity = (size_t)state->record_bytes + 8192u;
-        if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
+        if (capacity > SIZE_MAX - (page - 1)) {
+            pthread_mutex_unlock(&state->mutex);
+            memset(view, 0, sizeof(*view));
+            return -1;
+        }
+        capacity = (capacity + page - 1) & ~(page - 1);
+        if (posix_memalign((void **)&slot->slab, page, capacity)) {
             slot->slab = NULL;
             pthread_mutex_unlock(&state->mutex);
             memset(view, 0, sizeof(*view));
             return -1;
         }
+        slot->slab_bytes = capacity;
         slot->aligned_slab = 1;
+#ifdef COLI_V4_METAL_SEAM
+        coli_v4_metal_register_slab(slot->slab, slot->slab_bytes);
+#endif
         state->stats.resident_bytes += state->record_bytes;
     }
     policy->packed[hot_slot_index(state, slot)] = 0;
@@ -6724,6 +6774,9 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #include "json.h"
 #include "native_quant.h"
 #include "tok.h"
+#ifdef COLI_V4_METAL_SEAM
+#include "backend_metal_v4_seam.h"
+#endif
 
 static int load_embedding(float *state, const ColiSafetensorsIndex *index,
                           const ColiDeepSeekV4Config *config, int token) {
@@ -8273,6 +8326,16 @@ static int spec_print(Tok *tokenizer, int token, float logit,
     return stop_sentence && spec_sentence_end(piece, length);
 }
 
+static void v4_metal_stats_emit(void) {
+#ifdef COLI_V4_METAL_SEAM
+    const char *enabled = getenv("COLI_V4_METAL_STATS");
+    if (enabled && !strcmp(enabled, "1"))
+        fprintf(stderr, "metal_dispatches=%lu\n", coli_v4_metal_dispatches());
+    const char *profile = getenv("COLI_V4_METAL_PROFILE");
+    if (profile && !strcmp(profile, "1")) coli_v4_metal_profile_report();
+#endif
+}
+
 static void v4_generate_cleanup(
     ColiV4Session *session,
     char *prompt_storage,
@@ -8317,6 +8380,7 @@ static void v4_generate_cleanup(
     v4_attention_free(attention, layers);
     coli_v4_engine_destroy(engine);
     free(prompt_storage);
+    v4_metal_stats_emit();
 }
 
 typedef struct {
@@ -8588,6 +8652,7 @@ static int v4_serve_main(void) {
     }
     coli_v4_session_destroy(session);
     coli_v4_engine_destroy(engine);
+    v4_metal_stats_emit();
     return 0;
 }
 
