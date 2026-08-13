@@ -1007,3 +1007,36 @@ argument for having built the profiler first: without per-phase attribution this
 New ranking: matvec 59.4 % · **expert_wait 17.9 %** · everything else 22.7 %.
 That promotes M6/M7 (expert prefetch + cache policy) from "medium" to the next lane, on data
 rather than on the plan's original guess.
+
+---
+
+## E34. `loader_depth` — **NEGATIVE, hypothesis rejected** (no code change kept)
+
+`COLI_V4_EXPERT_LOADER_COUNT` is a compile-time constant (3). Since `expert_wait` had risen to
+17.9 % of decode, tested whether the loaders were queue-depth starved by sweeping N = 3/6/10.
+
+**The first sweep looked like a 2.3x win and was entirely an artifact.** N=3 ran first on a cold
+page cache after a full 26-unit rebuild and reported `decode_wall=10706 ms`,
+`expert_forward=3898 ms` — but the identical committed N=3 build had measured 4693-4838 ms with
+`expert_forward≈1240 ms` minutes earlier. Loader count cannot triple compute time; N=6 and N=10
+simply inherited the warmth N=3 paid for.
+
+Re-measured N=3 **warm**, same protocol:
+
+| loaders | decode_wall ms | expert_wait ms |
+|---|---|---|
+| 3 (warm, run1) | 4761.3 | 834.0 |
+| 3 (warm, run2) | 4771.6 | 757.0 |
+| 6 | 4750.8 | 833.1 |
+| 10 | 4721.8 | 839.9 |
+
+All within ~1 %; `expert_wait` statistically identical. **Loader parallelism is not the
+constraint — rejected, nothing merged.** Also re-confirms the M15b baseline reproduces (4761/4772
+sits inside the earlier 4693-4838 band).
+
+Implication: the residual wait is **dependency-bound, not bandwidth-bound**. You cannot fetch an
+expert until the router has chosen it, so more threads cannot help. Only *knowing earlier*
+(prediction) or *missing less often* (cache policy) can. That points at M7/M6, not at parallelism.
+
+**Process note:** this is the second time in the campaign that a first-run measurement was
+cold-cache inflated. Warm-up is now mandatory before any timing row.
