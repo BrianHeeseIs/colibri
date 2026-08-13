@@ -140,7 +140,15 @@ baseline ≥5 %.
 
 </details>
 
-### M15 · `cpu_expert_kernel` — speed the B=1 CPU expert forward itself  [Work: M]  (NEW, Oracle)
+### M15 · `matvec_kernels` — **DONE, −20.4 % decode, bit-exact** (ft-matvec_kernels)
+Rescoped by M16's profile from "expert kernel" (28.7 %) to BOTH matvec families (76.3 %).
+Shipped: tail-branch hoist + paired-row activation walk + gate/up dual-matvec fusion, on MXFP4
+and FP8-rows8. Real-model paired: decode 6684→5322 ms (**1.26×**), attn_out −32.9 %, attn_qkv
+−36.0 %, expert_forward −25.7 %, shared_expert −37.6 %, `generated_text` byte-identical.
+Savings landed 117 % inside the predicted phases. See E30/E32.
+<details><summary>original method text</summary>
+
+### M15 (original) — speed the B=1 CPU expert forward  [Work: M]
 **Mechanism.** §0.1 says warm decode ≈ 88 % expert-forward chain, yet v2 had no method for it.
 Candidates inside `matmul_mxfp4` scalar path (quant.h:1401-1412) / `coli_fp4_dual_matvec_ref`:
 NEON/vectorized nibble decode (the AVX2 branch shows the shape — arm64 got none), multi-row
@@ -156,6 +164,8 @@ cd c && cc -O3 -mcpu=native tests/bench variant vs baseline (new bench_mxfp4.c) 
 # engine: standing 8-tok pair, envs none (kernel change), PASS = tiny-oracle token-exact AND
 # paired after_first improves >=10%. KILL = <5% on both microbench and engine.
 ```
+
+</details>
 
 ### M2 · `rope_cache` — KILLED 2026-08-13 by its own pre-registered gate
 **M11 measured rope = 1.242 ms of a 6775 ms decode = 0.02 %** (gate required ≥3 %). The rebuild
