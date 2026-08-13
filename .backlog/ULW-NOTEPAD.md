@@ -68,3 +68,20 @@ Q2. E37 shipped --fast-sparse-attn as opt-in (not bit-exact). If M4 grouping als
     combine order (likely - summing expert contributions in a different order), do you want the
     same opt-in treatment, or is prefill-only reordering acceptable by default since it affects
     the prompt pass rather than sampled output? (I will default to opt-in/bit-exact unless told.)
+
+## Findings 2026-08-14 01:32 — prefill curve MEASURED (the M4 business case)
+| prompt | tokens | ttft s | prefill s | ms/token | hit_rate |
+|---|---|---|---|---|---|
+| "Hi"  |   5 |   5.278 |  (floor) |    -  | 34.3% |
+| p064  |  70 |  45.249 |  39.971  | 615.0 | 76.4% |
+| p256  | 184 | 118.840 | 113.562  | 634.4 | 86.2% |
+
+Marginal cost between the two points = 645.5 ms/token => prefill is LINEAR at ~0.63-0.65 s/token.
+Extrapolated 799-token prompt ~ 516s (~8.6 min). Matches the plan's 708s order of magnitude.
+
+DECISIVE: per token there are 43*6 = 258 expert ops, so ~2.50 ms per expert op, and each op
+reads a 13.37 MB expert record => ~5.3 GB/s effective. That is RAM-bandwidth territory, NOT
+compute. At S=1 the expert FFN is BANDWIDTH BOUND on weight reads.
+=> Batching S tokens against one expert amortizes the same 13.37MB read over S tokens.
+=> Expected win is ~linear in S until the compute roof. This validates M4 as the right lane.
+=> AND it re-confirms that raising the 64-token chunk (to lift S) is the lever that matters.
