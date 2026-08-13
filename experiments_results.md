@@ -834,3 +834,26 @@ not transfer to this regime — a regime-dependence finding worth more than the 
 **Process notes.** One harness bug cost one run: `local E=$(date +%s) W=$((E-S))` under
 `set -u` — arithmetic expansion referenced `E` before binding. Split declarations; re-ran from
 scratch. M12's priority drops accordingly (its premise weakened).
+
+---
+
+## E29. M11 `phase_profiler` — DONE, and the profile overturns the cost model
+
+Runtime `COLI_V4_PROFILE=1` profiler (branch ft-phase_profiler): 98.0 % of flash decode wall
+attributed (99.1-99.3 % tiny), zero output when unset, token-exact with profiler ON, 26-object
+default build intact. Overhead check inconclusive-but-benign: the profiled run was FASTER than
+the unprofiled pair (6.776 vs 7.362 s) — ambient variance dominates any profiler cost.
+
+**Flash decode profile (7 tokens, 968 ms/token, ram96):** attention **38.7 %**, expert_forward
+**28.2 %** (1.06 ms/call), shared_expert 8.8 %, expert_wait 8.7 %, head 3.6 %, router 3.4 %,
+hc_norm 2.9 %, indexer+compressor 3.7 %, embed 0.06 %, rope **0.02 %**.
+
+**RETRACTION.** The campaign doc's "expert chain ≈88 % of decode" was wrong: the 2.81 ms/expert
+figure had been derived by dividing total wall by dispatch count, silently absorbing attention,
+router, shared expert and head. Real expert_forward is 1.06 ms/call; the routed chain is 36.9 %
+and **attention is co-dominant at 38.7 %** — with no dedicated method until now (M16 added).
+
+**Consequences, all via pre-registered gates:** M2 rope_cache KILLED (0.02 % < 3 % gate — the
+gate fired exactly as designed, cheaper than the branch would have been); M3 gutted (embed half
+dead at 0.06 %); M16 `attention_dissect` added; sequencing rewritten (attention and expert
+kernels are the two lanes; prefill batch M4 unchanged).

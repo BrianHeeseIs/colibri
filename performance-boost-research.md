@@ -1,6 +1,6 @@
 # DeepSeek-V4-flash on M3 Max — Performance-Boost Research
 
-Status: **v3 — REVIEW PASSED** (2026-08-13 20:35).
+Status: **v4** — v3 PASSED review; v4 adds M11's measured profile, the §0.1 retraction, M1/M2 kill records, M16, and data-driven resequencing (2026-08-13 22:10).
 Oracle: PASS — "none of prior 4 blockers survives … technically careful, hypothesis-driven
 plan"; one standing caution: the 100–200 GB/s CPU-attainable-bandwidth figure is an estimate,
 to be pinned by M11/M15 measurement, and is framed as such.
@@ -51,11 +51,26 @@ COLI_V4_SAVE_USAGE=0 <METHOD_ENVS> ./c/deepseek_v4 models/deepseek-v4-flash \
 | observed failure | ONE partial n-gram rejection → `spec_disabled=1` for the whole generation | :8077-8081 |
 | PREWARM (688 experts eager) | killed −29.7 %; +9.98 pp hit rate; net +3.7 GB I/O | §13 |
 
-### 0.1 Where a decoded token's time goes (warm, ram96)
-Serial **expert-forward chain** (each forward internally OpenMP-16; forwards execute serially in
-`moe_token_pipeline` :3717-3797): 258 × 2.81 ms ≈ **725 ms of the ~820 ms/token**. The 2.81 ms is
-wall time per forward, so summing sequential wall times is valid critical-path attribution
-(Oracle-verified; includes wrapper work, not pure matmul). Everything else ≈ ~95 ms/token.
+### 0.1 Where a decoded token's time goes — MEASURED (M11 profiler, ram96, 98% accounted)
+
+| phase | ms/token | share |
+|---|---|---|
+| **attention** | 374.4 | **38.7 %** |
+| **expert_forward** (1806 calls, 1.06 ms each) | 273.3 | **28.2 %** |
+| shared_expert | 84.8 | 8.8 % |
+| expert_wait (loader stall) | 84.3 | 8.7 % |
+| head | 34.4 | 3.6 % |
+| router | 33.2 | 3.4 % |
+| hc_norm | 28.3 | 2.9 % |
+| indexer + compressor | 35.7 | 3.7 % |
+| embed + rope + other | 19.7 | 2.1 % |
+
+**RETRACTION (v3→v4):** earlier versions claimed the expert-forward chain was "~88 % of warm
+decode" from 258 × 2.81 ms. That 2.81 ms figure came from dividing TOTAL wall time by dispatch
+count — it silently attributed attention, router, shared expert and head to the experts. The
+profiler shows expert_forward is **1.06 ms/call**; the routed-expert chain (forward + wait) is
+**36.9 %**, and **attention is co-dominant at 38.7 % (8.7 ms/call)** — a cost center v3 treated
+as minor. Every downstream estimate inherited this error; §1 statuses below are corrected.
 
 ### 0.2 The walls, stated precisely (revised per Oracle blocker #1)
 1. **Weight-traffic floor:** a decoded token touches ≥ 258 × 13.37 MB ≈ 3.45 GB of *model bytes*
@@ -142,7 +157,12 @@ cd c && cc -O3 -mcpu=native tests/bench variant vs baseline (new bench_mxfp4.c) 
 # paired after_first improves >=10%. KILL = <5% on both microbench and engine.
 ```
 
-### M2 · `rope_cache` — cache RoPE tables on the DECODE path  [Work: S–M]  (revised per Oracle)
+### M2 · `rope_cache` — KILLED 2026-08-13 by its own pre-registered gate
+**M11 measured rope = 1.242 ms of a 6775 ms decode = 0.02 %** (gate required ≥3 %). The rebuild
+loops are real but cost nothing at this scale. No branch, no build — the gate did its job.
+<details><summary>original method text</summary>
+
+### M2 (original) — cache RoPE tables on the DECODE path  [Work: S–M]
 **Mechanism.** DECODE attention rebuilds the RoPE table to `position+1` every token·layer
 (:1647-1664, dup :4847-4864; compressor/indexer sites :2846-2930). **Prefill batched attention
 already precomputes once per chunk/layer (:2233-2313) — v2's prefill claim was WRONG and is
@@ -152,11 +172,13 @@ treat as small until measured. **Risk:** low (cache stores exactly the loop's va
 **QA.** Gated on M11 showing RoPE ≥3 % of decode. Then standing 8-tok pair at position≥512
 (long-context session), PASS = token-exact + measurable win consistent with M11's attribution.
 
+</details>
+
 ### M3 · `resident_head_embed` — stop per-token head/embedding re-reads  [Work: S]
 **Mechanism.** `final_hidden` reloads `hc_head_fn/base/scale/norm.weight` every token
 (:6802-6842); embedding row buffered-pread per token (:6781-6799). Cache head tensors; cache/mmap
 hot embed rows.
-**Gain:** 1-5 % decode (syscall+alloc removal). **Risk:** negligible.
+**Gain (revised by M11 data):** embed measured 0.06 % → that half is DEAD. head phase is 3.6 % total and includes the argmax compute, so the reload slice is a fraction of that. Ceiling ≈1-2 %; DEPRIORITIZED below M7/M10/M15.
 **QA.** `sudo fs_usage -w -f filesys <pid>` (or ktrace) during 8 warm tokens: PASS = per-token
 reads of those tensors drop to 0 AND standing pair token-exact, non-negative delta.
 
@@ -234,12 +256,18 @@ mostly scalar (:2846-2930). Element-parallel only (NO sum-reorder) to preserve t
 **Gain:** part of the ~95 ms/token non-expert slice (M11 will size it). **QA.** Standing 8-tok
 pair; PASS = token-exact + after_first −≥5 %. KILL if M11 shows the slice <8 % of decode.
 
-### M11 · `phase_profiler` — wire the dormant per-phase profiler  [Work: S]  (ENABLER — first)
+### M11 · `phase_profiler` — DONE 2026-08-13 (branch ft-phase_profiler)
+Runtime `COLI_V4_PROFILE=1`; 98-99 % accounted (tiny + flash); zero lines when unset; token-exact with profiler ON; 26-object default build. Its first real-model profile forced the §0.1 retraction, killed M2, gutted M3, and exposed attention as co-dominant.
+<details><summary>original method text</summary>
+
+### M11 (original) — [Work: S]
 **Mechanism.** `COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE` hooks exist without glue (:3553-3587).
 Wire + add startup-phase timers + RoPE/head/embed counters. Converts every "est." above into a
 measurement; Oracle's re-sequencing depends on it.
 **QA.** `COLI_V4_PROFILE=1` run emits per-phase ms summing to within 10 % of wall `after_first`;
 zero overhead when env unset (paired check).
+
+</details>
 
 ### M12 · `mtp_economics` — make 70-89 % MTP acceptance pay  [Work: S sweeps; rides M4]
 **Mechanism.** MTP loses on rejection-replay only. Sweep `V4_MTP_PARTIAL_KEEP=1`,
@@ -257,22 +285,36 @@ PASS = gap_gb stays ≤1 and compressor stays flat on the wired arm where the un
 ### M14 · `cpu_gpu_split` — heterogeneous co-execution  [Work: L, PARKED]
 Revisit only if M11 shows the non-expert track ≥20 % of decode. Ceiling ≤ min(track).
 
+### M16 · `attention_dissect` — sub-attribute then attack the 38.7 % attention phase  [Work: S then ?]
+**(Added v4 — the profile exposed a 374 ms/token blob with no dedicated method.)** Attention is
+8.7 ms/call and internally unattributed: FP8 matvecs wq_a/wq_b/wkv/wo (already OpenMP :10377),
+scalar sparse attention (:2953-3006), `all_kv` assembly copies (:1687-1726), KV ring writes.
+Step 1 (S): extend the M11 profiler with attention sub-phases. Step 2: attack whatever dominates
+(scalar sparse-attn → M10-style OpenMP; copies → buffer reuse; matvecs → M15-style kernel work).
+**QA.** Sub-profile first (same standing contract); the sub-phase table IS the gate for step 2.
+PASS for step 2 = paired after_first −≥8 % with token-exact output. Absorbs M10's
+sparse-attention slice; M10 keeps hc_norm/indexer (~5 % combined).
+
 ### Rejected / falsified (do not re-tread)
 Per-expert S=1 GPU offload (−1.118×, §12) · bulk eager prewarm-688 (−29.7 %, §13) · Apple
 Tensor API/MPP on M3 (M5-generation only, ll.cpp PR#20962) · F_NOCACHE for repeated sessions ·
 wiring 162 GB into 128 GiB.
 
-## 2. Sequencing (revised per Oracle)
+## 2. Sequencing (v4 — reordered by M11 measurement)
+
 ```
-Wave 0 (parallel):  M11 profiler  +  M1 spec_keep          <- first executable pair
-Wave 1 (profiler-informed, small): M3, M7, M8, M12-sweeps; M2 only if M11 shows RoPE >=3%
-Wave 2 (the structural win):       M4 moe_batch  ──telemetry gate──► M5 gpu_gather_moe
-Wave 3 (kernel + robustness):      M15 cpu_expert_kernel (microbench-gated), M10 (M11-gated),
-                                   M6 (recall-gated), M9 (startup lane), M13
-Parked: M14
+DONE:    M11 profiler (98% attribution)   M1 spec_keep (KILLED)   M2 rope_cache (KILLED by gate)
+Wave 1:  M16 attention_dissect step-1 (S, same enabler lane)  ──► pick attention attack from data
+Wave 2:  M15 cpu_expert_kernel (28.2% target, microbench-gated)
+         M7 cache_policy + M6-phase-1 recall log (expert_wait 8.7% + miss economics)
+Wave 3:  M4 moe_batch (prefill lane) ──gate──► M5 gpu_gather_moe
+Startup lane (independent): M9 mmap_load, M8 warm_break_even
+Deprioritized by data: M3 (≤1-2%), M12 (premise weakened by M1), M13 (robustness only)
+Parked: M14, M10-residual
 ```
-**Least-work first: M1 `spec_keep`** (branch `ft-spec_keep`), with M11 wired alongside on the
-same branch-cadence since every later priority depends on its attribution.
+Rationale: decode = attention 38.7 % + experts 36.9 % + everything-else 24 %. The two dominant
+blocks get the next two lanes; M16 step-1 is the least-work next action and directly picks the
+Wave-1 attack.
 
 ## 3. Sources
 (unchanged from v2 — llama.cpp MUL_MAT_ID/mmap/PRs #24524 #25294 #20962 d#12985 d#4167 d#24528;
