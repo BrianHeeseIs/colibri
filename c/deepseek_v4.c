@@ -1,6 +1,22 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+
+enum {
+    COLI_V4_PROFILE_EMBED,
+    COLI_V4_PROFILE_HC_NORM,
+    COLI_V4_PROFILE_ATTENTION,
+    COLI_V4_PROFILE_ROPE,
+    COLI_V4_PROFILE_COMPRESSOR,
+    COLI_V4_PROFILE_INDEXER,
+    COLI_V4_PROFILE_ROUTER,
+    COLI_V4_PROFILE_SHARED_EXPERT,
+    COLI_V4_PROFILE_EXPERT_WAIT,
+    COLI_V4_PROFILE_EXPERT_FORWARD,
+    COLI_V4_PROFILE_HEAD,
+    COLI_V4_PROFILE_COUNT,
+};
+
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
 
@@ -1414,6 +1430,21 @@ int coli_v4_swiglu(float *output, const float *gate, const float *up,
 #include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
+extern int coli_v4_profile_on;
+extern uint64_t coli_v4_profile_now_ns(void);
+extern void coli_v4_profile_add(int phase, uint64_t elapsed_ns);
+#define COLI_V4_PROFILE_ROPE 3
+
+extern int coli_v4_profile_on;
+extern uint64_t coli_v4_profile_now_ns(void);
+extern void coli_v4_profile_add(int phase, uint64_t elapsed_ns);
+#define COLI_V4_PROFILE_ROPE 3
+
+extern int coli_v4_profile_on;
+extern uint64_t coli_v4_profile_now_ns(void);
+extern void coli_v4_profile_add(int phase, uint64_t elapsed_ns);
+#define COLI_V4_PROFILE_ROPE 3
+
 static int set_error(char *error, size_t size, const char *format, ...);
 
 struct ColiDeepSeekV4WindowAttentionState {
@@ -1598,6 +1629,9 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
+    uint64_t attention_began = coli_v4_profile_on
+        ? coli_v4_profile_now_ns() : 0;
+    uint64_t compressor_ns = 0, indexer_ns = 0;
     int result = coli_fp8_matvec_ref(qa, &wq_a, input);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
@@ -1611,18 +1645,34 @@ static int attention_token_impl(float *output,
         if (!result && (position + 1) % state->ratio == 0)
             result = grow_compressed_state(state, error, error_size);
         int produced = 0;
-        if (!result) result = coli_v4_compressor_step(
-            state->compressor,
-            state->compressed + (size_t)state->compressed_count * head_dim,
-            &produced, input, position, error, error_size);
+        if (!result) {
+            uint64_t began = coli_v4_profile_on
+                ? coli_v4_profile_now_ns() : 0;
+            result = coli_v4_compressor_step(
+                state->compressor,
+                state->compressed + (size_t)state->compressed_count * head_dim,
+                &produced, input, position, error, error_size);
+            if (coli_v4_profile_on) {
+                compressor_ns = coli_v4_profile_now_ns() - began;
+                coli_v4_profile_add(COLI_V4_PROFILE_COMPRESSOR, compressor_ns);
+            }
+        }
         if (!result && produced) state->compressed_count++;
         if (!result && state->indexer) {
             compressed_indices = malloc((size_t)config->index_topk *
                                         sizeof(*compressed_indices));
             if (!compressed_indices) result = -1;
-            else compressed_selected = coli_v4_indexer_step(
-                state->indexer, compressed_indices, config->index_topk,
-                qa, input, position, error, error_size);
+            else {
+                uint64_t began = coli_v4_profile_on
+                    ? coli_v4_profile_now_ns() : 0;
+                compressed_selected = coli_v4_indexer_step(
+                    state->indexer, compressed_indices, config->index_topk,
+                    qa, input, position, error, error_size);
+                if (coli_v4_profile_on) {
+                    indexer_ns = coli_v4_profile_now_ns() - began;
+                    coli_v4_profile_add(COLI_V4_PROFILE_INDEXER, indexer_ns);
+                }
+            }
             if (compressed_selected < 0) result = -1;
         }
     }
@@ -1645,6 +1695,8 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
 
     if (!result) {
+        uint64_t rope_began = coli_v4_profile_on
+            ? coli_v4_profile_now_ns() : 0;
         float *all_cos = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_cos));
         float *all_sin = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_sin));
         int compressed = weights->plan.compression_ratio != 0;
@@ -1661,6 +1713,9 @@ static int attention_token_impl(float *output,
                    (size_t)rope_dim / 2 * sizeof(*sines));
         }
         free(all_sin); free(all_cos);
+        if (coli_v4_profile_on)
+            coli_v4_profile_add(COLI_V4_PROFILE_ROPE,
+                                coli_v4_profile_now_ns() - rope_began);
     }
     if (!result) {
         for (int head = 0; head < heads; head++) {
@@ -1766,6 +1821,12 @@ static int attention_token_impl(float *output,
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
+    if (coli_v4_profile_on) {
+        uint64_t elapsed = coli_v4_profile_now_ns() - attention_began;
+        if (elapsed >= compressor_ns + indexer_ns)
+            elapsed -= compressor_ns + indexer_ns;
+        coli_v4_profile_add(COLI_V4_PROFILE_ATTENTION, elapsed);
+    }
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -2658,7 +2719,6 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
                        sines + (size_t)rope_position * pairs, 0);
     coli_bf16_round_array(rope, (size_t)state->rope_dim);
     free(sines); free(cosines);
-
     size_t quantized = state->rotate_fp4
         ? (size_t)dimension : (size_t)(dimension - state->rope_dim);
     size_t block = state->rotate_fp4 ? 32u : 64u;
@@ -3039,6 +3099,10 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
 #include "backend_metal_v4_seam.h"
 #endif
 
+extern int coli_v4_profile_on;
+extern uint64_t coli_v4_profile_now_ns(void);
+extern void coli_v4_profile_add(int phase, uint64_t elapsed_ns);
+
 static int set_error(char *error, size_t size, const char *format, ...) {
     if (error && size) {
         va_list arguments;
@@ -3152,8 +3216,14 @@ static int moe_token(float *output,
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
-    if (!result) result = coli_v4_shared_expert_forward_ref(
-        shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+    if (!result) {
+        uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
+        result = coli_v4_shared_expert_forward_ref(
+            shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+        if (coli_v4_profile_on)
+            coli_v4_profile_add(COLI_V4_PROFILE_SHARED_EXPERT,
+                                coli_v4_profile_now_ns() - began);
+    }
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
     for (int expert_id = 0; !result && expert_id < n; expert_id++) {
         int rank = -1;
@@ -3213,8 +3283,12 @@ static int block_token_impl(float *output_hc,
         return set_error(error, error_size, "out of memory in block");
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
+    uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    if (coli_v4_profile_on)
+        coli_v4_profile_add(COLI_V4_PROFILE_HC_NORM,
+                            coli_v4_profile_now_ns() - began);
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
@@ -3563,6 +3637,7 @@ void coli_v4_block_profile_add(int kind, double seconds);
 
 static int profiled_expert_load_start(ExpertLoadHandle *handle,
                                       ExpertLoadJob *job) {
+    uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double began = coli_v4_block_profile_now();
 #endif
@@ -3571,10 +3646,14 @@ static int profiled_expert_load_start(ExpertLoadHandle *handle,
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_START,
                               coli_v4_block_profile_now() - began);
 #endif
+    if (coli_v4_profile_on)
+        coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_WAIT,
+                            coli_v4_profile_now_ns() - began);
     return result;
 }
 
 static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
+    uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double began = coli_v4_block_profile_now();
 #endif
@@ -3583,6 +3662,9 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_WAIT,
                               coli_v4_block_profile_now() - began);
 #endif
+    if (coli_v4_profile_on)
+        coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_WAIT,
+                            coli_v4_profile_now_ns() - began);
     return result;
 }
 
@@ -3632,6 +3714,7 @@ static int moe_token_pipeline(float *output,
     const float *bias = value(weights, "ffn.gate.bias", NULL);
     int result = token < 0 || token >= config->vocab_size;
     if (!result && weights->plan.uses_hash_router && !table) result = -1;
+    uint64_t router_began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
     if (!result && weights->plan.uses_hash_router)
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
@@ -3658,6 +3741,9 @@ static int moe_token_pipeline(float *output,
         }
     }
     if (!result && selected != topk) result = -1;
+    if (coli_v4_profile_on)
+        coli_v4_profile_add(COLI_V4_PROFILE_ROUTER,
+                            coli_v4_profile_now_ns() - router_began);
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
     if (!result && expert_prefetch_enabled() && store->ops->prefetch) {
@@ -3709,8 +3795,14 @@ static int moe_token_pipeline(float *output,
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
-    if (!result) result = coli_v4_shared_expert_forward_ref(
-        shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+    if (!result) {
+        uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
+        result = coli_v4_shared_expert_forward_ref(
+            shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+        if (coli_v4_profile_on)
+            coli_v4_profile_add(COLI_V4_PROFILE_SHARED_EXPERT,
+                                coli_v4_profile_now_ns() - began);
+    }
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
@@ -3738,6 +3830,7 @@ static int moe_token_pipeline(float *output,
                 loader_active[slot] = 1;
         }
         if (!result) {
+            uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
             int done = 0;
 #ifdef COLI_V4_METAL_SEAM
             if (coli_v4_metal_enabled() &&
@@ -3748,6 +3841,9 @@ static int moe_token_pipeline(float *output,
             if (!done) result = coli_v4_expert_forward_ref(
                 expert_output, &expert, input, expert_weights[current],
                 config->swiglu_limit);
+            if (coli_v4_profile_on)
+                coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_FORWARD,
+                                    coli_v4_profile_now_ns() - began);
         }
         coli_expert_release(store, &expert);
         if (!result)
@@ -3780,6 +3876,7 @@ static int moe_token_pipeline(float *output,
                 loader_active = 1;
         }
         if (!result) {
+            uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
             int done = 0;
 #ifdef COLI_V4_METAL_SEAM
             if (coli_v4_metal_enabled() &&
@@ -3837,8 +3934,12 @@ static int block_token_pipeline(float *output_hc,
         free(reduced); free(state); free(residual); return -1;
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
+    uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    if (coli_v4_profile_on)
+        coli_v4_profile_add(COLI_V4_PROFILE_HC_NORM,
+                            coli_v4_profile_now_ns() - began);
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
@@ -3848,9 +3949,14 @@ static int block_token_pipeline(float *output_hc,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
-    if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
-                                            weights, config, "ffn",
-                                            "ffn_norm.weight");
+    if (!result) {
+        began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
+        result = normalized_hc_pre(reduced, post, comb, normalized, state,
+                                   weights, config, "ffn", "ffn_norm.weight");
+        if (coli_v4_profile_on)
+            coli_v4_profile_add(COLI_V4_PROFILE_HC_NORM,
+                                coli_v4_profile_now_ns() - began);
+    }
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
@@ -6749,10 +6855,66 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #define spec_print spec_print_diagnostic_legacy
 /* Target-only generation helpers. */
 #include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>                         /* getrusage/RUSAGE_SELF for v4_serve_rss_gb;
                                                    * on Windows compat.h supplies the shim. */
 #endif
+
+typedef struct {
+    uint64_t elapsed_ns;
+    uint64_t calls;
+} ColiV4ProfilePhase;
+
+int coli_v4_profile_on;
+static int coli_v4_profile_env = -1;
+static ColiV4ProfilePhase coli_v4_profile[COLI_V4_PROFILE_COUNT];
+
+uint64_t coli_v4_profile_now_ns(void) {
+    struct timespec value;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &value);
+    return (uint64_t)value.tv_sec * UINT64_C(1000000000) + (uint64_t)value.tv_nsec;
+}
+
+void coli_v4_profile_add(int phase, uint64_t elapsed_ns) {
+    if (phase < 0 || phase >= COLI_V4_PROFILE_COUNT) return;
+    coli_v4_profile[phase].elapsed_ns += elapsed_ns;
+    coli_v4_profile[phase].calls++;
+}
+
+static void coli_v4_profile_reset_decode(void) {
+    if (coli_v4_profile_env < 0) {
+        const char *setting = getenv("COLI_V4_PROFILE");
+        coli_v4_profile_env = setting && !strcmp(setting, "1");
+    }
+    coli_v4_profile_on = coli_v4_profile_env;
+    if (coli_v4_profile_on) memset(coli_v4_profile, 0, sizeof(coli_v4_profile));
+}
+
+static void coli_v4_profile_report(int decode_tokens, uint64_t wall_ns) {
+    if (!coli_v4_profile_on) return;
+    static const char *names[COLI_V4_PROFILE_COUNT] = {
+        "embed", "hc_norm", "attention", "rope", "compressor", "indexer",
+        "router", "shared_expert", "expert_wait", "expert_forward", "head",
+    };
+    uint64_t accounted_ns = 0;
+    for (int phase = 0; phase < COLI_V4_PROFILE_COUNT; phase++) {
+        fprintf(stderr, "v4_profile phase=%s total_ms=%.3f calls=%llu\n",
+                names[phase], coli_v4_profile[phase].elapsed_ns / 1e6,
+                (unsigned long long)coli_v4_profile[phase].calls);
+        if (phase != COLI_V4_PROFILE_ROPE)
+            accounted_ns += coli_v4_profile[phase].elapsed_ns;
+    }
+    if (accounted_ns > wall_ns) accounted_ns = wall_ns;
+    fprintf(stderr, "v4_profile phase=other total_ms=%.3f\n",
+            (wall_ns - accounted_ns) / 1e6);
+    fprintf(stderr,
+            "v4_profile decode_tokens=%d decode_wall_ms=%.3f accounted_pct=%.1f\n",
+            decode_tokens, wall_ns / 1e6,
+            wall_ns ? 100.0 * accounted_ns / wall_ns : 0.0);
+}
 
 #define main coli_v4_first_token_legacy_main
 /* ---- begin include tools/deepseek_v4_first_token.c ---- */
@@ -7305,7 +7467,11 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
     float *state = *state_ptr, *next = *next_ptr;
+    uint64_t embed_began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
     if (load_embedding(state, index, config, token)) return -1;
+    if (coli_v4_profile_on)
+        coli_v4_profile_add(COLI_V4_PROFILE_EMBED,
+                            coli_v4_profile_now_ns() - embed_began);
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
@@ -7935,6 +8101,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                                   current_logit, last_processed,
                                   generated_count, options->stop_at_sentence);
     double first_at = spec_now();
+    coli_v4_profile_reset_decode();
 
     int draft_limit = getenv("V4_DRAFT") ? atoi(getenv("V4_DRAFT")) : 0;
     if (draft_limit < 0) draft_limit = 0;
@@ -8162,11 +8329,15 @@ int coli_v4_session_generate(ColiV4Session *session,
         kv_prefix_record(&session->fed, &current, position, 1);
         session->state = state;
         session->next = next;
+        uint64_t head_began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
         if (final_hidden(hidden, state, index, config, error, error_size) ||
             head_argmax(engine, hidden, index, config, &current, &current_logit)) {
             kv_prefix_taint(&session->fed);
             return -1;
         }
+        if (coli_v4_profile_on)
+            coli_v4_profile_add(COLI_V4_PROFILE_HEAD,
+                                coli_v4_profile_now_ns() - head_began);
         last_processed = position;
         generated[generated_count++] = current;
         done = session_emit_token(session, on_token, user_data, current,
@@ -8177,6 +8348,7 @@ int coli_v4_session_generate(ColiV4Session *session,
     }
     if (coli_v4_full_dspark_wanted) v4_dspark_report();
     double ended = spec_now();
+    uint64_t decode_wall_ns = (uint64_t)((ended - first_at) * 1e9);
     session->state = state;
     session->next = next;
     session->generated_count = generated_count;
@@ -8215,6 +8387,8 @@ int coli_v4_session_generate(ColiV4Session *session,
                     ? 100.0 * session->spec_accepted / session->spec_drafted
                     : 0.0,
                 session->spec_disabled);
+    coli_v4_profile_report(generated_count > 0 ? generated_count - 1 : 0,
+                           decode_wall_ns);
     return 0;
 }
 
