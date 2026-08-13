@@ -1046,3 +1046,50 @@ are walked twice (score pass, then value pass).
 **Caveat that must be tested, not assumed:** multiple accumulators change FP summation order, so
 this is *not* automatically bit-exact. The campaign gate is token-exact output; that must be
 verified empirically, with an order-preserving fallback if it fails.
+
+---
+
+## E37. `attn_sparse` NEON kernel — 4.53x on the phase, **opt-in** because it is not bit-exact
+
+Acted on the E36 root cause. Hand-written NEON with **4 independent `fmla.4s` accumulators** plus a
+single horizontal reduce, replacing the compiler's fmul-then-extract-then-serial-add pattern. Also
+hoisted the per-call `malloc`/`free` of `scores` to a stack buffer with a heap fallback for
+oversized `topk` (order-safe, so it applies to both paths).
+
+**Microbench** (n=30, `-O3 -mcpu=native`, no fast-math): 3.68x-4.74x across topk in {64,128,256,512}.
+
+**Engine, steady state (220 tokens, 9417 identical calls):**
+
+| | before | after | |
+|---|---|---|---|
+| attn_sparse | 22639.5 ms | **4999.3 ms** | **4.53x** (2.4041 -> 0.5309 ms/call) |
+| decode_wall | 151426.7 ms | **134619.3 ms** | **-11.1 %** |
+| throughput | 1.446 tok/s | **1.627 tok/s** | **+12.5 %** |
+
+attn_sparse alone accounts for -17640 ms of the -16807 ms wall delta, so the gain is fully
+attributable to this kernel.
+
+### It is NOT bit-exact, and the 8-token gate hid that
+The short gate passed (`**Paris**.` identical) because a ~3.87e-7 score delta cannot flip an argmax
+in 8 tokens. At 60 tokens it does. Verified by rebuilding **without** the change and running both
+builds twice:
+
+| build | 60-token md5 | deterministic |
+|---|---|---|
+| baseline (change stashed) | `5d04890413ff539e802985ce8c727814` | yes (run1 == run2) |
+| NEON reassociated | `c6d8f26ef47095bf6f777c11d99df080` | yes (run1 == run2) |
+
+Both builds are individually deterministic and they disagree — so the divergence is real and
+attributable to FP reassociation, not to engine nondeterminism. (Note: `generated_text` is
+multi-line; comparing it with `grep '^generated_text='` only compares the first line and is wrong.
+Use the full-block extraction.)
+
+**Resolution: opt-in via `--fast-sparse-attn`.** Default keeps the strictly ordered reduction and
+is byte-identical to the previous build (md5 verified). The flag prints
+`v4_sparse_attn mode=fast-reassociated warning=output-not-bit-identical-to-default` so no transcript
+is ambiguous. Selector is a write-once file-scope static set before any thread is created;
+non-arm64 always takes the ordered path. Wrapper: `run-deepseek-v4-fast-sparse-attention.sh`.
+
+**Methodology lesson (third of the campaign):** an 8-token gate is too short to catch FP-ordering
+regressions, just as it was too short for `attn_sparse` cost (understated ~7x) and too short for
+cache behaviour (E34b). Correctness gates must run at the length where the effect can appear.
