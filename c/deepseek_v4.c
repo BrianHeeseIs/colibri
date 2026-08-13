@@ -14,6 +14,11 @@ enum {
     COLI_V4_PROFILE_EXPERT_WAIT,
     COLI_V4_PROFILE_EXPERT_FORWARD,
     COLI_V4_PROFILE_HEAD,
+    COLI_V4_PROFILE_ATTN_QKV,
+    COLI_V4_PROFILE_ATTN_KV_ASSEMBLY,
+    COLI_V4_PROFILE_ATTN_SPARSE,
+    COLI_V4_PROFILE_ATTN_OUT,
+    COLI_V4_PROFILE_ATTN_OTHER,
     COLI_V4_PROFILE_COUNT,
 };
 
@@ -1631,7 +1636,10 @@ static int attention_token_impl(float *output,
 
     uint64_t attention_began = coli_v4_profile_on
         ? coli_v4_profile_now_ns() : 0;
-    uint64_t compressor_ns = 0, indexer_ns = 0;
+    uint64_t compressor_ns = 0, indexer_ns = 0, qkv_ns = 0;
+    uint64_t kv_assembly_ns = 0, sparse_ns = 0, out_ns = 0;
+    uint64_t qkv_began = coli_v4_profile_on
+        ? coli_v4_profile_now_ns() : 0;
     int result = coli_fp8_matvec_ref(qa, &wq_a, input);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
@@ -1639,6 +1647,8 @@ static int attention_token_impl(float *output,
                     coli_v4_rmsnorm(qa, qa, norm_weight, q_rank,
                                     config->rms_norm_eps))) result = -1;
     if (!result) coli_bf16_round_array(qa, (size_t)q_rank);
+    if (coli_v4_profile_on)
+        qkv_ns += coli_v4_profile_now_ns() - qkv_began;
     if (!result && state && weights->plan.compression_ratio) {
         result = prepare_compressed_state(state, weights, config,
                                           error, error_size);
@@ -1676,6 +1686,7 @@ static int attention_token_impl(float *output,
             if (compressed_selected < 0) result = -1;
         }
     }
+    qkv_began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
     if (!result) result = coli_fp8_matvec_ref(q, &wq_b, qa);
     if (!result) coli_bf16_round_array(q, (size_t)heads * head_dim);
     for (int head = 0; !result && head < heads; head++) {
@@ -1693,6 +1704,10 @@ static int attention_token_impl(float *output,
                     coli_v4_rmsnorm(kv, kv, norm_weight, head_dim,
                                     config->rms_norm_eps))) result = -1;
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
+    if (coli_v4_profile_on) {
+        qkv_ns += coli_v4_profile_now_ns() - qkv_began;
+        coli_v4_profile_add(COLI_V4_PROFILE_ATTN_QKV, qkv_ns);
+    }
 
     if (!result) {
         uint64_t rope_began = coli_v4_profile_on
@@ -1739,6 +1754,8 @@ static int attention_token_impl(float *output,
     }
 
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
+    uint64_t kv_assembly_began = coli_v4_profile_on
+        ? coli_v4_profile_now_ns() : 0;
     if (!result && state) {
         int slot = position % state->window_size;
         memcpy(state->kv + (size_t)slot * head_dim, kv,
@@ -1772,23 +1789,43 @@ static int attention_token_impl(float *output,
                 int ordinal = state->indexer ? compressed_indices[i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
+            if (coli_v4_profile_on) {
+                kv_assembly_ns = coli_v4_profile_now_ns() - kv_assembly_began;
+                coli_v4_profile_add(COLI_V4_PROFILE_ATTN_KV_ASSEMBLY,
+                                    kv_assembly_ns);
+            }
+            uint64_t sparse_began = coli_v4_profile_on
+                ? coli_v4_profile_now_ns() : 0;
             result = coli_v4_sparse_attention_ref(
                 attended, q, kv_values, sinks, indices, heads, head_dim,
                 kv_count, topk,
                 1.0f / sqrtf((float)head_dim));
+            if (coli_v4_profile_on) {
+                sparse_ns = coli_v4_profile_now_ns() - sparse_began;
+                coli_v4_profile_add(COLI_V4_PROFILE_ATTN_SPARSE, sparse_ns);
+            }
         }
         free(all_kv);
         free(indices);
-    } else for (int head = 0; !result && head < heads; head++) {
-        float *query = q + (size_t)head * head_dim;
-        float score = 0.0f;
-        for (int i = 0; i < head_dim; i++) score += query[i] * kv[i];
-        score *= 1.0f / sqrtf((float)head_dim);
-        float attention_weight = 1.0f / (1.0f + expf(sinks[head] - score));
-        float *head_output = attended + (size_t)head * head_dim;
-        for (int i = 0; i < head_dim; i++)
-            head_output[i] = coli_bf16_round(kv[i] * attention_weight);
+    } else {
+        uint64_t sparse_began = coli_v4_profile_on
+            ? coli_v4_profile_now_ns() : 0;
+        for (int head = 0; !result && head < heads; head++) {
+            float *query = q + (size_t)head * head_dim;
+            float score = 0.0f;
+            for (int i = 0; i < head_dim; i++) score += query[i] * kv[i];
+            score *= 1.0f / sqrtf((float)head_dim);
+            float attention_weight = 1.0f / (1.0f + expf(sinks[head] - score));
+            float *head_output = attended + (size_t)head * head_dim;
+            for (int i = 0; i < head_dim; i++)
+                head_output[i] = coli_bf16_round(kv[i] * attention_weight);
+        }
+        if (coli_v4_profile_on) {
+            sparse_ns = coli_v4_profile_now_ns() - sparse_began;
+            coli_v4_profile_add(COLI_V4_PROFILE_ATTN_SPARSE, sparse_ns);
+        }
     }
+    uint64_t out_began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
     for (int head = 0; !result && head < heads; head++) {
         float *head_output = attended + (size_t)head * head_dim;
         float *rope = head_output + head_dim - rope_dim;
@@ -1817,15 +1854,26 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
     if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
     if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    if (coli_v4_profile_on) {
+        out_ns = coli_v4_profile_now_ns() - out_began;
+        coli_v4_profile_add(COLI_V4_PROFILE_ATTN_OUT, out_ns);
+    }
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
     if (coli_v4_profile_on) {
         uint64_t elapsed = coli_v4_profile_now_ns() - attention_began;
-        if (elapsed >= compressor_ns + indexer_ns)
-            elapsed -= compressor_ns + indexer_ns;
+        uint64_t excluded_ns = compressor_ns + indexer_ns;
+        if (elapsed >= excluded_ns)
+            elapsed -= excluded_ns;
+        else
+            elapsed = 0;
         coli_v4_profile_add(COLI_V4_PROFILE_ATTENTION, elapsed);
+        uint64_t attn_detail_ns = qkv_ns + kv_assembly_ns + sparse_ns + out_ns;
+        uint64_t other_ns = elapsed >= attn_detail_ns
+            ? elapsed - attn_detail_ns : 0;
+        coli_v4_profile_add(COLI_V4_PROFILE_ATTN_OTHER, other_ns);
     }
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
@@ -6898,13 +6946,15 @@ static void coli_v4_profile_report(int decode_tokens, uint64_t wall_ns) {
     static const char *names[COLI_V4_PROFILE_COUNT] = {
         "embed", "hc_norm", "attention", "rope", "compressor", "indexer",
         "router", "shared_expert", "expert_wait", "expert_forward", "head",
+        "attn_qkv", "attn_kv_assembly", "attn_sparse", "attn_out", "attn_other",
     };
     uint64_t accounted_ns = 0;
     for (int phase = 0; phase < COLI_V4_PROFILE_COUNT; phase++) {
         fprintf(stderr, "v4_profile phase=%s total_ms=%.3f calls=%llu\n",
                 names[phase], coli_v4_profile[phase].elapsed_ns / 1e6,
                 (unsigned long long)coli_v4_profile[phase].calls);
-        if (phase != COLI_V4_PROFILE_ROPE)
+        if (phase != COLI_V4_PROFILE_ROPE &&
+            phase < COLI_V4_PROFILE_ATTN_QKV)
             accounted_ns += coli_v4_profile[phase].elapsed_ns;
     }
     if (accounted_ns > wall_ns) accounted_ns = wall_ns;

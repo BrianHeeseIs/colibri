@@ -857,3 +857,73 @@ and **attention is co-dominant at 38.7 %** — with no dedicated method until no
 gate fired exactly as designed, cheaper than the branch would have been); M3 gutted (embed half
 dead at 0.06 %); M16 `attention_dissect` added; sequencing rewritten (attention and expert
 kernels are the two lanes; prefill batch M4 unchanged).
+
+---
+
+## E30. M15 `cpu_expert_kernel` — microbench gate PASSED (~29 % kernel, bit-exact)
+
+`c/tests/bench_mxfp4.c`, n=20 mean±sd (first dropped), real dims, vs the shipping scalar path
+(`quant.h:1401-1412`):
+
+| shape | baseline | v1_notail | v2_2row |
+|---|---|---|---|
+| gate/up decode 4096→2048 | 0.401 ±0.022 ms | 0.320 ±0.008 (**−20.2 %**) | **0.286 ±0.011 (−28.7 %)** |
+| down decode 2048→4096 | 0.418 ±0.022 | 0.319 ±0.013 (−23.7 %) | **0.298 ±0.011 (−28.7 %)** |
+| gate/up S=8 | 3.036 ±0.233 | 2.214 ±0.139 (−27.1 %) | **1.962 ±0.182 (−35.4 %)** |
+
+**All variants BIT-EXACT** against baseline output (the gate — a faster variant that changed one
+bit would be rejected, not accepted as a tradeoff).
+
+- **v1_notail**: whole 32-column groups have no odd-column tail, so the per-iteration
+  `if (i+1 < base+glen)` bounds test is pure overhead — hoisted into a 16-byte fast path.
+  Order-identical; same adds in the same sequence.
+- **v2_2row**: two output rows per pass, so the activation vector is walked ONCE for two rows.
+  This is the weight/activation-reuse thesis from §0.2 confirmed on CPU, and it is exactly the
+  llama.cpp/MLX "multiple results per simdgroup" idea (4 rows) applied to the scalar path.
+  Rows are independent ⇒ per-row two-level accumulation order untouched ⇒ bit-exact.
+
+**Projected engine effect:** expert_forward is 28.2 % of decode (M11), so ~29 % of that ≈ **8 %
+decode** — just under the pre-registered 10 % PASS bar, so the engine-level result decides it.
+
+**Bigger prize spotted:** the same two techniques should transfer to the **FP8 rows8 matvec**
+(`:10337-10405`) used by attention's wq_a/wq_b/wkv/wo and by shared_expert — i.e. potentially the
+38.7 % + 8.8 % slices, not just the 28.2 %. M16's sub-attribution will size that directly.
+
+---
+
+## E31. M16 step-1 — attention dissected: the output projection is the biggest line item in decode
+
+Nested sub-phases added to the M11 profiler (branch `ft-attention_dissect`). Reconciliation is
+exact: 911.685 + 1.340 + 96.162 + 1668.940 + 4.642 = **2682.769 = parent attention**. Build 26
+objects, METAL=1 links, profiler silent when unset, tiny oracle token-exact with profiler ON,
+flash output exactly `The capital of France is **Paris**.`, accounted 98.0 %.
+
+| attention sub-phase | ms/decode | % of attention | % of decode | ms/call |
+|---|---|---|---|---|
+| **attn_out** (wo_a/wo_b) | **1668.9** | **62.2 %** | **25.0 %** | **5.54** |
+| attn_qkv (wq_a/wq_b/wkv) | 911.7 | 34.0 % | 13.6 % | 3.03 |
+| attn_sparse | 96.2 | 3.6 % | 1.4 % | 0.32 |
+| attn_kv_assembly | 1.3 | 0.05 % | 0.02 % | 0.004 |
+| attn_other | 4.6 | 0.2 % | 0.07 % | — |
+
+### The finding that reorganises the campaign
+Grouping by KERNEL rather than by phase:
+
+| kernel family | % of decode |
+|---|---|
+| **FP8 matvec** (attn_out 25.0 + attn_qkv 13.6 + shared_expert 9.0) | **47.6 %** |
+| **FP4 matvec** (routed experts) | 28.7 % |
+| **all quantized matvec** | **76.3 %** |
+| everything else (wait, head, router, norms, indexer, compressor, sparse…) | 23.7 % |
+
+**76 % of decode is quantized matvec** — and E30 already measured **−28.7 %, bit-exact**, on
+exactly that shape (tail-branch hoist + two-output-rows-per-activation-walk). If the technique
+transfers to both the FP4 expert path and the FP8 rows8 path (`:10337-10405`), the arithmetic is
+~21.9 % decode reduction ≈ **1.28× purely from bit-exact kernel work**.
+
+Note this also *raises* M15's value above its original scoping: M15 was written against the
+28.7 % FP4 slice; the profile shows the FP8 slice it did not target is **larger** (47.6 %).
+M15 is therefore rescoped from `cpu_expert_kernel` to cover both matvec families.
+
+**Attention was never "attention" — it is 96 % matvec.** The sparse-attention scalar loop that
+M10/M16 assumed was the target is 1.4 % of decode. That assumption is now dead.
