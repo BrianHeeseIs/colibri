@@ -1,96 +1,53 @@
-# ambienti python / cache
-c/mio_env/
-__pycache__/
-**/__pycache__/
-*.pyc
-web/node_modules/
-web/dist/
-web/*.tsbuildinfo
-desktop/src-tauri/target/
-desktop/src-tauri/gen/
+# --- model weights: NEVER commit ---
+models/
+*.safetensors
+*.gguf
 
-# binari compilati (si rigenerano con make / coli build)
+# --- local build artifacts (make install PREFIX=.) ---
+bin/
+libexec/
 c/colibri
-c/colibri.exe
-c/glm
-c/glm.exe
 c/olmoe
 c/inkling
 c/kimi_k3
-c/kimi_k3.exe
-c/olmoe.exe
-c/iobench
-c/iobench.exe
-c/tok_test
-c/backend_cuda.o
-c/backend_cuda_test
-c/backend_loader.o
-c/coli_cuda.dll
-c/coli_cuda.lib
-c/coli_cuda.exp
-c/coli_hip.dll
-c/coli_hip.lib
-c/coli_hip.exp
-c/coli_hip.pdb
+c/*.o
+web/dist/
+web/node_modules/
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv-convert/
+
+# --- agent/session state ---
+.omo/
+
+# --- validation: keep harnesses + small JSON evidence, drop runtime noise ---
+validation/**/download.log
+validation/**/aria2.session
+validation/**/*.safetensors.aria2
+
+# --- compiled test/bench/fuzz binaries (extensionless; sources stay tracked) ---
 c/tests/test_*
 !c/tests/test_*.c
 !c/tests/test_*.cu
 !c/tests/test_*.mm
 !c/tests/test_*.py
-# bench_* and fuzz_* build to extensionless binaries in the same directory and
-# were not covered here, which is how c/tests/bench_omp_grain reached the tree.
 c/tests/bench_*
 !c/tests/bench_*.c
-!c/tests/bench_*.cu
-!c/tests/bench_*.mm
-!c/tests/bench_*.py
 c/tests/fuzz_*
 !c/tests/fuzz_*.c
-!c/tests/fuzz_*.cu
-!c/tests/fuzz_*.mm
-!c/tests/fuzz_*.py
-result
-c/tests/test_cap_precedence
-c/tests/test_cap_precedence.exe
+web/*.tsbuildinfo
 
-# oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
-c/glm_tiny/
-c/glm_tiny_i2/
-c/glm_tiny_i4/
-c/glm_tiny_mix/
-c/glm_bench_medium/
-c/bench/
+# --- v4 build artifacts ---
+c/deepseek_v4
+c/deepseek_v4.exe
+c/build/
+c/*.orig
 
-# pesi modello / artefatti di run
-*.safetensors
-stats*.txt
-*.log
-
-# script di ricerca stadio-0 (esperimenti locali, non parte del motore)
-/engine.py
-/run.py
-/validate_ref.py
-/s0_costmodel.py
-/s1_trace_hitrate.py
-/s2_research.py
-/quant_test.py
-/profile_run.py
-/sweep.py
-c/backend_metal.o
-c/backend_metal_test
-c/tests/test_tier
-c/mio_env/
-c/bench/
-c/tests/test_decode_batch
-c/tests/test_i4_acc512
-c/tests/test_idot
-c/tests/test_uring
-olmoe_merged/
-olmoe_i4/
-c/olmoe_merged/
-c/olmoe_i4/
-.idea
-c/tiny_inkling/
-
-# Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
-.claude/
+# --- validation: binaries + runtime logs are noise; sources/CSV evidence stay ---
+validation/metal/probe_*
+!validation/metal/probe_*.m
+validation/metal/bench_*
+!validation/metal/bench_*.m
+validation/**/*.log
