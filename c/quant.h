@@ -492,20 +492,59 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
-        const uint8_t *w = q8 + (int64_t)o*I;
-        int64_t blkO = o / FP8_BLOCK;
-        const float *scl = bscale + blkO*nblkI;
+    for(int o=0;o<O;o+=2){
+        int o2 = o+1<O ? o+1 : o;
+        const uint8_t *w0 = q8 + (int64_t)o*I;
+        const uint8_t *w1 = q8 + (int64_t)o2*I;
+        const float *scl0 = bscale + (o/FP8_BLOCK)*nblkI;
+        const float *scl1 = bscale + (o2/FP8_BLOCK)*nblkI;
         for(int s=0;s<S;s++){
             const float *xs = x + (int64_t)s*I;
-            double a=0;
+            double a0=0, a1=0;
             for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
                 int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
-                float sc=scl[bi]; float acc=0;
-                for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
-                a += (double)acc*sc;
+                float acc0=0, acc1=0;
+                for(int i=base;i<base+blen;i++){
+                    float xv=xs[i];
+                    acc0 += e4m3_decode(w0[i])*xv;
+                    acc1 += e4m3_decode(w1[i])*xv;
+                }
+                a0 += (double)acc0*scl0[bi];
+                a1 += (double)acc1*scl1[bi];
             }
-            y[(int64_t)s*O+o]=(float)a;
+            y[(int64_t)s*O+o]=(float)a0;
+            if(o2!=o) y[(int64_t)s*O+o2]=(float)a1;
+        }
+    }
+}
+
+static void matmul_fp8_dual(float *y0, float *y1, const float *x,
+                            const uint8_t *q0, const float *bs0,
+                            const uint8_t *q1, const float *bs1,
+                            int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w0=q0+(int64_t)o*I, *w1=q1+(int64_t)o*I;
+        const float *s0=bs0+(o/FP8_BLOCK)*nblkI;
+        const float *s1=bs1+(o/FP8_BLOCK)*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            double a0=0, a1=0;
+            for(int64_t bi=0;bi*FP8_BLOCK<I;bi++){
+                int base=(int)(bi*FP8_BLOCK), blen=FP8_BLOCK;
+                if(base+blen>I) blen=I-base;
+                float acc0=0, acc1=0;
+                for(int i=base;i<base+blen;i++){
+                    float xv=xs[i];
+                    acc0+=e4m3_decode(w0[i])*xv;
+                    acc1+=e4m3_decode(w1[i])*xv;
+                }
+                a0+=(double)acc0*s0[bi];
+                a1+=(double)acc1*s1[bi];
+            }
+            y0[(int64_t)s*O+o]=(float)a0;
+            y1[(int64_t)s*O+o]=(float)a1;
         }
     }
 }
@@ -1367,49 +1406,81 @@ static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint
                          int S, int I, int O){
     int rb=(I+1)/2, ng=(I+31)/32;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
-        const uint8_t *w=q4+(int64_t)o*rb;
-        const uint8_t *scl=e8s+(int64_t)o*ng;
+    for(int o=0;o<O;o+=2){
+        int o2=o+1<O ? o+1 : o;
+        const uint8_t *w0=q4+(int64_t)o*rb, *w1=q4+(int64_t)o2*rb;
+        const uint8_t *s0=e8s+(int64_t)o*ng, *s1=e8s+(int64_t)o2*ng;
         for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I; float a=0;
-#ifdef __AVX2__
-            if(I%32==0){
-                /* doubled e2m1 values are exact int8 -> one pshufb decodes a
-                 * nibble vector; the 0.5f un-doubling rides the group scale */
-                const __m128i lut2=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
-                const __m128i m4=_mm_set1_epi8(0x0F);
-                __m256 acc=_mm256_setzero_ps();
-                for(int g=0;g<ng;g++){
-                    __m128i by=_mm_loadu_si128((const __m128i*)(w+g*16));
-                    __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-                    __m128i n0=_mm_shuffle_epi8(lut2,_mm_unpacklo_epi8(lo,hi));  /* cols g*32+0..15  */
-                    __m128i n1=_mm_shuffle_epi8(lut2,_mm_unpackhi_epi8(lo,hi));  /* cols g*32+16..31 */
-                    const float *xg=xs+g*32;
-                    __m256 ga=_mm256_mul_ps(_mm256_loadu_ps(xg),
-                                            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n0)));
-                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+8),
-                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n0,8))),ga);
-                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+16),
-                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n1)),ga);
-                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+24),
-                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n1,8))),ga);
-                    acc=_mm256_fmadd_ps(ga,_mm256_set1_ps(mx4_scale(scl[g])*0.5f),acc);
-                }
-                y[(int64_t)s*O+o]=hsum256(acc);
-                continue;
-            }
-#endif
+            const float *xs=x+(int64_t)s*I; float a0=0, a1=0;
             for(int g=0;g<ng;g++){
                 int base=g*32, glen=32; if(base+glen>I) glen=I-base;
-                float sc=mx4_scale(scl[g]), ga=0;
-                for(int i=base;i<base+glen;i+=2){
-                    uint8_t byte=w[i>>1];
-                    ga+=xs[i]*mx4_lut[byte&0xF];
-                    if(i+1<base+glen) ga+=xs[i+1]*mx4_lut[byte>>4];
+                float c0=mx4_scale(s0[g]), c1=mx4_scale(s1[g]), g0=0, g1=0;
+                const uint8_t *wg0=w0+(base>>1), *wg1=w1+(base>>1);
+                if(glen==32){
+                    for(int k=0;k<16;k++){
+                        uint8_t b0=wg0[k], b1=wg1[k];
+                        float xa=xs[base+2*k];
+                        g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
+                        float xb=xs[base+2*k+1];
+                        g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                    }
+                }else{
+                    for(int i=base;i<base+glen;i+=2){
+                        uint8_t b0=w0[i>>1], b1=w1[i>>1];
+                        float xa=xs[i];
+                        g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
+                        if(i+1<base+glen){
+                            float xb=xs[i+1];
+                            g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                        }
+                    }
                 }
-                a+=ga*sc;
+                a0+=g0*c0; a1+=g1*c1;
             }
-            y[(int64_t)s*O+o]=a;
+            y[(int64_t)s*O+o]=a0;
+            if(o2!=o) y[(int64_t)s*O+o2]=a1;
+        }
+    }
+}
+
+static void matmul_mxfp4_dual(float *y0, float *y1, const float *x,
+                              const uint8_t *q0, const uint8_t *e0,
+                              const uint8_t *q1, const uint8_t *e1,
+                              int S, int I, int O){
+    int rb=(I+1)/2, ng=(I+31)/32;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w0=q0+(int64_t)o*rb, *w1=q1+(int64_t)o*rb;
+        const uint8_t *s0=e0+(int64_t)o*ng, *s1=e1+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a0=0, a1=0;
+            for(int g=0;g<ng;g++){
+                int base=g*32, glen=32; if(base+glen>I) glen=I-base;
+                float c0=mx4_scale(s0[g]), c1=mx4_scale(s1[g]), g0=0, g1=0;
+                const uint8_t *wg0=w0+(base>>1), *wg1=w1+(base>>1);
+                if(glen==32){
+                    for(int k=0;k<16;k++){
+                        uint8_t b0=wg0[k], b1=wg1[k];
+                        float xa=xs[base+2*k];
+                        g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
+                        float xb=xs[base+2*k+1];
+                        g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                    }
+                }else{
+                    for(int i=base;i<base+glen;i+=2){
+                        uint8_t b0=w0[i>>1], b1=w1[i>>1];
+                        float xa=xs[i];
+                        g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
+                        if(i+1<base+glen){
+                            float xb=xs[i+1];
+                            g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                        }
+                    }
+                }
+                a0+=g0*c0; a1+=g1*c1;
+            }
+            y0[(int64_t)s*O+o]=a0;
+            y1[(int64_t)s*O+o]=a1;
         }
     }
 }

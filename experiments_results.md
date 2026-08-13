@@ -927,3 +927,46 @@ M15 is therefore rescoped from `cpu_expert_kernel` to cover both matvec families
 
 **Attention was never "attention" — it is 96 % matvec.** The sparse-attention scalar loop that
 M10/M16 assumed was the target is 1.4 % of decode. That assumption is now dead.
+
+---
+
+## E32. M15 `matvec_kernels` — **WIN: −20.4 % decode, token-exact** (branch ft-matvec_kernels)
+
+Applied the two E30-proven techniques to BOTH quantized matvec families: tail-branch hoist for
+whole 32-column groups, and paired-row processing so the activation vector is walked once per two
+output rows. Plus fused the gate/up dual matvec (was two separate S=1 walks, `:10461-10464`).
+Touched `c/quant.h` (MXFP4 + FP8 rows8) and `c/deepseek_v4.c` (dual-matvec fusion).
+
+**Independently re-measured by me** (agent's numbers reproduced within noise):
+
+| phase | before | after | delta |
+|---|---|---|---|
+| attn_out | 1668.9 ms | 1114.6–1120.6 | **−32.9 %** |
+| attn_qkv | 911.7 | 583.8–589.1 | **−36.0 %** |
+| expert_forward | 1920.8 | 1408.1–1426.4 | **−25.7 %** |
+| shared_expert | 599.2 | 374.1–376.5 | **−37.6 %** |
+| **decode wall** | **6684.2** | **5321.8–5338.9** | **−20.4 %** |
+| ttft | 10.116 s | 8.529–8.628 s | −15 % |
+
+**≈1.26× decode throughput (1.047 → 1.315 tok/s equivalent), bit-exact.**
+`generated_text` is byte-identical (`The capital of France is **Paris**.`) — bit-exactness proven
+at the only level that matters, on the real model.
+
+**The win landed exactly where predicted.** Matvec phases account for 1595.7 ms of savings against
+a 1362.4 ms wall reduction (117 %) — i.e. no time was displaced into unmeasured phases; if
+anything the other phases got marginally cheaper too. This is the difference between "the number
+moved" and "the number moved for the reason we said".
+
+**Shared-header risk checked, not assumed.** `quant.h` is included by `colibri.c` and `kimi_k3.c`
+as well as V4. All four quant tests pass (`test_native_quant`, `test_ue8m0`, `test_e8_kernel`,
+`test_i4_acc512`), plus the 5 Metal probes that assert against the CPU reference
+(`probe_primitives/matmul/fp8qdq/hot/fused_moe`), plus V4 tiny-oracle and KV-prefix suites.
+26-object default build; METAL=1 still links.
+
+### Why this worked when Metal didn't
+Same underlying thesis — **reuse the walk** — but applied where the machine actually is. Metal
+tried to win by moving 12.6 MB of weights per S=1 call to a device with no bandwidth advantage
+and a per-dispatch tax; this walks the *activation* once for two output rows on the CPU that is
+already resident, changing traffic without changing a single accumulation order. The profiler is
+what pointed here: the pre-M11 cost model would have sent this effort at rope caching (0.02 %)
+or the sparse-attention scalar loop (1.4 %).

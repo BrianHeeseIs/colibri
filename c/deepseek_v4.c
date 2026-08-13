@@ -10682,10 +10682,9 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
                                     input, columns, 128) != 0) {
         free(activation_scales); free(activation); return -1;
     }
-    matmul_mxfp4(output_a, activation, a->data, a->scales,
-                 1, (int)columns, (int)rows);
-    matmul_mxfp4(output_b, activation, b->data, b->scales,
-                 1, (int)columns, (int)rows);
+    matmul_mxfp4_dual(output_a, output_b, activation,
+                      a->data, a->scales, b->data, b->scales,
+                      1, (int)columns, (int)rows);
     free(activation_scales); free(activation); return 0;
 }
 
@@ -10757,10 +10756,9 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
         free(activation_scales); free(activation); return 0;
     }
 #endif
-    matmul_fp8(output_a, activation, a->data, a->scales,
-               1, (int)columns, (int)rows);
-    matmul_fp8(output_b, activation, b->data, b->scales,
-               1, (int)columns, (int)rows);
+    matmul_fp8_dual(output_a, output_b, activation,
+                    a->data, a->scales, b->data, b->scales,
+                    1, (int)columns, (int)rows);
     free(activation_scales); free(activation); return 0;
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT_DUAL */
