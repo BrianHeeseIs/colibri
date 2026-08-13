@@ -492,28 +492,36 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o+=2){
-        int o2 = o+1<O ? o+1 : o;
-        const uint8_t *w0 = q8 + (int64_t)o*I;
-        const uint8_t *w1 = q8 + (int64_t)o2*I;
-        const float *scl0 = bscale + (o/FP8_BLOCK)*nblkI;
-        const float *scl1 = bscale + (o2/FP8_BLOCK)*nblkI;
+    for(int o=0;o<O;o+=4){
+        int o1=o+1<O ? o+1 : o, o2=o+2<O ? o+2 : o, o3=o+3<O ? o+3 : o;
+        const uint8_t *w0=q8+(int64_t)o*I, *w1=q8+(int64_t)o1*I;
+        const uint8_t *w2=q8+(int64_t)o2*I, *w3=q8+(int64_t)o3*I;
+        const float *scl0=bscale+(o/FP8_BLOCK)*nblkI;
+        const float *scl1=bscale+(o1/FP8_BLOCK)*nblkI;
+        const float *scl2=bscale+(o2/FP8_BLOCK)*nblkI;
+        const float *scl3=bscale+(o3/FP8_BLOCK)*nblkI;
         for(int s=0;s<S;s++){
             const float *xs = x + (int64_t)s*I;
-            double a0=0, a1=0;
+            double a0=0, a1=0, a2=0, a3=0;
             for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
                 int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
-                float acc0=0, acc1=0;
+                float acc0=0, acc1=0, acc2=0, acc3=0;
                 for(int i=base;i<base+blen;i++){
                     float xv=xs[i];
                     acc0 += e4m3_decode(w0[i])*xv;
                     acc1 += e4m3_decode(w1[i])*xv;
+                    acc2 += e4m3_decode(w2[i])*xv;
+                    acc3 += e4m3_decode(w3[i])*xv;
                 }
                 a0 += (double)acc0*scl0[bi];
                 a1 += (double)acc1*scl1[bi];
+                a2 += (double)acc2*scl2[bi];
+                a3 += (double)acc3*scl3[bi];
             }
             y[(int64_t)s*O+o]=(float)a0;
-            if(o2!=o) y[(int64_t)s*O+o2]=(float)a1;
+            if(o1!=o) y[(int64_t)s*O+o1]=(float)a1;
+            if(o2!=o) y[(int64_t)s*O+o2]=(float)a2;
+            if(o3!=o) y[(int64_t)s*O+o3]=(float)a3;
         }
     }
 }
@@ -524,27 +532,41 @@ static void matmul_fp8_dual(float *y0, float *y1, const float *x,
                             int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
-        const uint8_t *w0=q0+(int64_t)o*I, *w1=q1+(int64_t)o*I;
-        const float *s0=bs0+(o/FP8_BLOCK)*nblkI;
-        const float *s1=bs1+(o/FP8_BLOCK)*nblkI;
+    for(int o=0;o<O;o+=4){
+        int o1=o+1<O ? o+1 : o, o2=o+2<O ? o+2 : o, o3=o+3<O ? o+3 : o;
+        const uint8_t *wa0=q0+(int64_t)o*I, *wa1=q0+(int64_t)o1*I;
+        const uint8_t *wa2=q0+(int64_t)o2*I, *wa3=q0+(int64_t)o3*I;
+        const uint8_t *wb0=q1+(int64_t)o*I, *wb1=q1+(int64_t)o1*I;
+        const uint8_t *wb2=q1+(int64_t)o2*I, *wb3=q1+(int64_t)o3*I;
+        const float *sa0=bs0+(o/FP8_BLOCK)*nblkI, *sa1=bs0+(o1/FP8_BLOCK)*nblkI;
+        const float *sa2=bs0+(o2/FP8_BLOCK)*nblkI, *sa3=bs0+(o3/FP8_BLOCK)*nblkI;
+        const float *sb0=bs1+(o/FP8_BLOCK)*nblkI, *sb1=bs1+(o1/FP8_BLOCK)*nblkI;
+        const float *sb2=bs1+(o2/FP8_BLOCK)*nblkI, *sb3=bs1+(o3/FP8_BLOCK)*nblkI;
         for(int s=0;s<S;s++){
             const float *xs=x+(int64_t)s*I;
-            double a0=0, a1=0;
+            double aa0=0, aa1=0, aa2=0, aa3=0;
+            double ab0=0, ab1=0, ab2=0, ab3=0;
             for(int64_t bi=0;bi*FP8_BLOCK<I;bi++){
                 int base=(int)(bi*FP8_BLOCK), blen=FP8_BLOCK;
                 if(base+blen>I) blen=I-base;
-                float acc0=0, acc1=0;
+                float ga0=0, ga1=0, ga2=0, ga3=0;
+                float gb0=0, gb1=0, gb2=0, gb3=0;
                 for(int i=base;i<base+blen;i++){
                     float xv=xs[i];
-                    acc0+=e4m3_decode(w0[i])*xv;
-                    acc1+=e4m3_decode(w1[i])*xv;
+                    ga0+=e4m3_decode(wa0[i])*xv; ga1+=e4m3_decode(wa1[i])*xv;
+                    ga2+=e4m3_decode(wa2[i])*xv; ga3+=e4m3_decode(wa3[i])*xv;
+                    gb0+=e4m3_decode(wb0[i])*xv; gb1+=e4m3_decode(wb1[i])*xv;
+                    gb2+=e4m3_decode(wb2[i])*xv; gb3+=e4m3_decode(wb3[i])*xv;
                 }
-                a0+=(double)acc0*s0[bi];
-                a1+=(double)acc1*s1[bi];
+                aa0+=(double)ga0*sa0[bi]; aa1+=(double)ga1*sa1[bi];
+                aa2+=(double)ga2*sa2[bi]; aa3+=(double)ga3*sa3[bi];
+                ab0+=(double)gb0*sb0[bi]; ab1+=(double)gb1*sb1[bi];
+                ab2+=(double)gb2*sb2[bi]; ab3+=(double)gb3*sb3[bi];
             }
-            y0[(int64_t)s*O+o]=(float)a0;
-            y1[(int64_t)s*O+o]=(float)a1;
+            y0[(int64_t)s*O+o]=(float)aa0; y1[(int64_t)s*O+o]=(float)ab0;
+            if(o1!=o){ y0[(int64_t)s*O+o1]=(float)aa1; y1[(int64_t)s*O+o1]=(float)ab1; }
+            if(o2!=o){ y0[(int64_t)s*O+o2]=(float)aa2; y1[(int64_t)s*O+o2]=(float)ab2; }
+            if(o3!=o){ y0[(int64_t)s*O+o3]=(float)aa3; y1[(int64_t)s*O+o3]=(float)ab3; }
         }
     }
 }
@@ -1406,39 +1428,49 @@ static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint
                          int S, int I, int O){
     int rb=(I+1)/2, ng=(I+31)/32;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o+=2){
-        int o2=o+1<O ? o+1 : o;
-        const uint8_t *w0=q4+(int64_t)o*rb, *w1=q4+(int64_t)o2*rb;
-        const uint8_t *s0=e8s+(int64_t)o*ng, *s1=e8s+(int64_t)o2*ng;
+    for(int o=0;o<O;o+=4){
+        int o1=o+1<O ? o+1 : o, o2=o+2<O ? o+2 : o, o3=o+3<O ? o+3 : o;
+        const uint8_t *w0=q4+(int64_t)o*rb, *w1=q4+(int64_t)o1*rb;
+        const uint8_t *w2=q4+(int64_t)o2*rb, *w3=q4+(int64_t)o3*rb;
+        const uint8_t *s0=e8s+(int64_t)o*ng, *s1=e8s+(int64_t)o1*ng;
+        const uint8_t *s2=e8s+(int64_t)o2*ng, *s3=e8s+(int64_t)o3*ng;
         for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I; float a0=0, a1=0;
+            const float *xs=x+(int64_t)s*I; float a0=0, a1=0, a2=0, a3=0;
             for(int g=0;g<ng;g++){
                 int base=g*32, glen=32; if(base+glen>I) glen=I-base;
-                float c0=mx4_scale(s0[g]), c1=mx4_scale(s1[g]), g0=0, g1=0;
-                const uint8_t *wg0=w0+(base>>1), *wg1=w1+(base>>1);
+                float c0=mx4_scale(s0[g]), c1=mx4_scale(s1[g]);
+                float c2=mx4_scale(s2[g]), c3=mx4_scale(s3[g]);
+                float g0=0, g1=0, g2=0, g3=0;
                 if(glen==32){
+                    const uint8_t *p0=w0+(base>>1), *p1=w1+(base>>1);
+                    const uint8_t *p2=w2+(base>>1), *p3=w3+(base>>1);
                     for(int k=0;k<16;k++){
-                        uint8_t b0=wg0[k], b1=wg1[k];
-                        float xa=xs[base+2*k];
-                        g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
-                        float xb=xs[base+2*k+1];
-                        g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                        float xa=xs[base+2*k], xb=xs[base+2*k+1];
+                        uint8_t b0=p0[k], b1=p1[k], b2=p2[k], b3=p3[k];
+                        g0+=xa*mx4_lut[b0&0xF]; g0+=xb*mx4_lut[b0>>4];
+                        g1+=xa*mx4_lut[b1&0xF]; g1+=xb*mx4_lut[b1>>4];
+                        g2+=xa*mx4_lut[b2&0xF]; g2+=xb*mx4_lut[b2>>4];
+                        g3+=xa*mx4_lut[b3&0xF]; g3+=xb*mx4_lut[b3>>4];
                     }
                 }else{
                     for(int i=base;i<base+glen;i+=2){
-                        uint8_t b0=w0[i>>1], b1=w1[i>>1];
+                        uint8_t b0=w0[i>>1], b1=w1[i>>1], b2=w2[i>>1], b3=w3[i>>1];
                         float xa=xs[i];
                         g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
+                        g2+=xa*mx4_lut[b2&0xF]; g3+=xa*mx4_lut[b3&0xF];
                         if(i+1<base+glen){
                             float xb=xs[i+1];
                             g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                            g2+=xb*mx4_lut[b2>>4]; g3+=xb*mx4_lut[b3>>4];
                         }
                     }
                 }
-                a0+=g0*c0; a1+=g1*c1;
+                a0+=g0*c0; a1+=g1*c1; a2+=g2*c2; a3+=g3*c3;
             }
             y[(int64_t)s*O+o]=a0;
-            if(o2!=o) y[(int64_t)s*O+o2]=a1;
+            if(o1!=o) y[(int64_t)s*O+o1]=a1;
+            if(o2!=o) y[(int64_t)s*O+o2]=a2;
+            if(o3!=o) y[(int64_t)s*O+o3]=a3;
         }
     }
 }
@@ -1449,38 +1481,69 @@ static void matmul_mxfp4_dual(float *y0, float *y1, const float *x,
                               int S, int I, int O){
     int rb=(I+1)/2, ng=(I+31)/32;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
-        const uint8_t *w0=q0+(int64_t)o*rb, *w1=q1+(int64_t)o*rb;
-        const uint8_t *s0=e0+(int64_t)o*ng, *s1=e1+(int64_t)o*ng;
+    for(int o=0;o<O;o+=4){
+        int o1=o+1<O ? o+1 : o, o2=o+2<O ? o+2 : o, o3=o+3<O ? o+3 : o;
+        const uint8_t *wa0=q0+(int64_t)o*rb, *wa1=q0+(int64_t)o1*rb;
+        const uint8_t *wa2=q0+(int64_t)o2*rb, *wa3=q0+(int64_t)o3*rb;
+        const uint8_t *wb0=q1+(int64_t)o*rb, *wb1=q1+(int64_t)o1*rb;
+        const uint8_t *wb2=q1+(int64_t)o2*rb, *wb3=q1+(int64_t)o3*rb;
+        const uint8_t *sa0=e0+(int64_t)o*ng, *sa1=e0+(int64_t)o1*ng;
+        const uint8_t *sa2=e0+(int64_t)o2*ng, *sa3=e0+(int64_t)o3*ng;
+        const uint8_t *sb0=e1+(int64_t)o*ng, *sb1=e1+(int64_t)o1*ng;
+        const uint8_t *sb2=e1+(int64_t)o2*ng, *sb3=e1+(int64_t)o3*ng;
         for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I; float a0=0, a1=0;
+            const float *xs=x+(int64_t)s*I;
+            float aa0=0, aa1=0, aa2=0, aa3=0, ab0=0, ab1=0, ab2=0, ab3=0;
             for(int g=0;g<ng;g++){
                 int base=g*32, glen=32; if(base+glen>I) glen=I-base;
-                float c0=mx4_scale(s0[g]), c1=mx4_scale(s1[g]), g0=0, g1=0;
-                const uint8_t *wg0=w0+(base>>1), *wg1=w1+(base>>1);
+                float ca0=mx4_scale(sa0[g]), ca1=mx4_scale(sa1[g]);
+                float ca2=mx4_scale(sa2[g]), ca3=mx4_scale(sa3[g]);
+                float cb0=mx4_scale(sb0[g]), cb1=mx4_scale(sb1[g]);
+                float cb2=mx4_scale(sb2[g]), cb3=mx4_scale(sb3[g]);
+                float ga0=0, ga1=0, ga2=0, ga3=0, gb0=0, gb1=0, gb2=0, gb3=0;
                 if(glen==32){
+                    const uint8_t *pa0=wa0+(base>>1), *pa1=wa1+(base>>1);
+                    const uint8_t *pa2=wa2+(base>>1), *pa3=wa3+(base>>1);
+                    const uint8_t *pb0=wb0+(base>>1), *pb1=wb1+(base>>1);
+                    const uint8_t *pb2=wb2+(base>>1), *pb3=wb3+(base>>1);
                     for(int k=0;k<16;k++){
-                        uint8_t b0=wg0[k], b1=wg1[k];
-                        float xa=xs[base+2*k];
-                        g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
-                        float xb=xs[base+2*k+1];
-                        g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                        float xa=xs[base+2*k], xb=xs[base+2*k+1];
+                        uint8_t a0=pa0[k], a1=pa1[k], a2=pa2[k], a3=pa3[k];
+                        uint8_t b0=pb0[k], b1=pb1[k], b2=pb2[k], b3=pb3[k];
+                        ga0+=xa*mx4_lut[a0&15]; ga0+=xb*mx4_lut[a0>>4];
+                        ga1+=xa*mx4_lut[a1&15]; ga1+=xb*mx4_lut[a1>>4];
+                        ga2+=xa*mx4_lut[a2&15]; ga2+=xb*mx4_lut[a2>>4];
+                        ga3+=xa*mx4_lut[a3&15]; ga3+=xb*mx4_lut[a3>>4];
+                        gb0+=xa*mx4_lut[b0&15]; gb0+=xb*mx4_lut[b0>>4];
+                        gb1+=xa*mx4_lut[b1&15]; gb1+=xb*mx4_lut[b1>>4];
+                        gb2+=xa*mx4_lut[b2&15]; gb2+=xb*mx4_lut[b2>>4];
+                        gb3+=xa*mx4_lut[b3&15]; gb3+=xb*mx4_lut[b3>>4];
                     }
                 }else{
                     for(int i=base;i<base+glen;i+=2){
-                        uint8_t b0=w0[i>>1], b1=w1[i>>1];
+                        uint8_t a0=wa0[i>>1], a1=wa1[i>>1], a2=wa2[i>>1], a3=wa3[i>>1];
+                        uint8_t b0=wb0[i>>1], b1=wb1[i>>1], b2=wb2[i>>1], b3=wb3[i>>1];
                         float xa=xs[i];
-                        g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
+                        ga0+=xa*mx4_lut[a0&15]; ga1+=xa*mx4_lut[a1&15];
+                        ga2+=xa*mx4_lut[a2&15]; ga3+=xa*mx4_lut[a3&15];
+                        gb0+=xa*mx4_lut[b0&15]; gb1+=xa*mx4_lut[b1&15];
+                        gb2+=xa*mx4_lut[b2&15]; gb3+=xa*mx4_lut[b3&15];
                         if(i+1<base+glen){
                             float xb=xs[i+1];
-                            g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                            ga0+=xb*mx4_lut[a0>>4]; ga1+=xb*mx4_lut[a1>>4];
+                            ga2+=xb*mx4_lut[a2>>4]; ga3+=xb*mx4_lut[a3>>4];
+                            gb0+=xb*mx4_lut[b0>>4]; gb1+=xb*mx4_lut[b1>>4];
+                            gb2+=xb*mx4_lut[b2>>4]; gb3+=xb*mx4_lut[b3>>4];
                         }
                     }
                 }
-                a0+=g0*c0; a1+=g1*c1;
+                aa0+=ga0*ca0; aa1+=ga1*ca1; aa2+=ga2*ca2; aa3+=ga3*ca3;
+                ab0+=gb0*cb0; ab1+=gb1*cb1; ab2+=gb2*cb2; ab3+=gb3*cb3;
             }
-            y0[(int64_t)s*O+o]=a0;
-            y1[(int64_t)s*O+o]=a1;
+            y0[(int64_t)s*O+o]=aa0; y1[(int64_t)s*O+o]=ab0;
+            if(o1!=o){ y0[(int64_t)s*O+o1]=aa1; y1[(int64_t)s*O+o1]=ab1; }
+            if(o2!=o){ y0[(int64_t)s*O+o2]=aa2; y1[(int64_t)s*O+o2]=ab2; }
+            if(o3!=o){ y0[(int64_t)s*O+o3]=aa3; y1[(int64_t)s*O+o3]=ab3; }
         }
     }
 }

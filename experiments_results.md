@@ -970,3 +970,40 @@ and a per-dispatch tax; this walks the *activation* once for two output rows on 
 already resident, changing traffic without changing a single accumulation order. The profiler is
 what pointed here: the pre-M11 cost model would have sent this effort at rope caching (0.02 %)
 or the sparse-attention scalar loop (1.4 %).
+
+---
+
+## E33. M15b `matvec_rows4` — **cumulative 1.38–1.42× decode, bit-exact** (branch ft-matvec_rows4)
+
+Raised the row-block from 2 → 4 per activation walk (llama.cpp/MLX both use 4 results per
+simdgroup; we had left that on the table). Only `c/quant.h` changed (MXFP4 + scalar FP8; the AVX2
+rows8 path already processes 8 rows per column and was left alone). Ragged `O` handled with
+clamped indices + guarded stores; agent verified `O={1,2,3,4,5,7,17,129,130}`.
+
+| phase | pre-M15 | 2-row | 4-row | total vs pre-M15 |
+|---|---|---|---|---|
+| attn_out | 1668.9 | 1114.6 | 869–883 | **−47.1 %** |
+| attn_qkv | 911.7 | 589.1 | 430–441 | **−51.6 %** |
+| shared_expert | 599.2 | 376.5 | 283–288 | **−52.0 %** |
+| expert_forward | 1920.8 | 1408.1 | 1240–1262 | **−34.3 %** |
+| **decode wall** | **6684.2** | 5338.9 | **4693–4838** | **−27.6 to −29.8 %** |
+| ttft | 10.116 s | 8.628 | **7.860–7.904 s** | −22 % |
+
+**Cumulative ≈1.38–1.42× decode throughput (1.047 → 1.42–1.49 tok/s equivalent), output
+byte-identical throughout.** Two independent runs (mine 4693.1, agent's 4837.6) bracket ~3 % run
+variance; the conservative figure is quoted in claims.
+
+All canaries green: `test_native_quant`/`test_ue8m0`/`test_e8_kernel`/`test_i4_acc512` (shared
+`quant.h` is used by `colibri.c` and `kimi_k3.c`), 5 Metal probes, V4 tiny-oracle + KV-prefix,
+26-object build, METAL=1 links.
+
+### The important part: the bottleneck MOVED
+`expert_wait` went **415 ms (6.2 % of decode) → 779–864 ms (16.6–17.9 %)** and is now the #3
+phase. It did not get slower in absolute terms — **compute got ~37 % cheaper, so SSD/loader
+latency that compute used to hide is now exposed.** Textbook Amdahl shift, and it is the whole
+argument for having built the profiler first: without per-phase attribution this would look like
+"the optimization caused an I/O regression" instead of "the optimization revealed the I/O wall".
+
+New ranking: matvec 59.4 % · **expert_wait 17.9 %** · everything else 22.7 %.
+That promotes M6/M7 (expert prefetch + cache policy) from "medium" to the next lane, on data
+rather than on the plan's original guess.
