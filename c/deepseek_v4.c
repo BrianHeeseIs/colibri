@@ -3058,6 +3058,57 @@ int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state) {
 
 #include "native_quant.h"
 
+#if defined(__aarch64__)
+static int sparse_attention_fast_reassociated;
+#endif
+
+void coli_v4_sparse_attention_set_fast_reassociated(int enabled) {
+#if defined(__aarch64__)
+    sparse_attention_fast_reassociated = enabled != 0;
+#else
+    (void)enabled;
+#endif
+}
+
+static inline float sparse_attention_dot_ordered(const float *left,
+                                                 const float *right, int count) {
+    float result = 0.0f;
+    for (int column = 0; column < count; column++)
+        result += left[column] * right[column];
+    return result;
+}
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+
+static inline float sparse_attention_dot_fast(const float *left,
+                                              const float *right, int count) {
+    float32x4_t sums[4] = {
+        vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+        vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+    };
+    int column = 0;
+    for (; column + 15 < count; column += 16) {
+        sums[0] = vfmaq_f32(sums[0], vld1q_f32(left + column),
+                            vld1q_f32(right + column));
+        sums[1] = vfmaq_f32(sums[1], vld1q_f32(left + column + 4),
+                            vld1q_f32(right + column + 4));
+        sums[2] = vfmaq_f32(sums[2], vld1q_f32(left + column + 8),
+                            vld1q_f32(right + column + 8));
+        sums[3] = vfmaq_f32(sums[3], vld1q_f32(left + column + 12),
+                            vld1q_f32(right + column + 12));
+    }
+    for (; column + 3 < count; column += 4)
+        sums[0] = vfmaq_f32(sums[0], vld1q_f32(left + column),
+                            vld1q_f32(right + column));
+    float32x4_t sum = vaddq_f32(vaddq_f32(sums[0], sums[1]),
+                                vaddq_f32(sums[2], sums[3]));
+    float result = vaddvq_f32(sum);
+    for (; column < count; column++) result += left[column] * right[column];
+    return result;
+}
+#endif
+
 int coli_v4_sparse_attention_ref(float *output, const float *queries,
                                  const float *kv, const float *sinks,
                                  const int *indices, int heads,
@@ -3066,7 +3117,10 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
     if (!output || !queries || !kv || !sinks || !indices || heads < 1 ||
         head_dimension < 1 || kv_count < 1 || topk < 1 || !(softmax_scale > 0.0f))
         return -1;
-    float *scores = malloc((size_t)topk * sizeof(*scores));
+    float score_stack[512];
+    float *scores = topk <= (int)(sizeof(score_stack) / sizeof(score_stack[0]))
+                        ? score_stack
+                        : malloc((size_t)topk * sizeof(*scores));
     if (!scores) return -1;
     for (int head = 0; head < heads; head++) {
         const float *query = queries + (size_t)head * head_dimension;
@@ -3078,19 +3132,23 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
                 continue;
             }
             if (index >= kv_count) {
-                free(scores);
+                if (scores != score_stack) free(scores);
                 return -1;
             }
             const float *key = kv + (size_t)index * head_dimension;
-            float score = 0.0f;
-            for (int column = 0; column < head_dimension; column++)
-                score += query[column] * key[column];
+            float score;
+#if defined(__aarch64__)
+            if (sparse_attention_fast_reassociated)
+                score = sparse_attention_dot_fast(query, key, head_dimension);
+            else
+#endif
+                score = sparse_attention_dot_ordered(query, key, head_dimension);
             score *= softmax_scale;
             scores[rank] = score;
             if (score > maximum) maximum = score;
         }
         if (!isfinite(maximum)) {
-            free(scores);
+            if (scores != score_stack) free(scores);
             return -1;
         }
         float denominator = expf(sinks[head] - maximum);
@@ -3109,7 +3167,7 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
         for (int column = 0; column < head_dimension; column++)
             head_output[column] = coli_bf16_round(head_output[column] / denominator);
     }
-    free(scores);
+    if (scores != score_stack) free(scores);
     return 0;
 }
 #endif /* COLI_V4_UNIT_SPARSE_ATTENTION */
@@ -7619,9 +7677,12 @@ typedef struct {
     int greedy;
     int stop_sentence;
     int no_dspark;
+    int fast_sparse_attn;
     double memory_gib;
     ColiDeepSeekV4PromptMode prompt_mode;
 } V4CliOptions;
+
+extern void coli_v4_sparse_attention_set_fast_reassociated(int enabled);
 
 static void v4_cli_usage(FILE *stream, const char *program) {
     fprintf(stream,
@@ -7636,6 +7697,7 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "  --raw-prompt         bypass the default V4 chat template\n"
         "  --stop-sentence      stop after the first sentence terminator\n"
         "  --no-dspark          disable verified speculative drafting\n"
+        "  --fast-sparse-attn   faster reassociated-FP sparse attention (arm64; changes output)\n"
         "  --oracle FILE        validate against an oracle JSON fixture\n"
         "  --teacher-forcing N  oracle: compare top-1 on N prompt positions\n"
         "  --greedy N           oracle: compare N greedy continuation tokens\n"
@@ -7733,6 +7795,8 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
             options->stop_sentence = 1;
         } else if (!strcmp(option, "--no-dspark")) {
             options->no_dspark = 1;
+        } else if (!strcmp(option, "--fast-sparse-attn")) {
+            options->fast_sparse_attn = 1;
         } else if (!strcmp(option, "--oracle")) {
             if (++i == argc || !argv[i][0]) return -1;
             options->oracle_path = argv[i];
@@ -7762,6 +7826,7 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
     } else if (!options->prompt) {
         return -1;
     }
+    coli_v4_sparse_attention_set_fast_reassociated(options->fast_sparse_attn);
     return 0;
 }
 
@@ -8892,6 +8957,17 @@ int main(int argc, char **argv) {
         v4_cli_usage(stderr, argc ? argv[0] : "deepseek-v4");
         return 2;
     }
+#if defined(__aarch64__)
+    if (cli.fast_sparse_attn)
+        fprintf(stderr,
+                "v4_sparse_attn mode=fast-reassociated "
+                "warning=output-not-bit-identical-to-default\n");
+#else
+    if (cli.fast_sparse_attn)
+        fprintf(stderr,
+                "v4_sparse_attn mode=ordered "
+                "warning=fast-reassociated-unavailable-on-this-architecture\n");
+#endif
     int max_new = cli.max_new_tokens;
     int stop_sentence = cli.stop_sentence;
 

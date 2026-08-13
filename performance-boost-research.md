@@ -32,6 +32,21 @@ COLI_V4_SAVE_USAGE=0 <METHOD_ENVS> ./c/deepseek_v4 models/deepseek-v4-flash \
 #   (python3 -c "...700 words..." generator, 799 tok) and read time_to_first_token.
 ```
 
+## Opt-in reassociated sparse attention
+
+Apple arm64 builds support `--fast-sparse-attn`, which selects a four-accumulator NEON dot
+product for sparse-attention scores. It measured **4.53x faster** in `attn_sparse` on identical
+9417-call runs (`22639.5 ms` to `4999.3 ms`) and improved steady-state throughput by **12.5%**.
+The default remains the strictly ordered scalar reduction while retaining the allocation-free
+512-score stack scratch, so default output stays bit-identical to the original implementation.
+
+This path is opt-in because reassociating floating-point additions changes sparse-attention
+scores by about `4e-7`; at longer context that difference can flip an argmax. For the 60-token
+technical-explanation gate, multiline `generated_text` has MD5
+`5d04890413ff539e802985ce8c727814` in default mode and
+`c6d8f26ef47095bf6f777c11d99df080` with `--fast-sparse-attn`. The root wrapper
+`./run-deepseek-v4-fast-sparse-attention.sh` appends the flag and prints the output warning.
+
 ---
 
 ## 0. Empirical foundation (measured on THIS machine, paired, frozen history)
