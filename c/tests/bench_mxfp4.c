@@ -106,6 +106,56 @@ static void mm_v2_2row(float *y, const float *x, const uint8_t *q4, const uint8_
     }
 }
 
+
+/* ---- V3: FOUR output rows per pass — llama.cpp/MLX use 4 results per simdgroup.
+ * Same independence argument as v2, so per-row order is untouched. Question is whether
+ * register pressure on 16 accumulators + 4 weight streams beats the extra activation reuse. */
+static void mm_v3_4row(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
+                       int S, int I, int O){
+    int rb=(I+1)/2, ng=(I+31)/32;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o+=4){
+        int o1=(o+1<O)?o+1:o, o2=(o+2<O)?o+2:o, o3=(o+3<O)?o+3:o;
+        const uint8_t *w0=q4+(int64_t)o *rb,*s0=e8s+(int64_t)o *ng;
+        const uint8_t *w1=q4+(int64_t)o1*rb,*s1=e8s+(int64_t)o1*ng;
+        const uint8_t *w2=q4+(int64_t)o2*rb,*s2=e8s+(int64_t)o2*ng;
+        const uint8_t *w3=q4+(int64_t)o3*rb,*s3=e8s+(int64_t)o3*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a0=0,a1=0,a2=0,a3=0;
+            for(int g=0;g<ng;g++){
+                int base=g*32, glen=32; if(base+glen>I) glen=I-base;
+                float c0=mx4_scale(s0[g]),c1=mx4_scale(s1[g]),c2=mx4_scale(s2[g]),c3=mx4_scale(s3[g]);
+                float g0=0,g1=0,g2=0,g3=0;
+                if(glen==32){
+                    const uint8_t *p0=w0+(base>>1),*p1=w1+(base>>1),*p2=w2+(base>>1),*p3=w3+(base>>1);
+                    for(int k=0;k<16;k++){
+                        float xa=xs[base+2*k], xb=xs[base+2*k+1];
+                        uint8_t b0=p0[k],b1=p1[k],b2=p2[k],b3=p3[k];
+                        g0+=xa*mx4_lut[b0&0xF]; g0+=xb*mx4_lut[b0>>4];
+                        g1+=xa*mx4_lut[b1&0xF]; g1+=xb*mx4_lut[b1>>4];
+                        g2+=xa*mx4_lut[b2&0xF]; g2+=xb*mx4_lut[b2>>4];
+                        g3+=xa*mx4_lut[b3&0xF]; g3+=xb*mx4_lut[b3>>4];
+                    }
+                }else{
+                    for(int i=base;i<base+glen;i+=2){
+                        float xa=xs[i]; uint8_t b0=w0[i>>1],b1=w1[i>>1],b2=w2[i>>1],b3=w3[i>>1];
+                        g0+=xa*mx4_lut[b0&0xF]; g1+=xa*mx4_lut[b1&0xF];
+                        g2+=xa*mx4_lut[b2&0xF]; g3+=xa*mx4_lut[b3&0xF];
+                        if(i+1<base+glen){ float xb=xs[i+1];
+                            g0+=xb*mx4_lut[b0>>4]; g1+=xb*mx4_lut[b1>>4];
+                            g2+=xb*mx4_lut[b2>>4]; g3+=xb*mx4_lut[b3>>4]; }
+                    }
+                }
+                a0+=g0*c0; a1+=g1*c1; a2+=g2*c2; a3+=g3*c3;
+            }
+            y[(int64_t)s*O+o]=a0;
+            if(o1!=o) y[(int64_t)s*O+o1]=a1;
+            if(o2!=o) y[(int64_t)s*O+o2]=a2;
+            if(o3!=o) y[(int64_t)s*O+o3]=a3;
+        }
+    }
+}
+
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC_RAW,&t);
                            return t.tv_sec + t.tv_nsec/1e9; }
 
@@ -123,10 +173,11 @@ static int run_case(const char*name,int S,int I,int O,int iters){
     mm_baseline(yref,x,q4,e8,S,I,O);
 
     struct { const char*n; mmfn f; } V[] = {
-        {"baseline", mm_baseline}, {"v1_notail", mm_v1_notail}, {"v2_2row", mm_v2_2row} };
+        {"baseline", mm_baseline}, {"v1_notail", mm_v1_notail}, {"v2_2row", mm_v2_2row},
+        {"v3_4row", mm_v3_4row} };
     printf("  %s  S=%d I=%d O=%d\n", name, S, I, O);
     double base_mean=0;
-    for(int v=0; v<3; v++){
+    for(int v=0; v<4; v++){
         double sum=0,sum2=0,best=1e9;
         for(int it=0; it<iters; it++){
             double t0=now_s(); V[v].f(y,x,q4,e8,S,I,O); double d=now_s()-t0;
