@@ -85,3 +85,45 @@ compute. At S=1 the expert FFN is BANDWIDTH BOUND on weight reads.
 => Batching S tokens against one expert amortizes the same 13.37MB read over S tokens.
 => Expected win is ~linear in S until the compute roof. This validates M4 as the right lane.
 => AND it re-confirms that raising the 64-token chunk (to lift S) is the lever that matters.
+
+## CORRECTION 2026-08-14 01:40 — ttft does NOT include model load
+Agent bg_2ecb66f3 traced it: ttft timer starts `setup_done = spec_now()` at c/deepseek_v4.c:8175
+(immediately before target_batch prefill) and stops `first_at` at :8218 (after first token emit).
+EXCLUDED: engine open (:9001-9013), tokenizer load (:9018), prompt template (:9112), session
+create (:9129), tokenization+embedding (:8114-8173).
+=> My "5.278s floor" was NOT load. It was genuine COLD-CACHE prefill of 5 tokens (34% hit, 11.3GB).
+=> Actual model load ~= wall(5.78s) - ttft(5.278s) ~= 0.5s. Startup lane M9/M8 is DEAD, confirmed.
+=> Robust prefill rate = MARGINAL between the two warm points:
+   (118.840-45.249)/(184-70) = 0.6455 s/token. Conclusion unchanged.
+
+## Code map (bg_3afd8031) — authoritative
+- moe_token_pipeline :3777-4016 (single token). TWO call sites:
+    :4066-4067  block_token_pipeline  -> DECODE. MUST NOT CHANGE.
+    :4154-4156  coli_v4_block_window_batch_ref per-item loop :4141-4162 -> PREFILL. TARGET.
+- Routing coli_v4_route_bf16 :6511-6559 — single token, no batch param.
+- Expert selection reorder :3839-3849 scans experts 0..n-1 ascending =>
+  PER-TOKEN COMBINE ORDER IS ASCENDING EXPERT ID. Preserving that = bit-exact grouping.
+- Expert forward coli_v4_expert_forward_ref :9444-9483 (fp4 matvec gate/up/down)
+  rows16 variant :6452-6489 uses coli_fp4_dual_matvec_rows16_v10 (the fused gate/up I 4-row'd).
+- **BATCH PRIMITIVES ALREADY EXIST** c/native_quant_batch.h:6-11
+    coli_fp4_matmul_batch_ref(outputs, weight, inputs, batch)  impl :10934-10961
+    coli_fp8_matmul_batch_ref(...)                             impl :10862-10932
+    batch range 1..64. Header states scalar column accumulation order PRESERVED.
+    NOTE: no DUAL (fused gate+up) batch variant -> batching loses that fusion. Tradeoff.
+- Lease API c/expert_store.h:40-58: 1 lookup = exactly 1 release; view not copyable/shareable/
+  concurrent; active lease BLOCKS eviction (miss replacement needs !slots[i].references :5475).
+  Holding one view across several SERIAL token computations is explicitly allowed. => M4 is legal.
+- Profiler is DECODE-ONLY (reset :8219 after first token). Prefill instrumentation points:
+  start :8175, end :8181. coli_v4_profile_add :6987-6990 is NOT thread-safe (plain += ).
+
+## Prior art (bg_66841634)
+Canonical: route -> stable sort by expert -> pad to block -> per-expert GEMM -> fixed-order
+weighted reduction -> scatter back (inverse permutation).
+MLX (Apple, most relevant) ml-explore/mlx#2078: gather_sort/gather_qmm/scatter_unsort.
+  DeepSeek V3 (256 experts) prompt: 112->154 tok/s (1.4x), 114->210 (1.8x), "~2x once enough
+  tokens fill experts". Mixtral (8 experts) 3.4-3.8x. => 256-expert case is the HARD case;
+  realistic target 1.4-2x, gated on tokens-per-expert.
+vLLM/SGLang moe_align_block_size: stable sort, pad per expert to BLOCK_SIZE_M, -1 for empty,
+  topk weights applied AFTER expert GEMM, separate moe_sum. Small batches skip sort entirely.
+Determinism: upstream engines accept tolerance (assert_close), NOT bitwise — because their
+  combine order changes. OURS CAN BE BITWISE because existing order is already ascending-expert.
