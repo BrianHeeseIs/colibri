@@ -1357,3 +1357,31 @@ Identical within noise, no `COLI_V4_METAL_STATS=1` output, output md5 unchanged
 already exists but is inert. The next step is diagnosing *which* precondition rejects (add a
 one-line reject-reason log), not writing new kernels. Recorded, no code changed; default build
 restored to METAL=0 and re-verified against the golden md5.
+
+### E38c (T0c). Chunk re-bin — larger chunks do NOT rescue M4
+
+The one open question from E38 was whether raising the hardcoded 64-token prefill chunk
+(`c/deepseek_v4.c:7547`) would lift group sizes enough to clear the bar. Re-binned the captured
+routing trace (184 prompt tokens x 43 layers = 7912 token-layer rows, preserved at
+`.backlog/m4_traces/`) at several chunk sizes, capping groups at 64 since the batch primitives do.
+Projections use the measured `f(S)` curves from E38 (current kernel) and E39 (hoisted kernel).
+
+| chunk | groups | mean S | max S | % selections S>=8 | proj current | proj hoisted | proj hybrid `min()` |
+|---|---|---|---|---|---|---|---|
+| 64 | 11986 | 3.96 | 64 | 46.9 % | 1.186x | 1.008x | 1.217x |
+| 128 | 9349 | 5.08 | 64 | 58.4 % | 1.203x | 1.081x | 1.246x |
+| 184 (whole prompt) | 6204 | 7.65 | 64 | 72.9 % | 1.224x | 1.182x | **1.283x** |
+
+**Tripling the chunk buys +5.4 % of projected speedup (1.217 -> 1.283) for 2.9x the prefill buffer
+memory.** The curve saturates because `speedup_op(64) = 1.479` is the hard ceiling of the current
+kernel and mean S climbs slowly against 256 experts. Even the whole-prompt-as-one-chunk case only
+reaches 1.283x, and that is a **zero-overhead projection** — it charges nothing for gather/scatter,
+nothing for the hybrid two-kernel dispatch, and nothing for the E41 cache-contention risk that has
+already turned one "certain" win into an 11 % regression.
+
+**G0 verdict stands: M4 abandoned.** T0c closes the last open question against it rather than for it.
+
+**Side effect — M5's gate is technically met but blocked.** M5 (`gpu_gather_moe`) was gated on
+">=30 % of selections in groups S>=8"; measured **46.9 % at chunk 64**, rising to 72.9 % at 184. So
+the routing data supports GPU-side grouping. However E42 established the Metal expert path never
+executes today, so M5 is blocked behind diagnosing that, not behind routing telemetry.
