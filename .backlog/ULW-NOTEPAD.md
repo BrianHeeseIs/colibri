@@ -157,3 +157,45 @@ G3 (post-impl): SHIP if byte-identical AND canaries green AND real >=1.25x (or >
 - bg_3ac594bd  T0b  unspecified-high+ast-grep : COLI_M4_TRACE gated prefill group-size histogram
                                      on p064/p256 + raw routing trace dump for re-binning
 Next after both: T0c re-bin @64/128/256 + buffer audit, then G0 decision.
+
+## SESSION STATE 2026-08-14 02:58 — ft-deepmetal @ a3f5afb (pushed)
+### Landed tonight
+- E38 M4 gated out pre-implementation (batch primitives re-dequantize per item; projected 1.24x
+  vs 1.25 bar + skew veto). ZERO model code written. ~25 min of parallel measurement.
+- E39 dequant hoisting: bitwise-identical, speedup_op(64) 1.479->2.793, BUT f(1) 0.796->1.537.
+  Crossover S~10-12, real distribution below it. Best hybrid 1.21x vs 1.6x bar. LANE CLOSED.
+  Root-cause correction: expert FFN is compute-bound on the FP32 dot products + per-item
+  activation QDQ. NOT dequant, NOT bandwidth. Kills the whole M4/M5 batching family.
+- E40 router: Tier 1 bit-exact = 0.997x NEGATIVE (clang already vectorizes bf16 decode; and it
+  made default 3.83% slower -> stripped, baseline restored). Tier 2 opt-in = 10.76x on phase,
+  decode_wall -11.4%. Default md5 golden on every run.
+
+### Current numbers (60-token warm, M3 Max)
+  default : router 1955.5 ms  decode_wall 38612.8 ms  md5 5d04890413ff539e802985ce8c727814
+  flagged : router  181.8 ms  decode_wall 34197.5 ms  md5 7155bab905cbfa70aa06afa08f757cee
+  --fast-sparse-attn now = attn_sparse (E37) + router (E40) reassociated kernels.
+
+### Remaining unoptimized leaves (from E35 steady-state profile)
+  head     4.9%  33.8354 ms/call, 1 call/token, 129280 vocab x 4096, ALREADY OpenMP-parallel
+                 (:7258 head_argmax, #pragma omp parallel for at ~:7279). 529M MACs/token
+                 => 15.7 GMAC/s aggregate. Inner dot likely same serial-chain defect.
+                 NEXT TARGET.
+  hc_norm  4.0%  0.3245 ms/call x 18834
+  indexer  2.5%  0.8146 ms/call x 4599
+  compressor 1.9% 0.3246 ms/call x 8979
+  expert_forward 26.6% + attn_out 18.1% + attn_qkv 8.9% + shared_expert 5.8% -> all 4-row'd (E33)
+  expert_wait 6.0% -> I/O, de-promoted (E35)
+
+### Big lane not yet touched
+  GPU offload via coli_v4_metal_expert_forward (backend_metal_v4.o exists, METAL=1 links).
+  expert_forward is 26.6% of decode. E38 telemetry showed 71% of prefill selections in groups
+  >=4, which is favorable for GPU batching. Large/risky lane - needs its own gate.
+
+## Questions For User (ASK AT "good morning"/"good afternoon")
+Q1. Prefill chunk size 64 (:7547) - moot now, M4 closed. WITHDRAWN.
+Q2. Bit-exactness policy - ANSWERED by you: opt-in flag. Applied to E37 + E40.
+Q3. NEW: --fast-sparse-attn now covers attn_sparse + router and will likely cover head next.
+    The name is misleading. Rename to --fast-kernels (keeping --fast-sparse-attn as a hidden
+    alias for compat), or leave as is?
+Q4. NEW: Metal/GPU offload of expert_forward (26.6% of decode) is the largest remaining lane
+    but is a big, risky change. Worth opening, or keep to CPU kernels?
