@@ -1719,3 +1719,49 @@ buffer copies (zero-copy already), and not warmup. Making Metal competitive woul
 those kernels - a far larger project than batching, with the CPU path already at 36.5 GMAC/s.
 
 **Metal lane closed on evidence, for the second and final time.**
+
+---
+
+## E47. Warm vs cold operating points — **cache heating does not speed up decode**
+
+Requested: record warmed-cache performance as a first-class number, not just cold.
+
+Protocol per E45: cycle 4 distinct prompts x 4 cycles in one persistent serve process. Distinct
+prompts force a full attention reset every turn, **proven** by `session->prefix_reused = 0` on all
+16 requests in *both* runs. Plateau = requests 5-16 (cache saturates after ~4).
+
+| cell | hit_pct | tok/s (decode-only) | rel sd |
+|---|---|---|---|
+| COLD one-shot 60 tok, default | 77.97 | **1.531** | 0.3 % |
+| COLD one-shot 60 tok, `--fast-kernels` | 78.51 | **1.700** | 0.7 % |
+| MID one-shot 300 tok, default | 90.29 | 1.370 | 3.2 % |
+| WARM serve plateau, default | **95.41** | 1.449 | 10.9 % |
+| WARM serve plateau, `--fast-kernels` | **95.57** | 1.503 | 11.1 % |
+
+**Heating curve (hit_pct): 77.97 -> 88.4 (E35, 220 tok) -> 90.29 -> 95.41.**
+
+### The result: heating buys nothing for decode
+Driving the expert cache from 78 % to 95.4 % leaves decode throughput **flat within noise**. The
+controlled comparison (serve request 1 at 75.2 % vs plateau at 95.4 %, identical prompts and token
+count) is **-4.5 %, inside a 10.9 % band**. Cause is structural, not a measurement artifact: the
+cold misses are concentrated in **prefill**, and `hit_pct` spans prefill+decode while `tok_s`
+divides by `decode_sec` only (`c/deepseek_v4.c:9174-9217`). Decode was already hitting.
+
+**Caveat on the one-shot rows:** 60/300-token runs have different *average context lengths*, so
+they are not a pure cache-temperature series - the MID row is slower than COLD largely because
+attention cost grows with context, not because a warmer cache hurt. Only the serve rows isolate
+temperature at fixed token count.
+
+### fast-kernels holds up, but warm cannot resolve it
+11.1 % faster cold (0.3-0.7 % sd, decisive) vs 3.7 % warm (±11 % noise, **not resolvable**). This is
+why E45 rejected serve as a benchmarking vehicle: it is the right tool for *observing warm
+behaviour*, and the wrong tool for *measuring kernel deltas*.
+
+### Bug found while measuring: `COLI_V4_KERNELS` was a no-op in serve mode
+`v4_serve_main` reads env directly and never calls `v4_cli_parse`, where the variable is parsed
+(`:8149`). The first warm+fast run therefore silently measured the **default** kernels - it looked
+like fast-kernels gave no warm benefit. Fixed (commit 587c309): serve now parses the same env with
+the same validator, calls `coli_v4_kernels_set_active`, and emits `v4_kernels active=` so serve
+transcripts are self-describing. Golden md5 unchanged. **An env var that works on one entry path
+and silently no-ops on another is exactly the failure class E44's typo-rejection was built to
+prevent - it just had a hole in it.**
