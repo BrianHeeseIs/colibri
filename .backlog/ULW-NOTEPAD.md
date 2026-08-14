@@ -272,3 +272,45 @@ that phase is GPU offload, not more CPU micro-optimization.
   default  mean 38554.8 ms  sd 234.7   md5 5d04890413ff539e802985ce8c727814 (bit-exact)
   flagged  mean 34311.2 ms  sd  49.7   md5 7155bab905cbfa70aa06afa08f757cee
   => 11.01% faster (1.1237x). expert_forward identical in both (10476-10672) = no cache pollution.
+
+## 2026-08-14 04:12 — STOPPING POINT. ft-deepmetal @ 30aa44b (+ this commit), all pushed.
+
+### Repo state VERIFIED CLEAN
+Default build: 0 metal symbols, 0 metal frameworks, 26 units, decode_wall 38605.5 ms,
+golden md5 5d04890413ff539e802985ce8c727814. Working tree has no tracked modifications.
+
+### E42 Metal audit (investigation only, nothing changed)
+METAL ?= 0 is the default => the ENTIRE campaign measured CPU only.
+METAL=1 builds cleanly (6 shaders -> metallib, 8 symbols, frameworks linked) but the GPU path
+NEVER EXECUTES: same-build A/B COLI_V4_METAL=0 vs =1 is identical within noise, no stats output,
+md5 unchanged; also identical with AUTOPIN=0.
+Two causes found:
+  1. COLI_V4_DEFAULT_METALLIB is baked as a CWD-RELATIVE path "build/metal-v4/deepseek_v4.metallib"
+     but the file is at c/build/metal-v4/ -> never resolves when run from repo root.
+     (COLI_V4_METALLIB env at backend_metal_v4.mm:631 overrides it.)
+  2. coli_v4_metal_expert_forward (backend_metal_v4.mm:332) requires metal_variant()==0 AND all
+     three tensors to pass coli_v4_ordered_cold_tensor_valid (:356-364) = ORDERED-COLD layout,
+     but the runtime hot-packs experts into rows16 (packed_slots=722-902) which is what E33's CPU
+     4-row kernel targets. Setting COLI_V4_METALLIB explicitly STILL did not make it fire.
+NEXT STEP for this lane is a one-line reject-reason log inside coli_v4_metal_expert_forward,
+NOT writing new kernels. Cheap and decisive.
+
+### WHY I STOPPED
+- CPU kernel lane exhausted: expert_forward already at 36.5 GMAC/s (73 GFLOP/s) post-E33;
+  activation-QDQ hoist rejected on arithmetic (0.04%); remaining leaves (hc_norm 4.0%,
+  indexer 2.5%, compressor 1.9%) are small AND carry the E41 cache-pollution backfire risk.
+- The one lane with real upside (expert_forward 26.6% via Metal) needs a scope decision.
+- Everything else pending is a QUESTION, listed below.
+
+## QUESTIONS FOR USER — ASK ALL OF THESE AT "good morning"/"good afternoon"
+Q3. --fast-sparse-attn now enables attn_sparse + router (and would have covered head). Name is
+    misleading. Rename to --fast-kernels with --fast-sparse-attn kept as a hidden compat alias?
+Q4. Metal lane: the backend exists and builds but never fires. Want me to diagnose it (add a
+    reject-reason log, fix the metallib path, see if it can run on the rows16 layout)? This is
+    the only remaining lane with >10% upside.
+Q5. Build a same-build A/B harness (env var selecting kernel variant at runtime) so future kernel
+    work is measured without cross-build confounds? E41 took 6 runs to catch; this would have
+    caught it in 1. I recommend yes.
+Q6. Should the opt-in reassociated kernels become the DEFAULT? They are 11.01% faster and the
+    output difference is rounding-level, not quality-level. Currently default is bit-exact and
+    the win is opt-in only.
