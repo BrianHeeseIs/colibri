@@ -58,7 +58,9 @@ it is the only lever that scales the right way.
 env -u COLI_V4_PREFILL_PREFETCH ./bench/golden.sh ./c/deepseek_v4
 N=3 ./bench/rebaseline.sh ./c/deepseek_v4          # pins baseline
 N=3 ./bench/ab.sh "COLI_V4_PREFILL_PREFETCH=1" ./c/deepseek_v4
+cc -O2 -o bench/qd_sweep bench/qd_sweep.c      # tools ship as source, not binaries
 ./bench/qd_sweep models/deepseek-v4-flash artifacts/layer_contig.json
+cc -O2 -o bench/kernel_gap bench/kernel_gap.c  # E53 packed-vs-unpacked ratio
 # attribution: rebuild with -DCOLI_V4_PREFILL_TRACE, run p064 --max-tokens 1
 ```
 Artifacts: `artifacts/baseline.md`, `artifacts/qd_sweep.md`, `artifacts/layer_contig.json`,
