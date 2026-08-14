@@ -382,3 +382,30 @@ S3. Score neutrality: preservation must NOT change measured results.
 
 ## Now
 Survey skills, fire parallel explores, then plan agent.
+
+## Findings 12:14 — live system facts (none of the agents can see these)
+  RAM                128.0 GiB   (Apple M3 Max)
+  model on disk      155 GB across 48 safetensors shards
+  free disk          81 GiB of 926 (95% full)
+  page cache now     File-backed 31.3 GiB, free 66.3 GiB
+
+*** MODEL (155 GB) IS LARGER THAN RAM (128 GiB). ***
+=> A full RAM disk for the model is IMPOSSIBLE. Rules out the user's "maybe a ram disk"
+   in its simplest form. Partial/selective residency is the only RAM-disk-shaped option,
+   and the disk is 95% full so there is no room for a second copy anyway.
+=> The realistic levers are:
+   (a) a persistent server process that keeps the in-process expert cache hot across
+       requests (eliminates re-heating entirely) - bg_baca106c is checking if serve mode exists
+   (b) selective page-cache warming of the hottest shards (66.3 GiB free could hold a chunk)
+   (c) reducing what must be heated at all
+   NOTE: if the engine uses F_NOCACHE/direct IO (COLI_V4_DIRECT / v4_ssd_io), the OS page
+   cache may be deliberately BYPASSED today, which would make (b) useless or even
+   counterproductive. Must confirm before building anything.
+
+## Findings 12:14 — my quality-test harness bug (task B), NOT a model failure
+All 20 outputs came back empty because I filtered STDOUT for '^generated_text=', but that
+line goes to STDERR. STDOUT carries the clean generated text directly.
+Manual check: `... "The capital of France is" --max-tokens 24` -> stdout is
+  `The capital of France is **Paris**.<|end of sentence|>`
+=> Fix: read stdout directly (no awk needed), or merge 2>&1 and use the block extractor.
+Task B is NOT invalidated, just re-run needed.
