@@ -1648,3 +1648,74 @@ re-test (E46) must therefore use one-shot, not serve.
 **Recorded operating points (decode-only throughput):**
 - **cold** one-shot 60-token, hit ~78 %: **1.531 tok/s** (39194.0 ms, sd 107.2)
 - **warm** serve plateau, hit ~95.4 %: **1.449 tok/s** (sd 0.157, noisy)
+
+---
+
+## E46. Metal fair re-test (warmed, amortized) — **CONFIRM: 2.84x slower. Batching gate FAILS 10x.**
+
+The user challenged E43's "Metal is slower" verdict on the grounds that cache heating / warmup may
+have unfairly penalised it, and asked whether a non-per-dispatch (batched) design could rescue it.
+Both questions are answered here with pre-committed criteria.
+
+### Method fixes over E43
+- **One-shot, not serve.** E45 showed serve mode is ~40x noisier (10.9 % vs 0.27 % rel sd), so it
+  would have swamped the effect.
+- **Same binary, env toggle.** `c/deepseek_v4.metal` run with `COLI_V4_METAL=0` vs `=1` - a true
+  same-build A/B. Verified equivalent: pure `c/deepseek_v4.cpu` and `.metal` with `METAL=0` produce
+  the identical md5 `e8c7d8e6...`.
+- **300 tokens, not 30** - 10x more work so lazy `coli_v4_metal_init`, first-dispatch pipeline
+  build, scratch allocation and per-slab `newBufferWithBytesNoCopy` all amortize away.
+- Interleaved runs; `COLI_V4_METAL_STATS=1` for timing (PROFILE distorts and was used only for
+  stage attribution, in a separate pass).
+
+### Verdict: CONFIRM (pre-committed: OVERTURN <=1.05x, CONFIRM >1.10x)
+| | CPU (METAL=0) | Metal (METAL=1) | ratio |
+|---|---|---|---|
+| expert_forward | 59132.1 ms | 167856.6 ms | **2.84x slower** |
+| decode_wall | 218256.8 ms | 331186.9 ms | **1.52x slower** |
+
+**The warmup hypothesis is falsified**: at 30 tokens (E43) it was 2.84x/1.41x; at 300 tokens it is
+**2.84x/1.52x**. Ten times more work made Metal *worse*, not better.
+
+**Isolating the GPU from the hybrid** (46.7 % of experts reach the GPU; 53.3 % are rejected to CPU
+on the rows16 `block_dims` mismatch): `c_gpu = (ef_metal - c_cpu * N_fallback) / N_gpu`
+= **3.5475 ms/expert vs c_cpu 0.7185 ms/expert = 4.94x slower judged on its own.**
+
+**Correctness note:** at 300 tokens `METAL=1` output **diverges** from CPU
+(`b55c21ec...` vs `e8c7d8e6...`), though both are internally deterministic and were *identical* at
+30 tokens - the same slow-accumulation pattern seen in E37/E41. So Metal is not bit-exact at length.
+
+### The batching gate (user's proposal) — FAILS DECISIVELY
+Proposal: stop paying one synchronous `waitUntilCompleted` per expert; enqueue the independent
+experts of a (token,layer) - or a whole prefill chunk - into ONE command buffer.
+*The user's refcount concern was already handled*: the expert store refuses to evict a slot with
+live references (`c/deepseek_v4.c:5609-5614`), so holding N leases is safe by construction.
+
+`COLI_V4_METAL_PROFILE=1` (forwards=7060) gives the split:
+
+| | ms/expert |
+|---|---|
+| **weights zero-copy** | `zero_copy_tensors=42360`, **`copy_fallback_tensors=0`** |
+| matmul gate + down | 2.053 |
+| all other stages | 0.093 |
+| command-buffer submit+wait (9 injected) | 1.985 |
+
+Solving for round-trip R and real GPU compute C two independent ways:
+- from the 8 *extra* profile commits: R = **0.073 ms**, C = **3.475 ms**
+- from `submit_stage / 9`: R = **0.221 ms**, C = **3.327 ms**
+
+**Dispatch overhead is only 2-6 % of the cost. GPU compute is ~3.3-3.5 ms/expert.**
+Gate was: build if C <= 0.10 ms (decode) or C <= 0.35 ms (prefill). Measured C is **~10x above even
+the permissive prefill threshold**. Sanity check: a *perfect* 6-way batch yields
+`(0.073 + 6*3.475)/6 = 3.487 ms/expert`, still **4.9x slower than CPU**.
+
+**=> The previously-scheduled E46 (prefill GPU batch) and E47 (dspark widening) are CANCELLED.**
+Batching amortizes a cost that isn't there.
+
+### Root cause, and what would actually be required
+25.2 M MACs in ~3.33 ms = **~15 GFLOP/s on an M3 Max GPU** - roughly two orders of magnitude below
+the hardware. The bottleneck is **the mxfp4/UE8M0 shaders themselves**, not the dispatch model, not
+buffer copies (zero-copy already), and not warmup. Making Metal competitive would require rewriting
+those kernels - a far larger project than batching, with the CPU path already at 36.5 GMAC/s.
+
+**Metal lane closed on evidence, for the second and final time.**
