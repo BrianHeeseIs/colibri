@@ -2453,3 +2453,49 @@ sparse indexer, and the recurrent compressor (`:2603`) / KV ring (`:2688`).
 Per the rule this project earned the hard way — *attribute inside the engine before proposing a
 mechanism* (E48/E52/E53/E54 each died for violating it) — **B3 attention attribution is now the
 critical next measurement.** No attention work should be scoped until the 11.0 s is broken down.
+
+---
+
+## E60. The MoE GPU kernel was **occupancy-limited, not format-limited** — and that reframes the lane
+
+E58d measured my MXFP4 probes walling at ~114–130 GFLOP/s ≈ 3 % of this GPU's fp32 peak, and I
+recorded those GPU figures as a *lower bound*. E59's attention probe then hit **572 GFLOP/s** on
+dense fp8 with an otherwise similar per-element decode. That 4.4x gap was the clue.
+
+**Cause: dispatch geometry, not the quantisation format.** The MXFP4 probes dispatched **1D over
+output rows only — 2048 threads on a 40-core GPU**. The fp8 attention probe dispatched **2D
+`(rows × S)`**, up to 2.1 M threads. Re-dispatching MXFP4 as 2D (`validation/probes/sweep3_2d.m`):
+
+| S | v2 (1D) GFLOP/s | **v3 (2D) GFLOP/s** | v3 us/token |
+|---|---|---|---|
+| 1 | ~45 | 23.0 | 729.0 |
+| 4 | ~80 | 81.6 | 205.6 |
+| 8 | ~103 | 122.4 | 137.0 |
+| 16 | ~130 | 147.3 | 113.9 |
+| 32 | — | **275.1** | 61.0 |
+| 64 | — | **421.6** | **39.8** |
+
+**3.2x past the old wall**, and us/token falls to 39.8 (vs v2's best 128.9). MXFP4 was never the
+problem.
+
+### What this changes
+**The kernel is not the bottleneck — N is.** The measured N = 4.10 (E58e) sits in the *flat* part of
+this curve (205.6 us/token at S=4), while the real wins live at **S=32–64** (61.0 / 39.8 us/token).
+Improving the kernel further buys little at N=4.10; **raising N is the whole game**.
+
+That promotes the chunk-cap lever (plan T9) from "nice extra" to **the primary performance lever of
+the MoE lane** — and the cap is a code constant in seven+ places, one of which (`__m256 sums[64]`,
+`:12355`) is a stack-overflow hazard if raised naively.
+
+### Honest limitation — my extrapolation of N is NOT trustworthy
+I modelled unique-experts-vs-tokens by calibrating a coupon-collector curve to the single measured
+point (64 tokens → 93.7 unique). It predicts unique **saturating at ~95**, which would give N ≈ 16
+at 256 tokens and N ≈ 50 at 799. **But the measured per-layer maximum at chunk=64 was already 188**,
+which the model cannot produce. The model is overfitted to the mean and contradicts the observed
+spread (min 73, max 188).
+
+**So the N-vs-chunk curve is UNMEASURED.** Any claim that chunk=256 yields N≈16 is speculation of
+exactly the kind this project has repeatedly punished (E48/E52/E53/E54, and the +80.7 % composition
+in E57). **T9 must measure N at each chunk value directly from the engine's own `unique=` log
+before any performance claim is attached to it.** Recorded here as a hypothesis with a named
+measurement, not as a result.

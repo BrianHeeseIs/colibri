@@ -202,3 +202,36 @@ SCOPING: projections = 3.40 s of the 14.4 s attention block = 7.8% of the 43.5 s
 DECISIVE UNKNOWN: the other 11.0 s of attention (QK^T/softmax/AV/RoPE/DSA indexer/recurrent
 compressor :2603/:2688). Dense+batchable -> lane >> MoE lane. Recurrent -> lane capped ~1.07x.
 => B3 ATTENTION ATTRIBUTION IS NOW THE CRITICAL MEASUREMENT. Do not scope attention work before it.
+
+### F17. ATTENTION INTERNAL STRUCTURE (read from source, :2546-2777) - decides the lane's size
+coli_v4_attention_window_batch_ref stages:
+  BATCHED (GPU-favorable, measured 6.0x in E59):
+    :2592 wq_a matmul   :2632 wq_b matmul (the big one, 1024->32768)
+    :2644 wkv matmul    :2772 wo_b matmul
+  PER-ITEM / SEQUENTIAL (NOT batched today):
+    :2611 coli_v4_compressor_step   - RECURRENT (carries kv_state/score_state)
+    :2619 coli_v4_indexer_step      - per item
+    :2663-2675 RoPE apply x64 heads + bf16 round, per item
+    :2692-2694 KV ring memcpy per item  <-- CAUSAL: token i writes KV that later tokens read
+    :2727 coli_v4_sparse_attention_ref  - THE ATTENTION CORE, per item, 64 heads x head_dim 512
+    :2732-2738 RoPE apply on attended x64 heads, per item
+    :2764 wo_a matmul PER GROUP (not batched over items)
+KEY STRUCTURAL FACT: :2694 makes the per-item block CAUSALLY SEQUENTIAL within a chunk - token i
+attends to KV written by tokens < i. So the attention core canNOT be batched across tokens the way
+the projections are. Parallelism inside one token is 64 heads x selected keys, which IS large.
+=> The lane's size depends on how the 14.4 s splits between (a) the 4 batched matmuls ~3.4 s
+   (measured 6.0x available) and (b) the per-item block ~11.0 s (needs a DIFFERENT strategy:
+   per-token GPU dispatch of 64-head sparse attention, or CPU SIMD, or nothing).
+=> B3 must time :2611 / :2619 / RoPE / :2727 / :2764 SEPARATELY. Without that split, any attention
+   proposal is guesswork - and this project has killed 4 hypotheses for exactly that mistake.
+
+### F18. MXFP4 kernel was OCCUPANCY-limited (E60)
+v1/v2 dispatched 1D over O only = 2048 threads on 40 GPU cores. fp8 attention probe dispatched 2D
+(rows x S) and hit 572 GF/s. Re-dispatching MXFP4 2D (validation/probes/sweep3_2d.m):
+  S=4 81.6 GF/s (205.6us/tok) | S=16 147.3 (113.9) | S=32 275.1 (61.0) | S=64 421.6 (39.8)
+=> 3.2x past the old 130 GF/s wall. Format was never the limit.
+=> KERNEL IS NOT THE BOTTLENECK. N IS. N=4.10 sits in the FLAT part of the curve.
+=> chunk-cap lever (T9) is promoted to the PRIMARY lever of the MoE lane.
+CAUTION: my coupon-collector extrapolation of N vs tokens saturates unique at ~95, but the MEASURED
+max at chunk=64 is 188. Model contradicts data -> N at larger chunks is UNMEASURED. T9 must read it
+from the engine's unique= log. Do not attach a perf claim to the extrapolation.
