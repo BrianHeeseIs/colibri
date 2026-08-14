@@ -689,3 +689,19 @@ GATE B >=15% on p256 else revert; decode path + global 3-worker pool untouched.
 LAYOUT INTEL AVAILABLE: each layer = ONE shard; all 256 scale groups contiguous, all 256
 weight groups contiguous (21930/21930 neighbors adjacent) => adjacent needed experts in a
 layer can be coalesced into ONE larger pread per stream.
+
+## 18:20 — USER DECISION: keep prefetch (default OFF), pursue the UNPACKED-EXPERT KERNEL
+GATE B not met (7.0-9.5% vs 15%) but the feature is correct/bit-exact/default-OFF => KEPT.
+E51's "84% SSD wait" RETRACTED. Real bottleneck: prefill experts are cold/UNPACKED and take
+the slow fallback kernel; decode experts are rows16 hot-PACKED and take the fast fused kernel.
+Residual per-op 1.96ms (default kernels) vs 0.41-0.76ms warm => 3-5x gap. THAT is the prize.
+
+### NEW LANE: unpacked-expert compute path
+Two candidate fixes (must measure before choosing):
+  (a) PACK ON LOAD during prefill - convert to rows16 as part of the miss path, pay the pack
+      cost once per expert, then use the fast fused kernel. Cost: packing time x ~4257 misses.
+  (b) SPEED UP THE UNPACKED KERNEL - bring E33's 4-row fused treatment to the cold path
+      (coli_fp4_dual_matvec_ref / coli_fp4_matvec_ref) rather than only rows16_v10.
+Key code refs (from E46 T0a): packed hot -> coli_fp4_dual_matvec_rows16_v10 (:6586);
+cold/unpacked -> fallback (:6573); rows16 marker only set for packed hot slots (:6132).
+GATE: microbench both kernels at real shapes + measure pack cost, BEFORE engine work.
