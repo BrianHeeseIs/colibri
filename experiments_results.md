@@ -1581,3 +1581,70 @@ E37 flagged result from before the router kernel existed, three experiments ago.
 Adding a third kernel is one registry line (`X(HEAD, "head", 2)`), which automatically extends
 parsing, `all`, the error message, and the active-set log. That is how E41's head kernel should be
 re-tested if we revisit it.
+
+---
+
+## E45. Warm-cache measurement via persistent serve — **cache preserved, but 40x noisier; not a benchmarking win**
+
+User asked (a) whether cache heating had unfairly penalised Metal, (b) for a way to preserve a
+pre-heated cache between runs, and (c) that warm-cache performance be recorded as a first-class
+number. This experiment answers (b) and (c).
+
+### The only viable preservation lever is a persistent process
+- Model is **155 GB on disk vs 128 GiB RAM** - it does not fit, so a full RAM disk is impossible.
+- `hdiutil` RAM disks use **wired** memory, and swapping the storage medium would invalidate the
+  benchmark against production APFS/SSD anyway.
+- `posix_fadvise` does not exist on macOS; `madvise(MADV_WILLNEED)` applies to mapped ranges and
+  the engine uses `pread`, not mmap. `F_RDADVISE` is advisory only; `vmtouch`/`mlock` change
+  eviction behaviour and are benchmark-invalid.
+- **Decisive:** expert reads set `F_NOCACHE` (`COLI_V4_DIRECT` defaults on), so the OS unified
+  buffer cache is *deliberately bypassed*. Page-cache warming cannot help expert I/O at all.
+=> Only keeping the engine process alive preserves anything. Serve mode does exactly that
+(`SERVE=1`, one engine + one session, requests forever, READY in 0.333 s).
+
+### Two confounds had to die first
+1. **KV prefix reuse.** Re-sending a prompt lets the engine skip prefill entirely.
+2. **My own false hypothesis:** I believed a single KV slot accumulates context across turns.
+   It does not. `kv_prefix_reuse()` (`c/kv_prefix.h:116-127`) is **all-or-nothing** - reuse only
+   when the entire prior fed sequence is a prefix of a *longer* new prompt; anything else returns
+   0 and forces a **full attention reset + prefill from position 0** (`c/deepseek_v4.c:8477-8506`).
+   The real confound was accounting: `hit_pct` spans the whole generate call **including prefill**
+   (`:9174-9203`) while `tok_s` divides by `decode_sec`, which starts **after** prefill
+   (`:9204-9217`). Rising hit_pct never implied warmer decode.
+
+**Protocol adopted:** cycle a fixed set of 4 distinct prompts, repeat 4 cycles. Distinct within a
+cycle forces a reset every turn; the same prompt recurring each cycle makes cycle k vs cycle 1 a
+controlled comparison of the *same* workload at a hotter cache.
+**Proof it worked:** the engine's `DONE` line carries a 10th field, `session->prefix_reused`
+(`c/deepseek_v4.c:9213-9217`). It was **0 on all 16 requests** - every turn genuinely did a full
+reset. (Finding that field also fixed a harness bug: the documented 9-field `DONE` is wrong, and
+the engine's own comment says readers must accept `len(fields) >= 7`.)
+
+### Result: the cache heats, and it buys nothing for decode
+| | requests | hit_pct | tok/s |
+|---|---|---|---|
+| heating | 1-4 | 75.2 -> 91.1 -> 93.6 -> 95.0 | - |
+| plateau | 5-16 | **95.41 % (sd 0.38)** | **1.449 (sd 0.157)** |
+| coldest single request | 1 | 75.2 % | 1.517 |
+
+Heating 75.2 % -> 95.4 % changed decode throughput by **-4.5 %, inside a 10.9 % noise band**.
+Consistent with the accounting above: the cold misses are concentrated in **prefill**, and decode
+was already hitting.
+
+### And serve mode is unusable as a benchmark accelerator
+| | relative sd |
+|---|---|
+| one-shot `decode_wall` (n=3) | **0.27 %** |
+| serve plateau `tok_s` (n=12) | **10.9 %** |
+
+**Serve mode is ~40x noisier.** Matching one-shot precision would need ~472 samples per config
+(~6.5 h). Probable cause: the hot policy repins on an interval (`repin_interval=6`) and actively
+repacks rows16 - `packed_slots=1894` here versus 722-902 in one-shot runs.
+
+**Decision: do NOT adopt serve mode for benchmarking.** It preserves the cache but costs far more
+precision than it saves wall-clock. One-shot remains the measurement vehicle, and the Metal
+re-test (E46) must therefore use one-shot, not serve.
+
+**Recorded operating points (decode-only throughput):**
+- **cold** one-shot 60-token, hit ~78 %: **1.531 tok/s** (39194.0 ms, sd 107.2)
+- **warm** serve plateau, hit ~95.4 %: **1.449 tok/s** (sd 0.157, noisy)
