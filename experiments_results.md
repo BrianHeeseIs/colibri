@@ -1313,3 +1313,47 @@ contend for shared cache and memory bandwidth. Any future kernel win MUST be val
 cross-build comparisons hide this effect. This is the third time this campaign that a
 "clearly good" local change was wrong (E40 Tier 1 regressed the default 3.83 %; E39 hoisting
 regressed f(1) 2x; now E41 regressed the wall 11 %).
+
+---
+
+## E42. Metal/GPU backend audit — **builds, links, and never executes** (investigation only, no changes)
+
+Assessed the largest remaining lane (`expert_forward`, 26.6 % of decode) before proposing GPU work.
+
+**What exists:** 7 shaders under `c/metal/` (incl. `coli_v4_moe.metal`, all touched 2026-08-13), a
+seam header `c/backend_metal_v4_seam.h`, an Objective-C++ backend `c/backend_metal_v4.mm`, and
+**three integration points at exactly the hot path** — `c/deepseek_v4.c:3357`, `:4041`, `:4087` —
+each shaped as `if (coli_v4_metal_enabled() && coli_v4_metal_expert_forward(...) == 0) done = 1;`
+with a CPU fallback.
+
+**Findings:**
+1. **`METAL ?= 0` (c/Makefile.deepseek-v4:97).** The default build links **zero** Metal symbols.
+   Every measurement in this campaign was CPU-only.
+2. `METAL=1` **builds cleanly**: compiles all 6 shaders to `build/metal-v4/deepseek_v4.metallib`
+   and links `-framework Metal -framework Foundation` (8 Metal symbols).
+3. **It never executes.** Same-build A/B with `COLI_V4_METAL=0` vs `=1`:
+
+| config | expert_forward ms | decode_wall ms |
+|---|---|---|
+| METAL=0 | 10555.0 / 10464.5 | 38581.0 / 38312.8 |
+| METAL=1 | 10569.4 / 10583.5 | 38663.9 / 38577.7 |
+
+Identical within noise, no `COLI_V4_METAL_STATS=1` output, output md5 unchanged
+(`5d04890413ff539e802985ce8c727814`). Also unchanged with `COLI_V4_AUTOPIN=0`
+(expert_forward 5206.5 vs 5204.0 on a 30-token run).
+4. **Two concrete causes identified:**
+   - **Metallib path bug:** the build hardcodes
+     `-DCOLI_V4_DEFAULT_METALLIB='"build/metal-v4/deepseek_v4.metallib"'` — a path relative to CWD.
+     The file actually lives at `c/build/metal-v4/`, so running from the repo root resolves to a
+     nonexistent path. (`COLI_V4_METALLIB` at `backend_metal_v4.mm:631` can override it.)
+   - **Layout precondition:** `coli_v4_metal_expert_forward` (`backend_metal_v4.mm:332`) requires
+     `coli_v4_metal_variant() == 0` and all three tensors to pass
+     `coli_v4_ordered_cold_tensor_valid` (`:356-364`) — i.e. the **ordered-cold** layout. The
+     runtime hot-packs experts into rows16 (`v4_rows16 packed_slots=722-902`), which is the layout
+     E33's CPU 4-row kernel was built for. Setting `COLI_V4_METALLIB` explicitly still did not make
+     it fire, so at least one precondition rejects every expert in this configuration.
+
+**Conclusion:** GPU offload of `expert_forward` is not a greenfield build — substantial machinery
+already exists but is inert. The next step is diagnosing *which* precondition rejects (add a
+one-line reject-reason log), not writing new kernels. Recorded, no code changed; default build
+restored to METAL=0 and re-verified against the golden md5.
