@@ -22,6 +22,39 @@ enum {
     COLI_V4_PROFILE_COUNT,
 };
 
+#ifdef COLI_V4_PREFILL_TRACE
+enum {
+    COLI_V4_PREFILL_TRACE_ATTN_NORM,
+    COLI_V4_PREFILL_TRACE_ATTENTION,
+    COLI_V4_PREFILL_TRACE_ROUTEAHEAD,
+    COLI_V4_PREFILL_TRACE_ATTN_POST,
+    COLI_V4_PREFILL_TRACE_FFN_NORM,
+    COLI_V4_PREFILL_TRACE_MOE,
+    COLI_V4_PREFILL_TRACE_FFN_POST,
+    COLI_V4_PREFILL_TRACE_LOADER_FINISH,
+    COLI_V4_PREFILL_TRACE_HEAD,
+    COLI_V4_PREFILL_TRACE_HIT_MUTEX_WAIT,
+    COLI_V4_PREFILL_TRACE_HIT_SLOT_SCAN,
+    COLI_V4_PREFILL_TRACE_HIT_PACK,
+    COLI_V4_PREFILL_TRACE_HIT_VIEW_PUBLISH,
+    COLI_V4_PREFILL_TRACE_MISS_MUTEX_WAIT,
+    COLI_V4_PREFILL_TRACE_MISS_SLOT_SELECT,
+    COLI_V4_PREFILL_TRACE_MISS_SLAB_ALLOC,
+    COLI_V4_PREFILL_TRACE_MISS_READ_FIRST_TOUCH,
+    COLI_V4_PREFILL_TRACE_MISS_RELOCK_PUBLISH,
+    COLI_V4_PREFILL_TRACE_MISS_PACK,
+    COLI_V4_PREFILL_TRACE_REF_PREFILL,
+    COLI_V4_PREFILL_TRACE_REF_DECODE,
+    COLI_V4_PREFILL_TRACE_COUNT,
+};
+
+enum {
+    COLI_V4_PREFILL_TRACE_INACTIVE,
+    COLI_V4_PREFILL_TRACE_PREFILL,
+    COLI_V4_PREFILL_TRACE_DECODE,
+};
+#endif
+
 #define COLI_V4_KERNEL_LIST(X) \
     X(ATTN_SPARSE, "attn_sparse", 0) \
     X(ROUTER, "router", 1)
@@ -48,6 +81,10 @@ enum {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#if defined(COLI_V4_PREFILL_TRACE) && defined(_OPENMP)
+#include <omp.h>
+#endif
 
 static int set_error(char *error, size_t size, const char *format, ...) {
     if (error && size) {
@@ -58,6 +95,192 @@ static int set_error(char *error, size_t size, const char *format, ...) {
     }
     return -1;
 }
+
+#ifdef COLI_V4_PREFILL_TRACE
+typedef struct {
+    uint64_t elapsed_ns;
+    uint64_t calls;
+} ColiV4PrefillTraceStage;
+
+static ColiV4PrefillTraceStage
+    coli_v4_prefill_trace_stages[COLI_V4_PREFILL_TRACE_COUNT];
+static int coli_v4_prefill_trace_mode_value;
+static uint64_t coli_v4_prefill_trace_wall_began;
+static uint64_t coli_v4_prefill_trace_wall_ns;
+static int coli_v4_prefill_trace_prompt_tokens;
+static int coli_v4_prefill_trace_fresh_tokens;
+static int coli_v4_prefill_trace_prefetch;
+
+uint64_t coli_v4_prefill_trace_now_ns(void) {
+    struct timespec value;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &value);
+    return (uint64_t)value.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)value.tv_nsec;
+}
+
+int coli_v4_prefill_trace_mode(void) {
+    return __atomic_load_n(&coli_v4_prefill_trace_mode_value,
+                           __ATOMIC_RELAXED);
+}
+
+void coli_v4_prefill_trace_add(int stage, uint64_t elapsed_ns) {
+    if (stage < 0 || stage >= COLI_V4_PREFILL_TRACE_COUNT) return;
+    __atomic_fetch_add(&coli_v4_prefill_trace_stages[stage].elapsed_ns,
+                       elapsed_ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&coli_v4_prefill_trace_stages[stage].calls,
+                       UINT64_C(1), __ATOMIC_RELAXED);
+}
+
+void coli_v4_prefill_trace_begin(int prompt_tokens, int fresh_tokens) {
+    __atomic_store_n(&coli_v4_prefill_trace_mode_value,
+                     COLI_V4_PREFILL_TRACE_INACTIVE, __ATOMIC_RELAXED);
+    memset(coli_v4_prefill_trace_stages, 0,
+           sizeof(coli_v4_prefill_trace_stages));
+    coli_v4_prefill_trace_prompt_tokens = prompt_tokens;
+    coli_v4_prefill_trace_fresh_tokens = fresh_tokens;
+    const char *prefetch = getenv("COLI_V4_PREFILL_PREFETCH");
+    coli_v4_prefill_trace_prefetch =
+        prefetch && *prefetch && atoi(prefetch) != 0;
+    coli_v4_prefill_trace_wall_began = coli_v4_prefill_trace_now_ns();
+    __atomic_store_n(&coli_v4_prefill_trace_mode_value,
+                     COLI_V4_PREFILL_TRACE_PREFILL, __ATOMIC_RELEASE);
+}
+
+void coli_v4_prefill_trace_end_prefill(void) {
+    coli_v4_prefill_trace_wall_ns = coli_v4_prefill_trace_now_ns() -
+        coli_v4_prefill_trace_wall_began;
+    __atomic_store_n(&coli_v4_prefill_trace_mode_value,
+                     COLI_V4_PREFILL_TRACE_DECODE, __ATOMIC_RELEASE);
+}
+
+void coli_v4_prefill_trace_abort(void) {
+    __atomic_store_n(&coli_v4_prefill_trace_mode_value,
+                     COLI_V4_PREFILL_TRACE_INACTIVE, __ATOMIC_RELEASE);
+}
+
+static double coli_v4_prefill_trace_sample_overhead_ns(void) {
+    enum { samples = 100000 };
+    uint64_t elapsed_sink = 0;
+    uint64_t calls_sink = 0;
+    uint64_t began = coli_v4_prefill_trace_now_ns();
+    for (int sample = 0; sample < samples; sample++) {
+        uint64_t inner = coli_v4_prefill_trace_now_ns();
+        uint64_t elapsed = coli_v4_prefill_trace_now_ns() - inner;
+        __atomic_fetch_add(&elapsed_sink, elapsed, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&calls_sink, UINT64_C(1), __ATOMIC_RELAXED);
+    }
+    uint64_t elapsed = coli_v4_prefill_trace_now_ns() - began;
+    if (elapsed_sink == UINT64_MAX || calls_sink != samples)
+        fprintf(stderr, "v4_prefill_trace calibration_sink=%llu/%llu\n",
+                (unsigned long long)elapsed_sink,
+                (unsigned long long)calls_sink);
+    return (double)elapsed / samples;
+}
+
+static void coli_v4_prefill_trace_print_stage(const char *table,
+                                               const char *name, int stage,
+                                               uint64_t wall_ns) {
+    uint64_t elapsed = __atomic_load_n(
+        &coli_v4_prefill_trace_stages[stage].elapsed_ns, __ATOMIC_RELAXED);
+    uint64_t calls = __atomic_load_n(
+        &coli_v4_prefill_trace_stages[stage].calls, __ATOMIC_RELAXED);
+    fprintf(stderr,
+            "v4_prefill_trace table=%s stage=%s total_ms=%.3f calls=%llu "
+            "mean_ns=%.1f pct_wall=%.3f\n",
+            table, name, elapsed / 1e6, (unsigned long long)calls,
+            calls ? (double)elapsed / calls : 0.0,
+            wall_ns ? 100.0 * elapsed / wall_ns : 0.0);
+}
+
+void coli_v4_prefill_trace_report(void) {
+    static const char *names[COLI_V4_PREFILL_TRACE_COUNT] = {
+        "attention_norm", "attention", "routeahead",
+        "attention_hc_post", "ffn_norm", "moe", "ffn_hc_post",
+        "loader_finish", "head",
+        "hit_mutex_wait", "hit_slot_scan", "hit_pack",
+        "hit_view_publish", "miss_mutex_wait", "miss_slot_select",
+        "miss_slab_alloc", "miss_read_first_touch",
+        "miss_relock_publish", "miss_pack",
+        "expert_ref_prefill", "expert_ref_decode",
+    };
+#ifdef _OPENMP
+    int omp_max_threads = omp_get_max_threads();
+#else
+    int omp_max_threads = 1;
+#endif
+    uint64_t wall_ns = coli_v4_prefill_trace_wall_ns;
+    fprintf(stderr,
+            "v4_prefill_trace config prefetch=%d prompt_tokens=%d "
+            "fresh_tokens=%d omp_max_threads=%d wall_ms=%.3f\n",
+            coli_v4_prefill_trace_prefetch,
+            coli_v4_prefill_trace_prompt_tokens,
+            coli_v4_prefill_trace_fresh_tokens, omp_max_threads,
+            wall_ns / 1e6);
+
+    uint64_t accounted_ns = 0;
+    uint64_t accounted_calls = 0;
+    for (int stage = COLI_V4_PREFILL_TRACE_ATTN_NORM;
+         stage <= COLI_V4_PREFILL_TRACE_HEAD; stage++) {
+        coli_v4_prefill_trace_print_stage(
+            "wall", names[stage], stage, wall_ns);
+        accounted_ns += __atomic_load_n(
+            &coli_v4_prefill_trace_stages[stage].elapsed_ns,
+            __ATOMIC_RELAXED);
+        accounted_calls += __atomic_load_n(
+            &coli_v4_prefill_trace_stages[stage].calls,
+            __ATOMIC_RELAXED);
+    }
+    int64_t residual_ns = (int64_t)wall_ns - (int64_t)accounted_ns;
+    fprintf(stderr,
+            "v4_prefill_trace table=wall stage=residual total_ms=%.3f "
+            "calls=1 mean_ns=%.1f pct_wall=%.3f\n",
+            residual_ns / 1e6, (double)residual_ns,
+            wall_ns ? 100.0 * residual_ns / wall_ns : 0.0);
+    fprintf(stderr,
+            "v4_prefill_trace table=wall stage=sum total_ms=%.3f calls=%llu "
+            "mean_ns=%.1f pct_wall=100.000\n",
+            wall_ns / 1e6, (unsigned long long)(accounted_calls + 1),
+            (double)wall_ns / (accounted_calls + 1));
+
+    uint64_t store_ns = 0;
+    uint64_t store_calls = 0;
+    for (int stage = COLI_V4_PREFILL_TRACE_HIT_MUTEX_WAIT;
+         stage <= COLI_V4_PREFILL_TRACE_MISS_PACK; stage++) {
+        coli_v4_prefill_trace_print_stage(
+            "store_nested", names[stage], stage, wall_ns);
+        store_ns += __atomic_load_n(
+            &coli_v4_prefill_trace_stages[stage].elapsed_ns,
+            __ATOMIC_RELAXED);
+        store_calls += __atomic_load_n(
+            &coli_v4_prefill_trace_stages[stage].calls,
+            __ATOMIC_RELAXED);
+    }
+    fprintf(stderr,
+            "v4_prefill_trace table=store_nested stage=raw_sum total_ms=%.3f "
+            "calls=%llu mean_ns=%.1f pct_wall=%.3f\n",
+            store_ns / 1e6, (unsigned long long)store_calls,
+            store_calls ? (double)store_ns / store_calls : 0.0,
+            wall_ns ? 100.0 * store_ns / wall_ns : 0.0);
+    fprintf(stderr,
+            "v4_prefill_trace note=store_nested_is_nonadditive_due_to_worker_overlap\n"
+            "v4_prefill_trace note=slot_scan_includes_request_accounting_and_repin\n"
+            "v4_prefill_trace note=miss_read_first_touch_combined "
+            "reason=pread_faults_destination_pages\n");
+
+    coli_v4_prefill_trace_print_stage(
+        "expert", names[COLI_V4_PREFILL_TRACE_REF_PREFILL],
+        COLI_V4_PREFILL_TRACE_REF_PREFILL, wall_ns);
+    coli_v4_prefill_trace_print_stage(
+        "expert", names[COLI_V4_PREFILL_TRACE_REF_DECODE],
+        COLI_V4_PREFILL_TRACE_REF_DECODE, wall_ns);
+    fprintf(stderr,
+            "v4_prefill_trace timer_sample_overhead_ns=%.1f "
+            "sample=two_clocks_plus_two_atomic_adds iterations=100000\n",
+            coli_v4_prefill_trace_sample_overhead_ns());
+    __atomic_store_n(&coli_v4_prefill_trace_mode_value,
+                     COLI_V4_PREFILL_TRACE_INACTIVE, __ATOMIC_RELEASE);
+}
+#endif
 
 int coli_st_index_open(ColiSafetensorsIndex **out, const char *directory,
                        char *error, size_t error_size) {
@@ -1452,6 +1675,7 @@ int coli_v4_swiglu(float *output, const float *gate, const float *up,
 extern int coli_v4_profile_on;
 extern uint64_t coli_v4_profile_now_ns(void);
 extern void coli_v4_profile_add(int phase, uint64_t elapsed_ns);
+
 #define COLI_V4_PROFILE_ROPE 3
 
 extern int coli_v4_profile_on;
@@ -3231,6 +3455,32 @@ extern int coli_v4_profile_on;
 extern uint64_t coli_v4_profile_now_ns(void);
 extern void coli_v4_profile_add(int phase, uint64_t elapsed_ns);
 
+#ifdef COLI_V4_PREFILL_TRACE
+extern uint64_t coli_v4_prefill_trace_now_ns(void);
+extern void coli_v4_prefill_trace_add(int stage, uint64_t elapsed_ns);
+extern int coli_v4_prefill_trace_mode(void);
+
+static int coli_v4_prefill_trace_expert_forward(
+        float *output, const ColiExpertView *expert, const float *input,
+        float route_weight, float swiglu_limit) {
+    int mode = coli_v4_prefill_trace_mode();
+    if (mode == COLI_V4_PREFILL_TRACE_INACTIVE)
+        return coli_v4_expert_forward_ref(
+            output, expert, input, route_weight, swiglu_limit);
+    uint64_t began = coli_v4_prefill_trace_now_ns();
+    int result = coli_v4_expert_forward_ref(
+        output, expert, input, route_weight, swiglu_limit);
+    coli_v4_prefill_trace_add(
+        mode == COLI_V4_PREFILL_TRACE_PREFILL
+            ? COLI_V4_PREFILL_TRACE_REF_PREFILL
+            : COLI_V4_PREFILL_TRACE_REF_DECODE,
+        coli_v4_prefill_trace_now_ns() - began);
+    return result;
+}
+#else
+#define coli_v4_prefill_trace_expert_forward coli_v4_expert_forward_ref
+#endif
+
 static int set_error(char *error, size_t size, const char *format, ...) {
     if (error && size) {
         va_list arguments;
@@ -3372,7 +3622,7 @@ static int moe_token(float *output,
                                          route_weights[rank],
                                          config->swiglu_limit) == 0) done = 1;
 #endif
-        if (!done) result = coli_v4_expert_forward_ref(
+        if (!done) result = coli_v4_prefill_trace_expert_forward(
             expert_output, &expert, input, route_weights[rank],
             config->swiglu_limit);
         coli_expert_release(store, &expert);
@@ -4372,7 +4622,7 @@ static int coli_v4_prefill_experts_forward(
                 config->swiglu_limit) == 0)
             done = 1;
 #endif
-        int result = done ? 0 : coli_v4_expert_forward_ref(
+        int result = done ? 0 : coli_v4_prefill_trace_expert_forward(
             expert_output, &expert, input, expert_weights[current],
             config->swiglu_limit);
         if (coli_v4_profile_on)
@@ -4582,7 +4832,7 @@ static int moe_token_pipeline(float *output,
                                              expert_weights[current],
                                              config->swiglu_limit) == 0) done = 1;
 #endif
-            if (!done) result = coli_v4_expert_forward_ref(
+            if (!done) result = coli_v4_prefill_trace_expert_forward(
                 expert_output, &expert, input, expert_weights[current],
                 config->swiglu_limit);
             if (coli_v4_profile_on)
@@ -4628,7 +4878,7 @@ static int moe_token_pipeline(float *output,
                                              expert_weights[current],
                                              config->swiglu_limit) == 0) done = 1;
 #endif
-            if (!done) result = coli_v4_expert_forward_ref(
+            if (!done) result = coli_v4_prefill_trace_expert_forward(
                 expert_output, &expert, input, expert_weights[current],
                 config->swiglu_limit);
         }
@@ -4768,6 +5018,12 @@ int coli_v4_block_window_batch_ref(
     ColiV4PrefillRouteCache *route_cache = NULL;
     ColiV4PrefillRouteCache *previous_route_cache = NULL;
     int route_cache_active = 0;
+#ifdef COLI_V4_PREFILL_TRACE
+    int trace_prefill = coli_v4_prefill_trace_mode() ==
+        COLI_V4_PREFILL_TRACE_PREFILL;
+    uint64_t trace_began = trace_prefill
+        ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
 #ifdef COLI_M4_TRACE
     ColiM4ChunkTrace m4_trace = {
         .layer = weights->plan.layer,
@@ -4793,11 +5049,30 @@ int coli_v4_block_window_batch_ref(
             normalized + (size_t)item * d,
             inputs_hc + (size_t)item * hd,
             weights, config, "attn", "attn_norm.weight");
+#ifdef COLI_V4_PREFILL_TRACE
+    if (trace_prefill)
+        coli_v4_prefill_trace_add(
+            COLI_V4_PREFILL_TRACE_ATTN_NORM,
+            coli_v4_prefill_trace_now_ns() - trace_began);
+    trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
     phase = "attention";
+#ifdef COLI_V4_PREFILL_TRACE
+    int trace_attention_ran = trace_prefill && !result;
+#endif
     if (!result) result = coli_v4_attention_window_batch_ref(
         branches, attention, weights, config, normalized,
         start_position, batch, error, error_size);
+#ifdef COLI_V4_PREFILL_TRACE
+    if (trace_attention_ran)
+        coli_v4_prefill_trace_add(
+            COLI_V4_PREFILL_TRACE_ATTENTION,
+            coli_v4_prefill_trace_now_ns() - trace_began);
+#endif
     if (!result && coli_v4_prefill_routeahead_enabled()) {
+#ifdef COLI_V4_PREFILL_TRACE
+        trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
         phase = "prefill route-ahead";
         route_cache = coli_v4_prefill_route_cache_create(
             weights->plan.layer, batch, config->num_experts_per_tok,
@@ -4824,34 +5099,79 @@ int coli_v4_block_window_batch_ref(
             coli_v4_prefill_route_cache = route_cache;
             route_cache_active = 1;
         }
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_ROUTEAHEAD,
+                coli_v4_prefill_trace_now_ns() - trace_began);
+#endif
     }
     if (!result) phase = "attention post / FFN hyper-connection";
     for (int item = 0; !result && item < batch; item++) {
         if (route_cache_active) route_cache->current_item = item;
         float *state = states + (size_t)item * hd;
+#ifdef COLI_V4_PREFILL_TRACE
+        trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
         result = coli_v4_hc_post(
             state, branches + (size_t)item * d,
             inputs_hc + (size_t)item * hd,
             posts + (size_t)item * hc,
             combs + (size_t)item * hc * hc, hc, d);
         if (!result) coli_bf16_round_array(state, hd);
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_ATTN_POST,
+                coli_v4_prefill_trace_now_ns() - trace_began);
+        trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
         if (!result) phase = "FFN hyper-connection";
         if (!result) result = normalized_hc_pre(
             reduced, ffn_post, ffn_comb, ffn_normalized, state,
             weights, config, "ffn", "ffn_norm.weight");
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_FFN_NORM,
+                coli_v4_prefill_trace_now_ns() - trace_began);
+        trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
         if (!result) phase = "MoE";
         if (!result) result = moe_token_pipeline(
             ffn_branch, weights, config, experts,
             ffn_normalized, tokens[item]);
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_MOE,
+                coli_v4_prefill_trace_now_ns() - trace_began);
+        trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
         if (!result) result = coli_v4_hc_post(
             outputs_hc + (size_t)item * hd, ffn_branch, state,
             ffn_post, ffn_comb, hc, d);
         if (!result) coli_bf16_round_array(
             outputs_hc + (size_t)item * hd, hd);
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_FFN_POST,
+                coli_v4_prefill_trace_now_ns() - trace_began);
+#endif
     }
     if (route_cache && route_cache->loader) {
+#ifdef COLI_V4_PREFILL_TRACE
+        trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
         coli_v4_prefill_loader_batch_finish(route_cache->loader);
         route_cache->loader = NULL;
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_LOADER_FINISH,
+                coli_v4_prefill_trace_now_ns() - trace_began);
+#endif
     }
     if (route_cache_active)
         coli_v4_prefill_route_cache = previous_route_cache;
@@ -6435,6 +6755,12 @@ static V4HotPolicy *hot_policies;
 _Thread_local int coli_v4_prefill_lookup_active;
 uint64_t coli_v4_prefill_leased_eviction_attempts;
 
+#ifdef COLI_V4_PREFILL_TRACE
+extern uint64_t coli_v4_prefill_trace_now_ns(void);
+extern void coli_v4_prefill_trace_add(int stage, uint64_t elapsed_ns);
+extern int coli_v4_prefill_trace_mode(void);
+#endif
+
 static double hot_now(void) {
     struct timespec value;
     clock_gettime(CLOCK_MONOTONIC, &value);
@@ -6835,7 +7161,22 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         memset(view, 0, sizeof(*view));
         return -1;
     }
+#ifdef COLI_V4_PREFILL_TRACE
+    int trace_prefill = coli_v4_prefill_trace_mode() ==
+        COLI_V4_PREFILL_TRACE_PREFILL;
+    uint64_t trace_wait_began = trace_prefill
+        ? coli_v4_prefill_trace_now_ns() : 0;
+    uint64_t trace_wait_ns = 0;
+    uint64_t trace_select_ns = 0;
+    uint64_t trace_alloc_ns = 0;
+    int trace_alloc_calls = 0;
+#endif
     pthread_mutex_lock(&state->mutex);
+#ifdef COLI_V4_PREFILL_TRACE
+    uint64_t trace_lock_acquired = trace_prefill
+        ? coli_v4_prefill_trace_now_ns() : 0;
+    if (trace_prefill) trace_wait_ns = trace_lock_acquired - trace_wait_began;
+#endif
     state->stats.requests++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
@@ -6850,14 +7191,51 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             slot = &slots[i]; slot->references++;
             state->active_leases++;
             slot->used = ++state->clock; state->stats.hits++;
-            if (hot_is_pinned(policy, key.layer, key.expert))
+#ifdef COLI_V4_PREFILL_TRACE
+            uint64_t trace_hit_scan_ns = trace_prefill
+                ? coli_v4_prefill_trace_now_ns() - trace_lock_acquired : 0;
+            uint64_t trace_pack_ns = 0;
+            int trace_pack_calls = 0;
+#endif
+            if (hot_is_pinned(policy, key.layer, key.expert)) {
+#ifdef COLI_V4_PREFILL_TRACE
+                uint64_t trace_pack_began = trace_prefill
+                    ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
                 hot_pack_slot_locked(policy, state, record, slot);
+#ifdef COLI_V4_PREFILL_TRACE
+                if (trace_prefill) {
+                    trace_pack_ns = coli_v4_prefill_trace_now_ns() -
+                        trace_pack_began;
+                    trace_pack_calls = 1;
+                }
+#endif
+            }
+#ifdef COLI_V4_PREFILL_TRACE
+            uint64_t trace_view_began = trace_prefill
+                ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
             memset(view, 0, sizeof(*view)); view->key = key;
             hot_fill_view(&view->gate, record, slot, V4_W1, policy, state);
             hot_fill_view(&view->down, record, slot, V4_W2, policy, state);
             hot_fill_view(&view->up, record, slot, V4_W3, policy, state);
             view->lease = slot;
-            pthread_mutex_unlock(&state->mutex); return 0;
+            pthread_mutex_unlock(&state->mutex);
+#ifdef COLI_V4_PREFILL_TRACE
+            if (trace_prefill) {
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_HIT_MUTEX_WAIT, trace_wait_ns);
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_HIT_SLOT_SCAN, trace_hit_scan_ns);
+                if (trace_pack_calls)
+                    coli_v4_prefill_trace_add(
+                        COLI_V4_PREFILL_TRACE_HIT_PACK, trace_pack_ns);
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_HIT_VIEW_PUBLISH,
+                    coli_v4_prefill_trace_now_ns() - trace_view_began);
+            }
+#endif
+            return 0;
         }
     }
     for (int i = 0; i < state->slots_per_layer; i++)
@@ -6871,8 +7249,20 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         for (int i = 0; i < state->slots_per_layer; i++)
             if (!slots[i].references && (!slot || slots[i].used < slot->used))
                 slot = &slots[i];
+#ifdef COLI_V4_PREFILL_TRACE
+    if (trace_prefill)
+        trace_select_ns = coli_v4_prefill_trace_now_ns() - trace_lock_acquired;
+#endif
     if (!slot) {
         pthread_mutex_unlock(&state->mutex);
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill) {
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_MISS_MUTEX_WAIT, trace_wait_ns);
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_MISS_SLOT_SELECT, trace_select_ns);
+        }
+#endif
         memset(view, 0, sizeof(*view));
         return -1;
     }
@@ -6884,13 +7274,43 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         size_t capacity = (size_t)state->record_bytes + 8192u;
         if (capacity > SIZE_MAX - (page - 1)) {
             pthread_mutex_unlock(&state->mutex);
+#ifdef COLI_V4_PREFILL_TRACE
+            if (trace_prefill) {
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_MISS_MUTEX_WAIT, trace_wait_ns);
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_MISS_SLOT_SELECT, trace_select_ns);
+            }
+#endif
             memset(view, 0, sizeof(*view));
             return -1;
         }
         capacity = (capacity + page - 1) & ~(page - 1);
+#ifdef COLI_V4_PREFILL_TRACE
+        uint64_t trace_alloc_began = trace_prefill
+            ? coli_v4_prefill_trace_now_ns() : 0;
+        int allocation_failed = posix_memalign(
+            (void **)&slot->slab, page, capacity);
+        if (trace_prefill) {
+            trace_alloc_ns = coli_v4_prefill_trace_now_ns() - trace_alloc_began;
+            trace_alloc_calls = 1;
+        }
+        if (allocation_failed) {
+#else
         if (posix_memalign((void **)&slot->slab, page, capacity)) {
+#endif
             slot->slab = NULL;
             pthread_mutex_unlock(&state->mutex);
+#ifdef COLI_V4_PREFILL_TRACE
+            if (trace_prefill) {
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_MISS_MUTEX_WAIT, trace_wait_ns);
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_MISS_SLOT_SELECT, trace_select_ns);
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_MISS_SLAB_ALLOC, trace_alloc_ns);
+            }
+#endif
             memset(view, 0, sizeof(*view));
             return -1;
         }
@@ -6906,25 +7326,85 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     state->active_leases++;
     slot->used = ++state->clock;
     pthread_mutex_unlock(&state->mutex);
+#ifdef COLI_V4_PREFILL_TRACE
+    if (trace_prefill) {
+        coli_v4_prefill_trace_add(
+            COLI_V4_PREFILL_TRACE_MISS_MUTEX_WAIT, trace_wait_ns);
+        coli_v4_prefill_trace_add(
+            COLI_V4_PREFILL_TRACE_MISS_SLOT_SELECT, trace_select_ns);
+        if (trace_alloc_calls)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_MISS_SLAB_ALLOC, trace_alloc_ns);
+    }
+    uint64_t trace_read_began = trace_prefill
+        ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
     int read_result = v4_read_expert_record(state, record, slot);
+#ifdef COLI_V4_PREFILL_TRACE
+    if (trace_prefill)
+        coli_v4_prefill_trace_add(
+            COLI_V4_PREFILL_TRACE_MISS_READ_FIRST_TOUCH,
+            coli_v4_prefill_trace_now_ns() - trace_read_began);
+    uint64_t trace_publish_began = trace_prefill
+        ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
     pthread_mutex_lock(&state->mutex);
     if (read_result) {
         slot->references = 0; slot->expert = -1;
         if (state->active_leases) state->active_leases--;
         pthread_mutex_unlock(&state->mutex);
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_MISS_RELOCK_PUBLISH,
+                coli_v4_prefill_trace_now_ns() - trace_publish_began);
+#endif
         memset(view, 0, sizeof(*view));
         return -1;
     }
     slot->expert = key.expert; slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
-    if (hot_is_pinned(policy, key.layer, key.expert))
+#ifdef COLI_V4_PREFILL_TRACE
+    uint64_t trace_publish_ns = trace_prefill
+        ? coli_v4_prefill_trace_now_ns() - trace_publish_began : 0;
+    uint64_t trace_pack_ns = 0;
+    int trace_pack_calls = 0;
+#endif
+    if (hot_is_pinned(policy, key.layer, key.expert)) {
+#ifdef COLI_V4_PREFILL_TRACE
+        uint64_t trace_pack_began = trace_prefill
+            ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
         hot_pack_slot_locked(policy, state, record, slot);
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill) {
+            trace_pack_ns = coli_v4_prefill_trace_now_ns() - trace_pack_began;
+            trace_pack_calls = 1;
+        }
+#endif
+    }
+#ifdef COLI_V4_PREFILL_TRACE
+    uint64_t trace_publish_tail_began = trace_prefill
+        ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
     memset(view, 0, sizeof(*view)); view->key = key;
     hot_fill_view(&view->gate, record, slot, V4_W1, policy, state);
     hot_fill_view(&view->down, record, slot, V4_W2, policy, state);
     hot_fill_view(&view->up, record, slot, V4_W3, policy, state);
     view->lease = slot;
-    pthread_mutex_unlock(&state->mutex); return 0;
+    pthread_mutex_unlock(&state->mutex);
+#ifdef COLI_V4_PREFILL_TRACE
+    if (trace_prefill) {
+        trace_publish_ns += coli_v4_prefill_trace_now_ns() -
+            trace_publish_tail_began;
+        coli_v4_prefill_trace_add(
+            COLI_V4_PREFILL_TRACE_MISS_RELOCK_PUBLISH, trace_publish_ns);
+        if (trace_pack_calls)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_MISS_PACK, trace_pack_ns);
+    }
+#endif
+    return 0;
 }
 
 static void destroy_hot(ColiExpertStore *store) {
@@ -7814,6 +8294,18 @@ typedef struct {
 int coli_v4_profile_on;
 static int coli_v4_profile_env = -1;
 static ColiV4ProfilePhase coli_v4_profile[COLI_V4_PROFILE_COUNT];
+
+#ifdef COLI_V4_PREFILL_TRACE
+extern uint64_t coli_v4_prefill_trace_now_ns(void);
+extern void coli_v4_prefill_trace_add(int stage, uint64_t elapsed_ns);
+extern void coli_v4_prefill_trace_begin(int prompt_tokens, int fresh_tokens);
+extern void coli_v4_prefill_trace_end_prefill(void);
+extern void coli_v4_prefill_trace_abort(void);
+extern void coli_v4_prefill_trace_report(void);
+#define COLI_V4_PREFILL_TRACE_ABORT() coli_v4_prefill_trace_abort()
+#else
+#define COLI_V4_PREFILL_TRACE_ABORT() ((void)0)
+#endif
 
 uint64_t coli_v4_profile_now_ns(void) {
     struct timespec value;
@@ -9090,6 +9582,9 @@ int coli_v4_session_generate(ColiV4Session *session,
         }
 
     double setup_done = spec_now();
+#ifdef COLI_V4_PREFILL_TRACE
+    coli_v4_prefill_trace_begin(prompt_count, fresh);
+#endif
 #ifdef COLI_M4_TRACE
     coli_m4_prefill_active = 1;
     coli_m4_prefill_chunk = 0;
@@ -9101,6 +9596,7 @@ int coli_v4_session_generate(ColiV4Session *session,
         coli_m4_prefill_active = 0;
 #endif
         kv_prefix_taint(&session->fed);
+        COLI_V4_PREFILL_TRACE_ABORT();
         return -1;
     }
 #ifdef COLI_M4_TRACE
@@ -9118,6 +9614,7 @@ int coli_v4_session_generate(ColiV4Session *session,
     if (coli_v4_test_fail_generate_after_prefill) {
         if (error && error_size)
             snprintf(error, error_size, "test: forced failure after prefill");
+        COLI_V4_PREFILL_TRACE_ABORT();
         return -1;
     }
 #endif
@@ -9126,11 +9623,20 @@ int coli_v4_session_generate(ColiV4Session *session,
     const float *last = state + (size_t)(fresh - 1) * hd;
     int current = 0;
     float current_logit = 0.0f;
+#ifdef COLI_V4_PREFILL_TRACE
+    uint64_t trace_head_began = coli_v4_prefill_trace_now_ns();
+#endif
     if (final_hidden(hidden, last, index, config, error, error_size) ||
         head_argmax(engine, hidden, index, config, &current, &current_logit)) {
         kv_prefix_taint(&session->fed);
+        COLI_V4_PREFILL_TRACE_ABORT();
         return -1;
     }
+#ifdef COLI_V4_PREFILL_TRACE
+    coli_v4_prefill_trace_add(
+        COLI_V4_PREFILL_TRACE_HEAD,
+        coli_v4_prefill_trace_now_ns() - trace_head_began);
+#endif
     /* The prompt is in the attention state from here on; record it before the
      * decode loop so a failure mid-generation still leaves fed describing what
      * was actually fed. */
@@ -9143,6 +9649,9 @@ int coli_v4_session_generate(ColiV4Session *session,
                                   current_logit, last_processed,
                                   generated_count, options->stop_at_sentence);
     double first_at = spec_now();
+#ifdef COLI_V4_PREFILL_TRACE
+    coli_v4_prefill_trace_end_prefill();
+#endif
     coli_v4_profile_reset_decode();
 
     int draft_limit = getenv("V4_DRAFT") ? atoi(getenv("V4_DRAFT")) : 0;
@@ -9227,6 +9736,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                             if (error && error_size)
                                 snprintf(error, error_size,
                                          "cannot load speculative embedding");
+                            COLI_V4_PREFILL_TRACE_ABORT();
                             return -1;
                         }
                     if (target_batch(engine, &state, &next, attention, index,
@@ -9237,6 +9747,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         spec_attention_free(snapshots,
                                             config->num_hidden_layers);
                         kv_prefix_taint(&session->fed);
+                        COLI_V4_PREFILL_TRACE_ABORT();
                         return -1;
                     }
                     float *batch_hidden = malloc(
@@ -9261,6 +9772,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         if (error && error_size && !error[0])
                             snprintf(error, error_size,
                                      "speculative target head failed");
+                        COLI_V4_PREFILL_TRACE_ABORT();
                         return -1;
                     }
 
@@ -9317,6 +9829,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                             if (error && error_size)
                                 snprintf(error, error_size,
                                          "cannot restore speculative KV state");
+                            COLI_V4_PREFILL_TRACE_ABORT();
                             return -1;
                         }
                         if (coli_v4_full_dspark_wanted)
@@ -9330,6 +9843,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                                 if (error && error_size)
                                     snprintf(error, error_size,
                                              "cannot replay speculative input");
+                                COLI_V4_PREFILL_TRACE_ABORT();
                                 return -1;
                             }
                         if (retained > 0 && target_batch(
@@ -9339,6 +9853,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                             spec_attention_free(
                                 snapshots, config->num_hidden_layers);
                             kv_prefix_taint(&session->fed);
+                            COLI_V4_PREFILL_TRACE_ABORT();
                             return -1;
                         }
                     }
@@ -9363,6 +9878,7 @@ int coli_v4_session_generate(ColiV4Session *session,
         if (target_token(engine, &state, &next, attention, index, config, experts,
                          current, position, error, error_size)) {
             kv_prefix_taint(&session->fed);
+            COLI_V4_PREFILL_TRACE_ABORT();
             return -1;
         }
         /* `current` is now in the attention state at `position`. Record it here,
@@ -9375,6 +9891,7 @@ int coli_v4_session_generate(ColiV4Session *session,
         if (final_hidden(hidden, state, index, config, error, error_size) ||
             head_argmax(engine, hidden, index, config, &current, &current_logit)) {
             kv_prefix_taint(&session->fed);
+            COLI_V4_PREFILL_TRACE_ABORT();
             return -1;
         }
         if (coli_v4_profile_on)
@@ -9431,6 +9948,9 @@ int coli_v4_session_generate(ColiV4Session *session,
                 session->spec_disabled);
     coli_v4_profile_report(generated_count > 0 ? generated_count - 1 : 0,
                            decode_wall_ns);
+#ifdef COLI_V4_PREFILL_TRACE
+    coli_v4_prefill_trace_report();
+#endif
     return 0;
 }
 
