@@ -476,3 +476,74 @@ CAVEAT: absolute numbers ~2% above yesterday's reference (38554.8 / 34311.2) for
 => consistent machine drift, not a regression. The A/B RATIO is the durable quantity
    (9.97% today vs 11.01% yesterday). Always compare within a session.
 *** COLD OPERATING POINT = hit_rate ~78% *** (this is what every one-shot benchmark measures)
+
+## T2 DONE 12:48 — MY KV-ACCUMULATION HYPOTHESIS WAS FALSE (.backlog/serve/RESET_FINDING.md)
+1. Slot rotation IMPOSSIBLE: V4 rejects any slot != 0 (c/deepseek_v4.c:9044-9055); coli and
+   openai_server both reject kv_slots!=1 for V4 (c/coli:1144-1149, openai_server.py:2783-2786).
+2. NO mux reset frame: only CANCEL/STOP/SUBMIT parsed (:9035-9042). STOP/CANCEL do NOT clear KV
+   (:9100-9107) - do not send them between turns. \x02RESET is GLM-legacy only (c/colibri.c:7472).
+3. V4 prefix reuse is ALL-OR-NOTHING (c/kv_prefix.h:116-127): reuse only if the ENTIRE prior fed
+   sequence is a prefix of a LONGER new prompt; otherwise 0 -> FULL attention reset + prefill from
+   position 0 (:8477-8482, :8488-8506). Recurrent compressed/window attention cannot be rewound
+   to an arbitrary point (:8460-8475), hence all-or-nothing.
+   => DISTINCT PROMPTS ALREADY GET A FULL KV RESET FOR FREE. No mechanism needed. T5 simplifies.
+4. THE REAL CONFOUND (accounting, not physics): hit_pct spans the whole session_generate call
+   INCLUDING prefill (:9174-9203), while tok_s divides by stats.decode_sec which starts AFTER
+   prefill (:9204-9217). Different windows => rising hit_pct never implied warmer decode.
+   Also 4 distinct prompts = 4 DIFFERENT WORKLOADS, and the expert policy mutates on every lookup
+   and repins on an interval (:6248-6254). 4 samples cannot establish a monotonic slowdown.
+=> WARM PROTOCOL: cycle a FIXED SET of distinct prompts and repeat the cycle N times. Each request
+   still gets a full reset; the same workload recurs so cycles are comparable; expert cache heats
+   across all of it. Compare cycle k vs cycle 1 for the SAME prompt.
+
+## USER REQUEST 12:49 — BATCHED (non-per-dispatch) METAL. PLANNED, GATED, NOT YET BUILT.
+User: investigate the non-per-dispatch option; suggests a call-time table + refcounts so we only
+hot-swap an item when it has no callers. "Do not stop current work; plan alongside and decide when
+this experiment is worth building."
+
+### Correction for the record
+I never claimed "wrong references" - I flagged per-dispatch overhead. But the constraint the user
+is reaching for is REAL: you cannot let the expert store evict/reuse a slab while a GPU dispatch is
+still in flight against it. THE MECHANISM ALREADY EXISTS:
+  - expert_store.h contract: exactly one release per lookup; an active lease BLOCKS eviction
+  - miss replacement requires !slots[i].references (c/deepseek_v4.c:5609-5614)
+  - holding one view across several SERIAL computations is explicitly allowed
+=> Batching needs to hold 6 leases at once instead of 1. 164 slots/layer, so no capacity risk and
+   no deadlock. No new refcount table required - the user's idea is already implemented.
+
+### The actual change
+Today: per expert -> 1 command buffer + 1 encoder + 1 SYNCHRONOUS waitUntilCompleted (:575-577,
+:698-699). ~240 blocking round-trips per token.
+Proposed: the 6 experts of one (token,layer) are INDEPENDENT (results are summed). Enqueue all 6
+into ONE command buffer, commit once, wait once. Saves 5 of 6 round-trips.
+  current  6*(R+C) = 6R+6C      batched  R+6C
+
+### Feasibility arithmetic (estimates - to be REPLACED by T7 PROFILE data)
+measured GPU 1.614 ms/dispatch, CPU 0.410 ms/expert. 25.2M MACs on M3 Max GPU ~ 0.005 ms of real
+compute, so R (round trip) should dominate overwhelmingly.
+  C=0.05 -> batched6 0.311 ms/exp -> 1.32x vs CPU ->  +3.7% overall (57% eligible) / +6.4% (100%)
+  C=0.10 -> batched6 0.352        -> 1.16x         ->  smaller
+  C=0.20 -> batched6 0.436        -> 0.94x         ->  NEGATIVE, do not build
+*** THE WHOLE DECISION IS ONE NUMBER: C, the real GPU compute per expert. ***
+
+### GATE (costs nothing extra - T7 already collects it)
+T7's COLI_V4_METAL_PROFILE=1 pass reports per-stage ms_per_expert (submit/GPU/memcpy) plus
+zero_copy_tensors vs copy_fallback_tensors.
+  BUILD IT   if submit/wait dominates AND implied C <= ~0.10 ms  (=> >=1.16x vs CPU)
+  DO NOT     if C >= ~0.20 ms (batching cannot beat CPU) or if weights turn out to be
+             copy_fallback rather than zero-copy (then a 13.37MB memcpy per dispatch is the
+             real cost and batching does not remove it)
+
+### Bigger prize than decode: PREFILL
+Decode can only batch 6 (one token, one layer) because tokens are sequential.
+PREFILL processes 64-token chunks -> far more independent experts in flight, and E38 measured mean
+group size S=4.1 at chunk 64 / 7.65 whole-prompt. Prefill is ~0.646 s/token and almost entirely
+expert-bound. If batched GPU dispatch works at all, PREFILL is where it pays most - this is the
+M5 gpu_gather_moe idea, previously blocked because the CPU batch primitives re-dequantize (E38),
+but a GPU kernel has no such constraint.
+ALSO: dspark speculative drafting exists (--no-dspark). Speculation yields several candidate tokens
+at once => more experts batchable per round trip in DECODE too. Worth revisiting if the gate passes.
+
+### Sequencing decision
+Run AFTER T7 produces the PROFILE numbers. Do not build before the gate. If the gate passes,
+prototype on PREFILL first (bigger prize, more parallelism), not decode.
