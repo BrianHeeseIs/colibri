@@ -1765,3 +1765,50 @@ the same validator, calls `coli_v4_kernels_set_active`, and emits `v4_kernels ac
 transcripts are self-describing. Golden md5 unchanged. **An env var that works on one entry path
 and silently no-ops on another is exactly the failure class E44's typo-rejection was built to
 prevent - it just had a hole in it.**
+
+---
+
+## E48. The 158x gap resolved — **my "shaders are slow" claim was WRONG; batching gate now PASSES**
+
+E46 closed the Metal lane on the claim that the mxfp4/UE8M0 shaders run at ~15 GFLOP/s. That claim
+rested on per-stage numbers containing an unexplained contradiction: `matmul gate` 1.369 ms vs
+`matmul up` 0.0087 ms for **identical dispatches** (same pipeline, same 2048x4096 shape,
+`backend_metal_v4.mm:618-637`). A 158x gap between identical work cannot be "slow shaders".
+
+**Discriminator** (user-approved cheap test): re-run the PROFILE pass at 100 tokens (1.98x the
+dispatches of the 30-token run). First-touch costs amortize; real compute does not.
+
+| stage | ms/expert @30tok | @100tok | total @30 | @100 | behaviour |
+|---|---|---|---|---|---|
+| matmul gate | 1.3689 | 0.6126 (**0.45x**) | 9.7 s | 8.6 s (~flat) | **one-time pool, amortizing** |
+| matmul down | 0.6842 | 0.3119 (**0.46x**) | 4.8 s | 4.4 s (~flat) | **one-time pool, amortizing** |
+| matmul up | 0.0087 | 0.0072 | 0.06 s | 0.10 s (scales) | true per-dispatch compute |
+| submit+wait | 1.9848 | 2.2287 | 14.0 s | 31.2 s (scales) | per-dispatch |
+
+**Verdict:** gate/down absorb a **first-touch cost** (GPU page-mapping / CPU-write coherency of the
+`newBufferWithBytesNoCopy` expert slabs) on whichever dispatch touches an expert's pages first;
+`up` runs immediately after gate on the *same* expert, pages already mapped, so it shows the truth:
+**16.8 MFLOP / 0.00715 ms = 2.35 TFLOP/s. The shaders are FINE.** E46's root-cause claim is
+retracted (its *measured outcome* — Metal slower as currently dispatched — still stands).
+
+### Batching gate re-run with corrected C
+C = 3 matmuls + aux stages ~= **0.086 ms**; R ~= 1.528 ms (from E43's 1.614 ms non-profile dispatch).
+Gate was: build if C <= 0.10 (decode) / 0.35 (prefill). **C = 0.086 -> GATE PASSES.**
+
+| design | ms/expert | vs CPU 0.719 |
+|---|---|---|
+| today (1 sync/expert) | 1.614 | 2.2x slower |
+| decode batch=6 | (R+6C)/6 = **0.341** | **2.1x FASTER** |
+| prefill batch=64 | (R+64C)/64 = **0.110** | **6.5x FASTER** |
+
+### Caveat that must be verified before building
+The one-time pool (~13 s across the first ~14k dispatches) is first-touch on ~7k slabs. If slot
+EVICTION re-dirties pages, part of it recurs with cache misses. Evidence points at per-slab-one-time
+(the pool FELL slightly while misses nearly doubled), but a longer NON-profile run must confirm
+`c_gpu` actually approaches R+C before the projection is trusted.
+
+### Incidental find: SIGKILL was code-signing, not memory
+Both runs of this test initially died with `Killed: 9`. Crash report: `EXC_CRASH SIGKILL (Code
+Signature Invalid), Taskgated Invalid Signature`. Cause: `cp` onto an EXISTING executable rewrites
+the vnode in place and macOS keeps a per-vnode signature cache -> next exec is killed. Fix: `rm`
+before `cp` (fresh inode). `build_toggle.sh` hardened accordingly.

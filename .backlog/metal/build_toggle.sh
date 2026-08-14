@@ -26,6 +26,10 @@ build() { # $1=metalflag  $2=outname
 echo "building both variants from clean object state..."
 build ""  deepseek_v4.cpu
 build "1" deepseek_v4.metal
-# leave a working default binary in place
+# leave a working default binary in place.
+# NOTE: rm before cp is REQUIRED. cp onto an existing executable rewrites the vnode
+# in place and macOS keeps a per-vnode code-signature cache -> the kernel kills the
+# next exec with SIGKILL (Code Signature Invalid). A fresh inode revalidates cleanly.
+rm -f c/deepseek_v4
 cp c/deepseek_v4.cpu c/deepseek_v4
 echo "  restored c/deepseek_v4 <- deepseek_v4.cpu (default)"

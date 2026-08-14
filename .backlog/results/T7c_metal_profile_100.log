@@ -1,0 +1,29 @@
+v4_kernels active=none
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_cli mode=chat memory=limited target_only=1
+v4_dense_resident layers=43 bytes=6.267GiB
+# **Technical Explanation: Token Routing in Mixture-of-Experts (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE
+v4_tokens prompt=20 generated=100 total=120 expert_requests=30702 hits=26635 misses=4067 hit_rate=86.753 bytes=54373122048 target_only=1
+generated_text=# **Technical Explanation: Token Routing in Mixture-of-Experts (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE) (MoE
+timing time_to_first_token=21.233s after_first=93.845s
+v4_rows16 packed_slots=1069
+v4_direct reads=4067 flock_reads=0 fallbacks=0 payload_bytes=51174703104
+metal_dispatches=13986
+metal_profile forwards=13986 zero_copy_tensors=83916 copy_fallback_tensors=0
+metal_profile stage=host weight memcpy ms_per_expert=0.016311 percent=0.51
+metal_profile stage=fp8_qdq (input) ms_per_expert=0.011089 percent=0.34
+metal_profile stage=matmul gate ms_per_expert=0.612585 percent=18.99
+metal_profile stage=matmul up ms_per_expert=0.007154 percent=0.22
+metal_profile stage=bf16 gate/up ms_per_expert=0.000348 percent=0.01
+metal_profile stage=swiglu ms_per_expert=0.005887 percent=0.18
+metal_profile stage=weighted_bf16 ms_per_expert=0.009385 percent=0.29
+metal_profile stage=fp8_qdq (down_input) ms_per_expert=0.015554 percent=0.48
+metal_profile stage=matmul down ms_per_expert=0.311870 percent=9.67
+metal_profile stage=bf16 out ms_per_expert=0.006222 percent=0.19
+metal_profile stage=command-buffer submit+wait overhead ms_per_expert=2.228666 percent=69.10
+v4_metal_reject variant=0 init=0 queue=0 dims=0 layout=16716 pipelines=0 ok=13986
+v4_metal_layout tensor_gate=16716 tensor_up=16716 tensor_down=16716 format=0 pointers=0 rows=0 columns=0 row_bytes=0 groups=0 block_dims=50148
+v4_metal_library kind=metallib

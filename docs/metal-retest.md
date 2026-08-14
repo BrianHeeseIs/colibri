@@ -75,7 +75,13 @@ bound the same quantity from one dataset, so they can be wrong in the same direc
 `c_gpu` additionally assumes the layout-rejected CPU fallbacks cost the same as the global average
 CPU expert; if rejected experts are systematically cheaper or dearer, the isolated GPU figure shifts.
 
-**Root cause:** 25.2 M MACs in ~3.33 ms = **~15 GFLOP/s on an M3 Max GPU**, roughly two orders of
-magnitude below the hardware. The bottleneck is the **mxfp4/UE8M0 shaders**, not the dispatch model,
-not buffer copies, not warmup. Making Metal competitive means rewriting those kernels — a far larger
-project than batching, against a CPU path already running at 36.5 GMAC/s.
+**Root cause — RETRACTED and corrected by E48.** This document previously claimed the shaders run at
+~15 GFLOP/s. That number blended a **first-touch page-mapping/coherency pool** into compute: at 1.98x
+the dispatches, `matmul gate`/`down` per-expert cost FELL 2.2x (a fixed pool amortizing) while
+`matmul up` — an identical dispatch whose pages were already mapped — held ~0.007 ms =
+**2.35 TFLOP/s. The shaders are fine.** True per-dispatch compute is C ~= 0.086 ms against a
+~1.53 ms synchronous round-trip, so the batching gate (build if C <= 0.10/0.35) **passes**:
+decode batch-6 projects 2.1x FASTER than CPU, prefill batch-64 projects 6.5x — pending one
+verification (that the first-touch pool is per-slab-one-time rather than recurring with evictions).
+The measured outcome of this document — Metal as currently dispatched is 2.747x slower — still
+stands; the *mechanism* and the *remedy* changed. See E48.
