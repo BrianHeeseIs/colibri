@@ -1214,3 +1214,48 @@ already shown 5.34 GB/s is ~20x below DRAM). Consequently:
   E33's 4-row matvec already took the latter.
 This closes M4/M5-style batching as a family and points the remaining work at the still-scalar
 leaf phases (router, head, hc_norm) and at GPU offload.
+
+---
+
+## E40. `router` kernel — **10.76x on the phase, opt-in; default provably untouched**
+
+`router` was 4.8 % of steady-state decode doing only 256x4096 = 1.048 M MACs per call in 0.766 ms
+(~1.37 GMAC/s). Same defect as E36/E37: `c/deepseek_v4.c` router hot loop accumulates into a single
+`float sum`, a serial FP dependency chain clang may not legally reassociate without fast-math.
+(For scale: the LM head does 529 M MACs/token in 33.8 ms because it is OpenMP-parallel.)
+
+### Tier 1 (bit-exact) was a NEGATIVE result and was removed
+Hypothesis: `route_bf16_decode` is a pure elementwise widening and therefore order-independent, so
+NEON-widening the decode while keeping the accumulation strictly serial should win for free.
+**Measured 0.997x microbench, 1.005x in-engine — nothing.** Apple clang already auto-vectorizes that
+decode. Worse, the default build's decode_wall measured 3.83 % slower with Tier 1 present
+(38721.3 -> 40205.2 ms). It was stripped entirely; three warm re-runs then restored baseline
+(router mean 1960.3 vs 1961.3; decode_wall mean 38714.2 vs 38721.3), confirming Tier 1 caused it.
+**The bottleneck is purely the serial accumulation chain — nothing else.**
+
+### Tier 2 (opt-in, reassociated) is the win
+4 independent NEON FMA accumulators + horizontal reduce, gated behind the EXISTING
+`--fast-sparse-attn` flag (no second flag introduced; internal selector generalized to
+`coli_v4_fast_reassociated_kernels()`), write-once file-scope static set during CLI parse,
+ordered path always on non-arm64.
+
+| microbench (M3 Max, no fast-math, 7 rounds) | ms/call | speedup |
+|---|---|---|
+| current | 0.729328 +/- 0.020374 | 1.000x |
+| Tier 1 (bit-exact) | 0.731344 +/- 0.014628 | 0.997x |
+| Tier 2 (reassociated) | 0.067984 +/- 0.001292 | **10.728x** |
+
+Engine, 60-token warm runs, independently re-verified by me:
+
+| build | router ms | decode_wall ms | md5 |
+|---|---|---|---|
+| default | 1955.475 | 38612.758 | `5d04890413ff539e802985ce8c727814` (**golden, bit-exact**) |
+| `--fast-sparse-attn` | **181.814 (10.76x)** | 34197.534 (**-11.4 %**) | `7155bab905cbfa70aa06afa08f757cee` |
+
+Diff `+120/-4`: a dispatch guard plus a new fast function. The original scalar loop and its three
+`malloc`s are untouched, proven by the golden md5 on every default run. Canaries green
+(`test_native_quant`, `test_ue8m0`, `test_e8_kernel`, `test_kv_prefix`, `test_deepseek_v4`,
+tiny oracle, KV-prefix); x86_64 non-arm route path cross-compiles.
+
+**Flag scope note:** `--fast-sparse-attn` now enables the whole reassociated-kernel set
+(attn_sparse + router). Name kept for compatibility; wrapper script and docs updated to say so.

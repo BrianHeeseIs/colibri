@@ -3059,14 +3059,22 @@ int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state) {
 #include "native_quant.h"
 
 #if defined(__aarch64__)
-static int sparse_attention_fast_reassociated;
+static int fast_reassociated_kernels;
 #endif
 
 void coli_v4_sparse_attention_set_fast_reassociated(int enabled) {
 #if defined(__aarch64__)
-    sparse_attention_fast_reassociated = enabled != 0;
+    fast_reassociated_kernels = enabled != 0;
 #else
     (void)enabled;
+#endif
+}
+
+int coli_v4_fast_reassociated_kernels(void) {
+#if defined(__aarch64__)
+    return fast_reassociated_kernels;
+#else
+    return 0;
 #endif
 }
 
@@ -3138,7 +3146,7 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
             const float *key = kv + (size_t)index * head_dimension;
             float score;
 #if defined(__aarch64__)
-            if (sparse_attention_fast_reassociated)
+            if (fast_reassociated_kernels)
                 score = sparse_attention_dot_fast(query, key, head_dimension);
             else
 #endif
@@ -6611,6 +6619,10 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 static float route_bf16_decode(uint16_t value) {
     uint32_t bits = (uint32_t)value << 16;
     float output;
@@ -6622,10 +6634,114 @@ static float route_softplus(float value) {
     return fmaxf(value, 0.0f) + log1pf(expf(-fabsf(value)));
 }
 
+#if defined(__aarch64__)
+extern int coli_v4_fast_reassociated_kernels(void);
+
+static inline float route_bf16_dot_fast(const uint16_t *row,
+                                        const float *hidden, int count) {
+    float32x4_t sums[4] = {
+        vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+        vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+    };
+    int column = 0;
+    for (; column + 15 < count; column += 16) {
+        uint16x8_t packed0 = vld1q_u16(row + column);
+        uint16x8_t packed1 = vld1q_u16(row + column + 8);
+        float32x4_t values0 = vreinterpretq_f32_u32(
+            vshll_n_u16(vget_low_u16(packed0), 16));
+        float32x4_t values1 = vreinterpretq_f32_u32(
+            vshll_n_u16(vget_high_u16(packed0), 16));
+        float32x4_t values2 = vreinterpretq_f32_u32(
+            vshll_n_u16(vget_low_u16(packed1), 16));
+        float32x4_t values3 = vreinterpretq_f32_u32(
+            vshll_n_u16(vget_high_u16(packed1), 16));
+        sums[0] = vfmaq_f32(sums[0], values0,
+                            vld1q_f32(hidden + column));
+        sums[1] = vfmaq_f32(sums[1], values1,
+                            vld1q_f32(hidden + column + 4));
+        sums[2] = vfmaq_f32(sums[2], values2,
+                            vld1q_f32(hidden + column + 8));
+        sums[3] = vfmaq_f32(sums[3], values3,
+                            vld1q_f32(hidden + column + 12));
+    }
+    float32x4_t sum = vaddq_f32(vaddq_f32(sums[0], sums[1]),
+                                vaddq_f32(sums[2], sums[3]));
+    float result = vaddvq_f32(sum);
+    for (; column < count; column++)
+        result += route_bf16_decode(row[column]) * hidden[column];
+    return result;
+}
+
+static int route_bf16_fast(float *weights, int *indices, const float *hidden,
+                           const uint16_t *gate, const float *bias,
+                           const int *forced_indices, int experts, int dimension,
+                           int topk, float route_scale) {
+    if (!weights || !indices || !hidden || !gate || experts < 1 ||
+        dimension < 1 || topk < 1 || topk > experts) return -1;
+    enum { route_stack_experts = 256 };
+    float score_stack[route_stack_experts];
+    float selection_stack[route_stack_experts];
+    unsigned char selected_stack[route_stack_experts];
+    void *fast_heap = NULL;
+    float *scores = score_stack;
+    float *selection = selection_stack;
+    unsigned char *selected = selected_stack;
+    if (experts > route_stack_experts) {
+        size_t float_bytes = (size_t)experts * sizeof(*scores);
+        fast_heap = malloc(float_bytes * 2 + (size_t)experts);
+        if (!fast_heap) return -1;
+        scores = fast_heap;
+        selection = (float *)((unsigned char *)fast_heap + float_bytes);
+        selected = (unsigned char *)fast_heap + float_bytes * 2;
+    }
+    memset(selected, 0, (size_t)experts);
+    for (int expert = 0; expert < experts; expert++) {
+        const uint16_t *row = gate + (size_t)expert * dimension;
+        float sum = route_bf16_dot_fast(row, hidden, dimension);
+        scores[expert] = sqrtf(route_softplus(sum));
+        selection[expert] = scores[expert] + (bias ? bias[expert] : 0.0f);
+    }
+    if (forced_indices) {
+        for (int rank = 0; rank < topk; rank++) {
+            if (forced_indices[rank] < 0 || forced_indices[rank] >= experts) {
+                free(fast_heap); return -1;
+            }
+            indices[rank] = forced_indices[rank];
+        }
+    } else {
+        for (int rank = 0; rank < topk; rank++) {
+            int best = -1;
+            for (int expert = 0; expert < experts; expert++)
+                if (!selected[expert] &&
+                    (best < 0 || selection[expert] > selection[best]))
+                    best = expert;
+            indices[rank] = best;
+            selected[best] = 1;
+        }
+    }
+    float total = 0.0f;
+    for (int rank = 0; rank < topk; rank++)
+        total += scores[indices[rank]];
+    if (!(total > 0.0f)) {
+        free(fast_heap); return -1;
+    }
+    for (int rank = 0; rank < topk; rank++)
+        weights[rank] = scores[indices[rank]] / total * route_scale;
+    free(fast_heap);
+    return 0;
+}
+#endif
+
 int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const uint16_t *gate, const float *bias,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale) {
+#if defined(__aarch64__)
+    if (coli_v4_fast_reassociated_kernels())
+        return route_bf16_fast(weights, indices, hidden, gate, bias,
+                               forced_indices, experts, dimension, topk,
+                               route_scale);
+#endif
     if (!weights || !indices || !hidden || !gate || experts < 1 ||
         dimension < 1 || topk < 1 || topk > experts) return -1;
     float *scores = malloc((size_t)experts * sizeof(*scores));
@@ -7823,7 +7939,7 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "  --raw-prompt         bypass the default V4 chat template\n"
         "  --stop-sentence      stop after the first sentence terminator\n"
         "  --no-dspark          disable verified speculative drafting\n"
-        "  --fast-sparse-attn   faster reassociated-FP sparse attention (arm64; changes output)\n"
+        "  --fast-sparse-attn   faster reassociated-FP kernels (arm64; changes output)\n"
         "  --oracle FILE        validate against an oracle JSON fixture\n"
         "  --teacher-forcing N  oracle: compare top-1 on N prompt positions\n"
         "  --greedy N           oracle: compare N greedy continuation tokens\n"
