@@ -1008,6 +1008,110 @@ New ranking: matvec 59.4 % · **expert_wait 17.9 %** · everything else 22.7 %.
 That promotes M6/M7 (expert prefetch + cache policy) from "medium" to the next lane, on data
 rather than on the plan's original guess.
 
+
+---
+
+## E34. `loader_depth` — **NEGATIVE, hypothesis rejected** (no code change kept)
+
+`COLI_V4_EXPERT_LOADER_COUNT` is a compile-time constant (3). Since `expert_wait` had risen to
+17.9 % of decode, tested whether the loaders were queue-depth starved by sweeping N = 3/6/10.
+
+**The first sweep looked like a 2.3x win and was entirely an artifact.** N=3 ran first on a cold
+page cache after a full 26-unit rebuild and reported `decode_wall=10706 ms`,
+`expert_forward=3898 ms` — but the identical committed N=3 build had measured 4693-4838 ms with
+`expert_forward≈1240 ms` minutes earlier. Loader count cannot triple compute time; N=6 and N=10
+simply inherited the warmth N=3 paid for.
+
+Re-measured N=3 **warm**, same protocol:
+
+| loaders | decode_wall ms | expert_wait ms |
+|---|---|---|
+| 3 (warm, run1) | 4761.3 | 834.0 |
+| 3 (warm, run2) | 4771.6 | 757.0 |
+| 6 | 4750.8 | 833.1 |
+| 10 | 4721.8 | 839.9 |
+
+All within ~1 %; `expert_wait` statistically identical. **Loader parallelism is not the
+constraint — rejected, nothing merged.** Also re-confirms the M15b baseline reproduces (4761/4772
+sits inside the earlier 4693-4838 band).
+
+Implication: the residual wait is **dependency-bound, not bandwidth-bound**. You cannot fetch an
+expert until the router has chosen it, so more threads cannot help. Only *knowing earlier*
+(prediction) or *missing less often* (cache policy) can. That points at M7/M6, not at parallelism.
+
+**Process note:** this is the second time in the campaign that a first-run measurement was
+cold-cache inflated. Warm-up is now mandatory before any timing row.
+
+### E34b. Retraction + methodology fix: short runs cannot measure cache policy
+
+While scoping M7 I asserted the cache policy was "performing worse than uniform-random" because
+`hit_rate=57.7 %` sat below the `164/256 = 64.1 %` residency capacity. **That was my error and is
+retracted.** The uniform-random baseline assumes a *saturated* cache. Ours is not:
+
+- cache capacity = 164 slots/layer x 43 layers = **7052 expert records**
+- bytes read 23.33 GB / 13.37 MB = **1745 distinct loads == 1745 misses** (1 load per miss, no churn)
+- => cache ends the run **24.7 % full**
+
+So nearly every miss in a 17-token run is **compulsory**, not a policy failure. With only a quarter
+of slots populated, 57.7 % is evidence that autopin's 16 pins/layer plus routing skew are working,
+not failing.
+
+**Two consequences:**
+1. Any M7/M6 cache experiment must first run long enough to **saturate** the cache; measured on an
+   8-token benchmark it would be noise-fitting cold-start behaviour.
+2. `expert_wait = 17.9 %` of decode is **cold-start-inflated** and overstates steady-state I/O for
+   long generations. The matvec results (E31-E33) are unaffected - they are pure compute - but the
+   *ranking* that promoted the I/O lane was built on a cold-start number and must be re-derived
+   from a saturated run before any I/O work is justified.
+
+---
+
+## E35. Steady-state profile (220 tokens) — the short-run profile was misleading twice
+
+Ran 220 tokens to saturate the expert cache, per the E34b methodology fix.
+
+**Cache reaches steady state:** `hit_rate 57.7 % -> 88.406 %` (61662 requests, 7149 misses).
+
+**`expert_wait` collapses 17.9 % -> 6.0 % of decode** (119.1 -> 41.3 ms/token, -65 %). The I/O
+lane promoted in E33 was chasing a cold-start artifact; **de-promoted, M6/M7 not pursued.**
+Every other phase is within 3 % per-token of the short run, so the 8-token benchmark remains valid
+for *compute* work — it is only the I/O share it distorts.
+
+**`attention` is a PARENT phase.** Its children sum to 64048 ms vs its own 63909 ms, which is why
+a naive sort showed cumulative >100 %. Corrected non-overlapping top level (sums to the reported
+98.7 % accounted):
+
+| top level | ms | % |
+|---|---|---|
+| attention (parent) | 63908.9 | 42.2 |
+| expert_forward | 40261.2 | 26.6 |
+| expert_wait | 9048.5 | 6.0 |
+| shared_expert | 8739.8 | 5.8 |
+| head | 7410.0 | 4.9 |
+| router | 7212.1 | 4.8 |
+| hc_norm | 6110.7 | 4.0 |
+| indexer | 3746.1 | 2.5 |
+| compressor | 2914.5 | 1.9 |
+
+**Leaf ranking — and the finding:**
+
+| leaf | ms | % | optimized |
+|---|---|---|---|
+| expert_forward | 40261.2 | 26.6 | v4 4-row |
+| attn_out | 27418.7 | 18.1 | v4 4-row |
+| **attn_sparse** | **22639.5** | **15.0** | **never touched** |
+| attn_qkv | 13547.3 | 8.9 | v4 4-row |
+| expert_wait | 9048.5 | 6.0 | I/O, de-promoted |
+| shared_expert | 8739.8 | 5.8 | v4 4-row |
+| head | 7410.0 | 4.9 | no - 33.84 ms/token, 1 call/token |
+| router | 7212.1 | 4.8 | no |
+
+`attn_sparse` (2.4041 ms/call x 9417) is **the largest unoptimized leaf in the engine** and was
+invisible in every 8-token profile because I had only ever grepped attn_out/attn_qkv. Steady
+throughput 1.446 tok/s (691.4 ms/token).
+
+**Next lane is attn_sparse, on evidence.**
+
 ---
 
 ## E36. `attn_sparse` root cause — clang emits vector-multiply + lane-extract + SERIAL scalar adds
