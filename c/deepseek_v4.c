@@ -9241,6 +9241,18 @@ static int v4_serve_main(void) {
     if (ram && atof(ram) > 0.0)
         open_options.memory_limit_bytes =
             (uint64_t)(atof(ram) * 1073741824.0);
+    /* Serve mode never runs v4_cli_parse, so COLI_V4_KERNELS was silently ignored
+     * here while working in one-shot mode.  An env var that no-ops on one entry
+     * path is the same silent-failure class the parser rejects typos for, so honour
+     * it identically.  Default (unset) selects no reassociated kernels, matching the
+     * previous serve behaviour exactly. */
+    unsigned serve_kernels = 0;
+    const char *serve_kernel_environment = getenv("COLI_V4_KERNELS");
+    if (serve_kernel_environment &&
+        v4_kernel_mask_parse(serve_kernel_environment, &serve_kernels))
+        return 1;
+    coli_v4_kernels_set_active(serve_kernels);
+    v4_kernels_emit_active();
     if (coli_v4_engine_open(&engine, &open_options, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         return 1;
