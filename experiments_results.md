@@ -2289,3 +2289,112 @@ the first time `--ram 96` has held gate-clean under a real workload on this host
 ### Standing
 n=4 per pass, one workload, one host. The **direction** is solid (8/8 paired losses, zero gate
 failures in either compared arm) but the magnitude is n=4. **The +80.7 % figure is retracted.**
+
+---
+
+## E58. Investigating the Metal verdict's own premises — **one of the four stated causes is FALSE on this host**
+
+The Metal lane was closed by §12 with four structural causes and the conclusion that *"no backend
+tuning changes the sign"*. Before planning any new architecture I tested the premises rather than
+inheriting them. **One is false, a second is structurally wrong, and the remaining two hold.**
+
+### E58a. "Unified memory gives the GPU no bandwidth advantage" — FALSE
+
+`validation/probes/bw2.m`, one `MTLResourceStorageModeShared` buffer, same physical pages, GPU kernel
+writes unconditionally (`out[gid] = sum`) so loads cannot be dead-code eliminated, and **both sides
+are checksum-verified against the known exact sum**:
+
+| buffer | CPU GB/s | GPU GB/s | ratio | checksum |
+|---|---|---|---|---|
+| 512 MB | 118.7 | 271.3 | 2.29x | match |
+| 1 GB | 115.8 | 350.6 | 3.03x | match |
+| 2 GB | 113.1 | 374.0 | **3.31x** | match |
+| 4 GB | 115.0 | 367.3 | 3.19x | GPU match |
+| 8 GB | 117.8 | 379.1 | 3.22x | GPU match |
+
+The GPU checksum equals the expected value **exactly at every size**, so the loads really happened.
+370–379 GB/s is ~93 % of the M3 Max's 400 GB/s spec. **The GPU pulls ~3.1x the bandwidth the CPU
+can**; the CPU cannot saturate the fabric.
+
+The CPU checksum diverges at ≥4 GB purely from float32 accumulator saturation —
+`805306368 == 48 × 2^24` exactly (12 threads × 4 accumulators, each pinned at 2^24). Checksum
+artefact only; identical loop, identical bytes, timing unaffected.
+
+### E58b. "Prefill walks token by token" — STRUCTURALLY WRONG
+
+`target_batch` (`c/deepseek_v4.c:8879`) is **layer-outer, chunk-inner**:
+`for (layer) { for (offset += 64) { chunk = min(64, batch-offset) } }`, and **attention already
+batches across those tokens** (`coli_fp8_matmul_batch_ref(..., batch)` at `:2592/:2632/:2644/:2772`).
+**Only MoE discards the batch**: `:5110 for (item < batch)` → `:5141 moe_token_pipeline(...,
+tokens[item])`. Up to **64 tokens are already in flight at every layer**. S=N therefore needs **no
+prefill restructure** — the thing that made this look like a large project.
+
+### E58c. The two causes that DO hold
+
+- **S=1 is real.** The seam is one token in / one token out (`backend_metal_v4_seam.h:17`), with one
+  blocking command buffer per token-expert (`backend_metal_v4.mm:415-715`).
+- **Nothing is DRAM-bound today.** 13.37 MB per expert at 2.919 ms = **4.58 GB/s effective**, 26–80x
+  below either processor's streaming bandwidth, and matching SSD QD1 (5.227 GB/s → 2.56 ms). **The
+  miss path is SSD-bound and no compute placement fixes it.**
+
+### E58d. Why S=1 loses, measured on the real shape
+
+`validation/probes/{sweep_mxfp4.m,sweep2.m,cpu_mxfp4.c}`, gate/up I=4096 O=2048 MXFP4 blk32,
+**microseconds per token**:
+
+| S | CPU | GPU simple | GPU tiled+uchar4 | best GPU | verdict |
+|---|---|---|---|---|---|
+| 1 | 397.0 | 376.9 | 968.5 | 376.9 | GPU 1.05x |
+| 2 | 325.5 | 290.1 | 304.8 | 290.1 | GPU 1.12x |
+| 4 | 320.3 | 256.3 | 210.6 | 210.6 | **GPU 1.52x** |
+| 8 | 219.8 | 212.4 | 163.5 | 163.5 | GPU 1.34x |
+| 16 | 317.0 | 147.7 | **128.9** | 128.9 | **GPU 2.46x** |
+
+**The CPU does not scale with batch (1.25x); the GPU scales 2.9x.** At S=1 the GPU edge is only
+1.05x — trivially erased by per-call command-buffer construction and `waitUntilCompleted`, which
+with 17.8 % coverage fully explains the shipped **1.118x slower**. **The fault is S=1, not the
+kernel.** Both probes wall at ~114–130 GFLOP/s ≈ **3 % of fp32 peak**, so those GPU figures are a
+*lower bound*.
+
+### E58e. The decisive input, measured not assumed
+
+The engine already logs unique-expert counts (`:5086`). p064 prefill, 86 layer-chunk records:
+
+| chunk | selections | unique experts | **avg N** |
+|---|---|---|---|
+| 6 | 36 | 24.3 | 1.48 |
+| **64** | **384** | **93.7** (min 73, max 188) | **4.10** |
+
+Only **37 %** of the 256-expert space is touched per chunk. Uniform-random routing would touch ~202;
+the actual 94 means routing is **heavily concentrated**, which favours batching. At chunk=64 the
+prize is **4.1x fewer dispatches** (94 vs 384) and **4.1x less weight traffic** — landing at S≈4,
+where the GPU measures **1.52x**.
+
+### E58f. The honest ceiling (this killed my own first target)
+
+Amdahl on the measured p064 attribution:
+- expert path at `g_hit = 1.52`, hit rate `h = 0.577..0.677`: `1/((1-h) + h/1.52)` = **1.25–1.30x**
+- untouched share: miss/first-touch 43.47 % + attention 33.18 % + norms/HC/head 5.22 % + residual
+  1.55 % = **83.42 %**
+- **full-prefill ceiling ≈ 1.20–1.25x**
+
+My original acceptance gate was **1.3x — above the ceiling**. Withdrawn; the gate is now 1.12x.
+Equally important: **the 3.08x bandwidth, the 4.1x traffic reduction and the 1.52x microbench are
+NOT independent multipliers** — they are three descriptions of one effect, and the first draft
+double-counted them.
+
+### E58g. Stale references in the source document (all verified)
+
+| `experiments-backlog.md` claim | reality |
+|---|---|
+| `moe_token_pipeline` at `:3579` | it is at **:4639**; :3579 is a gate-bias line in `moe_token` (:3559) |
+| "three seams" | **four**: 3621, 4620, 4831, 4877 |
+| one `coli_v4_expert_forward_ref` | **three** (7582, 7661, 10899); shipped is **:7661** (`COLI_V4_UNIT_EXPERT_ROWS16`) |
+| batch cap "in three places" | **seven+**, incl. `__m256 sums[64]` (`:12355`) where removing the guard alone is a **stack buffer overflow**, the planner (`:1232`), and DSpark's 128-entry rings |
+
+### Outcome
+Plan written to `docs/plans/metal-batched-moe-architecture.md`, revised across **four adversarial
+review rounds** (Momus, Oracle, and a third code-grounded reviewer), and approved **3/3**. Every
+round found a real defect, including in my own fixes — the sign of `bench/ab.sh`
+(`100*(on-off)/off`, so a speedup is **negative**, meaning my gates would have passed a slowdown),
+a wave/loader deadlock, and a `loader_reserve` that could exceed a capacity which floors at 6.
