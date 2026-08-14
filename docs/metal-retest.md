@@ -21,16 +21,22 @@ Warmup/cache-heating was a legitimate objection: the backend has real one-time c
 | build trap | `rm -f c/*.o` before each variant | `make clean` does not remove objects and make will not recompile on a `-D` change — this silently produced a wrong conclusion twice |
 
 ## Result
+**n=3 per configuration, interleaved** (contract met):
+
 | | CPU (METAL=0) | Metal (METAL=1) | ratio |
 |---|---|---|---|
-| `expert_forward` | 59132.1 ms | 167856.6 ms | **2.84x slower** |
-| `decode_wall` | 218256.8 ms | 331186.9 ms | **1.52x slower** |
+| `expert_forward` | 60136.5 ms (sd 6.6 %) | 165187.1 ms (sd 3.3 %) | **2.747x slower** |
+| `decode_wall` | 218587.7 ms (sd 2.8 %) | 324436.5 ms (sd 2.9 %) | **1.484x slower** |
+
+Worst-case pairing for Metal (lowest Metal run / highest CPU run) is still **2.51x**; the two
+distributions do not overlap, so the verdict is robust to sample size. `hit_rate` matched closely
+across configs (90.289 vs 90.333), so cache state was comparable despite the output divergence.
+Both configs were internally deterministic (md5 `e8c7d8e6` x3 and `b55c21ec` x3).
 
 Pre-committed criteria were **OVERTURN ≤1.05x / CONFIRM >1.10x** → **CONFIRM.**
 
-**Two caveats on strength of evidence (raised in review):**
-- The binding contract called for **n≥3 per configuration**; the table above is n=2. Both pairs
-  agree and both ratios sit far above the 1.10x bar, but the contract was not met as written.
+**Caveat on strength of evidence (raised in review, partly resolved):**
+- ~~n=2~~ **resolved: n=3 per configuration**, distributions non-overlapping.
 - At 300 tokens the two configurations **produce different output** (see Correctness below), so
   after the divergence point they generate different tokens, which route to different experts.
   The workloads are therefore not strictly identical over the full window. The 30-token E43 run,
