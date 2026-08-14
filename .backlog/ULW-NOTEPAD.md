@@ -632,3 +632,35 @@ Runs needed (serial, same .metal binary, non-profile, STATS on): 4 = {100,500} x
 PASS if marginal Metal mixed cost/dispatch approaches (1-f)*c_cpu_marginal + f*(R+C)
   with f=ok fraction ~0.467, i.e. clearly BELOW the 300-token average c_gpu=3.55.
 FAIL if marginal cost stays ~3.5 -> pool recurs with evictions -> projection degrades; stop.
+
+## 16:30 — PREFILL I/O LANE OPENED (plan ses_fff512312ffehgrsaswoiEhfAO)
+E50 DONE: fast-kernels quality 10/10 == default 10/10 (truncation artifact corrected).
+GPU-resident parked on ft-metal-GPU-resident (design doc = resume point).
+
+### Explore findings that shape the design (cited in plan)
+- Prefill discovers expert I/O INCREMENTALLY per token, but after batched attention ALL 64
+  tokens' router inputs exist -> layer's ~93 unique experts knowable before any I/O.
+- Loader pool: 3 workers x 1 job slot = QD 3 max. Global, shared with decode. DO NOT TOUCH.
+- ACTIVE hot store reads OUTSIDE the mutex (:6315-6317); base store (mutex across read) is
+  NOT the active path. Concurrent preads on same shard fd are safe TODAY.
+- store->ops->prefetch is fadvise(WILLNEED) on BUFFERED fds while reads use DIRECT F_NOCACHE
+  fds -> existing prefetch is USELESS by construction. PREFETCH_BATCH calls an UNIMPLEMENTED
+  function (link error if enabled).
+- coli_v4_route_bf16 is stateless/separable; hash-router forced_indices path exists and is the
+  natural carrier for cached route results into moe_token_pipeline (5 call sites unchanged).
+- E34 reconciliation: more threads failed for DECODE (dependency-bound, 1-3 knowable);
+  prefill route-ahead knows ~93 -> deep queue CAN fill. Different regime.
+
+### Gates (pre-committed)
+GATE A (before any engine code): bench/qd_sweep on real record offsets, QD 1/4/8/16/32.
+  PROCEED if QD8 >= 2.0x QD1; STOP (lane capped) if < 1.5x.
+GATE B (after build): >= 15% ttft gain on 184-tok prompt, n>=3 interleaved vs re-baseline,
+  else git revert engine commits, keep bench+report.
+Golden: md5 5d04890413ff539e802985ce8c727814 must hold with flag OFF at every commit AND
+  with flag ON post-integration (route-ahead is pure I/O reordering -> bit-identical or defect).
+
+### Wave 1 IN FLIGHT (parallel, code-only, no model process)
+  bg_da47bb35  T1 qd_sweep.c microbench (build + smoke only)
+  bg_83a5d3d4  T2 layer_contig.py + artifacts/layer_contig.json (11008 records expected)
+  bg_4214b328  T3 harness: golden.sh/rebaseline.sh/ab.sh/build.sh/shares.sh + fixture tests
+Wave 2 (serial, model process): T4 re-baseline -> T5 QD sweep -> GATE A decision.
