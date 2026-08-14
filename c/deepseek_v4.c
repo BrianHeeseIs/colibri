@@ -3468,6 +3468,8 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        int topk, float route_scale);
 #endif
 
+typedef struct ColiV4PrefillLoadBatch ColiV4PrefillLoadBatch;
+
 typedef struct {
     int layer;
     int items;
@@ -3480,6 +3482,7 @@ typedef struct {
     int *idx;
     float *w;
     int *unique_experts;
+    ColiV4PrefillLoadBatch *loader;
 } ColiV4PrefillRouteCache;
 
 static pthread_once_t coli_v4_prefill_routeahead_once = PTHREAD_ONCE_INIT;
@@ -3564,6 +3567,270 @@ typedef struct {
     ColiExpertView view;
     int result;
 } ExpertLoadJob;
+
+enum {
+    COLI_V4_PREFILL_QD_DEFAULT = 4,
+    COLI_V4_PREFILL_QD_MAX = 8,
+};
+
+enum {
+    COLI_V4_PREFILL_PENDING = 0,
+    COLI_V4_PREFILL_LOADING = 1,
+    COLI_V4_PREFILL_READY = 2,
+    COLI_V4_PREFILL_RESIDENT = 3,
+    COLI_V4_PREFILL_CONSUMED = 4,
+};
+
+struct ColiV4PrefillLoadBatch {
+    ColiExpertStore *store;
+    int layer;
+    int count;
+    const int *experts;
+    unsigned char *states;
+    int *results;
+    ColiExpertView *views;
+    int inflight;
+};
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t ready;
+    pthread_cond_t complete;
+    pthread_t threads[COLI_V4_PREFILL_QD_MAX];
+    unsigned char available[COLI_V4_PREFILL_QD_MAX];
+    ColiV4PrefillLoadBatch *batch;
+    int qd;
+    int workers;
+    int stopping;
+    int max_inflight;
+    uint64_t prefetched;
+    uint64_t hits;
+} ColiV4PrefillLoaderPool;
+
+static ColiV4PrefillLoaderPool coli_v4_prefill_loader_pool = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .ready = PTHREAD_COND_INITIALIZER,
+    .complete = PTHREAD_COND_INITIALIZER,
+};
+static pthread_once_t coli_v4_prefill_loader_once = PTHREAD_ONCE_INIT;
+
+extern _Thread_local int coli_v4_prefill_lookup_active;
+extern uint64_t coli_v4_prefill_leased_eviction_attempts;
+int coli_v4_prefill_store_capacity(ColiExpertStore *store);
+int coli_v4_prefill_store_resident(ColiExpertStore *store, ColiExpertKey key);
+
+static int coli_v4_prefill_loader_next_locked(
+        ColiV4PrefillLoadBatch *batch) {
+    for (int item = 0; item < batch->count; item++)
+        if (batch->states[item] == COLI_V4_PREFILL_PENDING) {
+            batch->states[item] = COLI_V4_PREFILL_LOADING;
+            batch->inflight++;
+            if (batch->inflight > coli_v4_prefill_loader_pool.max_inflight)
+                coli_v4_prefill_loader_pool.max_inflight = batch->inflight;
+            return item;
+        }
+    return -1;
+}
+
+static void *coli_v4_prefill_loader_worker(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&coli_v4_prefill_loader_pool.mutex);
+    for (;;) {
+        int item = -1;
+        ColiV4PrefillLoadBatch *batch = NULL;
+        while (!coli_v4_prefill_loader_pool.stopping) {
+            batch = coli_v4_prefill_loader_pool.batch;
+            if (batch) item = coli_v4_prefill_loader_next_locked(batch);
+            if (item >= 0) break;
+            pthread_cond_wait(&coli_v4_prefill_loader_pool.ready,
+                              &coli_v4_prefill_loader_pool.mutex);
+        }
+        if (coli_v4_prefill_loader_pool.stopping) break;
+        ColiExpertKey key = {batch->layer, batch->experts[item]};
+        pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+        coli_v4_prefill_lookup_active = 1;
+        int result = coli_expert_lookup(
+            batch->store, key, &batch->views[item]);
+        coli_v4_prefill_lookup_active = 0;
+        pthread_mutex_lock(&coli_v4_prefill_loader_pool.mutex);
+        batch->results[item] = result;
+        batch->states[item] = COLI_V4_PREFILL_READY;
+        batch->inflight--;
+        if (!result) coli_v4_prefill_loader_pool.prefetched++;
+        pthread_cond_broadcast(&coli_v4_prefill_loader_pool.complete);
+    }
+    pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+    return NULL;
+}
+
+static void coli_v4_prefill_loader_shutdown(void) {
+    pthread_mutex_lock(&coli_v4_prefill_loader_pool.mutex);
+    coli_v4_prefill_loader_pool.stopping = 1;
+    pthread_cond_broadcast(&coli_v4_prefill_loader_pool.ready);
+    pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+    for (int worker = 0; worker < COLI_V4_PREFILL_QD_MAX; worker++)
+        if (coli_v4_prefill_loader_pool.available[worker]) {
+            pthread_join(coli_v4_prefill_loader_pool.threads[worker], NULL);
+            coli_v4_prefill_loader_pool.available[worker] = 0;
+        }
+}
+
+static void coli_v4_prefill_loader_verify_report(void) {
+    pthread_mutex_lock(&coli_v4_prefill_loader_pool.mutex);
+    uint64_t prefetched = coli_v4_prefill_loader_pool.prefetched;
+    uint64_t hits = coli_v4_prefill_loader_pool.hits;
+    int max_inflight = coli_v4_prefill_loader_pool.max_inflight;
+    int qd = coli_v4_prefill_loader_pool.qd;
+    pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+    fprintf(stderr,
+            "v4_prefill_loader verify prefetched=%llu hits=%llu "
+            "leased_eviction_attempts=%llu max_inflight=%d qd=%d\n",
+            (unsigned long long)prefetched, (unsigned long long)hits,
+            (unsigned long long)__atomic_load_n(
+                &coli_v4_prefill_leased_eviction_attempts, __ATOMIC_RELAXED),
+            max_inflight, qd);
+}
+
+static int coli_v4_prefill_qd(void) {
+    const char *text = getenv("COLI_V4_PREFILL_QD");
+    if (!text || !*text) return COLI_V4_PREFILL_QD_DEFAULT;
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+    if (errno || end == text || *end) {
+        fprintf(stderr,
+                "COLI_V4_PREFILL_QD invalid=%s using_default=%d range=1-%d\n",
+                text, COLI_V4_PREFILL_QD_DEFAULT, COLI_V4_PREFILL_QD_MAX);
+        return COLI_V4_PREFILL_QD_DEFAULT;
+    }
+    if (value < 1) {
+        fprintf(stderr, "COLI_V4_PREFILL_QD clamped=%ld effective=1\n", value);
+        return 1;
+    }
+    if (value > COLI_V4_PREFILL_QD_MAX) {
+        fprintf(stderr,
+                "COLI_V4_PREFILL_QD clamped=%ld effective=%d\n",
+                value, COLI_V4_PREFILL_QD_MAX);
+        return COLI_V4_PREFILL_QD_MAX;
+    }
+    return (int)value;
+}
+
+static void coli_v4_prefill_loader_init(void) {
+    coli_v4_prefill_loader_pool.qd = coli_v4_prefill_qd();
+    for (int worker = 0; worker < coli_v4_prefill_loader_pool.qd; worker++)
+        if (!pthread_create(&coli_v4_prefill_loader_pool.threads[worker], NULL,
+                            coli_v4_prefill_loader_worker, NULL)) {
+            coli_v4_prefill_loader_pool.available[worker] = 1;
+            coli_v4_prefill_loader_pool.workers++;
+        }
+    if (coli_v4_prefill_loader_pool.workers !=
+        coli_v4_prefill_loader_pool.qd)
+        fprintf(stderr,
+                "v4_prefill_loader warning=requested_qd=%d workers=%d\n",
+                coli_v4_prefill_loader_pool.qd,
+                coli_v4_prefill_loader_pool.workers);
+    if (coli_v4_prefill_loader_pool.workers) {
+        if (coli_v4_prefill_routeahead_verify_value)
+            atexit(coli_v4_prefill_loader_verify_report);
+        atexit(coli_v4_prefill_loader_shutdown);
+    }
+}
+
+static ColiV4PrefillLoadBatch *coli_v4_prefill_loader_batch_start(
+        ColiExpertStore *store, int layer, const int *experts, int count) {
+    pthread_once(&coli_v4_prefill_loader_once, coli_v4_prefill_loader_init);
+    if (!coli_v4_prefill_loader_pool.workers || count < 1) return NULL;
+    ColiV4PrefillLoadBatch *batch = calloc(1, sizeof(*batch));
+    if (!batch) return NULL;
+    batch->states = calloc((size_t)count, sizeof(*batch->states));
+    batch->results = malloc((size_t)count * sizeof(*batch->results));
+    batch->views = calloc((size_t)count, sizeof(*batch->views));
+    if (!batch->states || !batch->results || !batch->views) {
+        free(batch->views); free(batch->results); free(batch->states);
+        free(batch); return NULL;
+    }
+    batch->store = store;
+    batch->layer = layer;
+    batch->count = count;
+    batch->experts = experts;
+    int queued = 0;
+    for (int item = 0; item < count; item++) {
+        batch->results[item] = -1;
+        ColiExpertKey key = {layer, experts[item]};
+        if (coli_v4_prefill_store_resident(store, key))
+            batch->states[item] = COLI_V4_PREFILL_RESIDENT;
+        else
+            queued++;
+    }
+    if (!queued) {
+        free(batch->views); free(batch->results); free(batch->states);
+        free(batch); return NULL;
+    }
+    pthread_mutex_lock(&coli_v4_prefill_loader_pool.mutex);
+    while (coli_v4_prefill_loader_pool.batch)
+        pthread_cond_wait(&coli_v4_prefill_loader_pool.complete,
+                          &coli_v4_prefill_loader_pool.mutex);
+    coli_v4_prefill_loader_pool.batch = batch;
+    pthread_cond_broadcast(&coli_v4_prefill_loader_pool.ready);
+    pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+    return batch;
+}
+
+static int coli_v4_prefill_loader_lookup(
+        ColiV4PrefillLoadBatch *batch, int expert, ColiExpertView *view) {
+    int item = -1;
+    pthread_mutex_lock(&coli_v4_prefill_loader_pool.mutex);
+    for (int candidate = 0; candidate < batch->count; candidate++)
+        if (batch->experts[candidate] == expert) { item = candidate; break; }
+    if (item < 0 || batch->states[item] == COLI_V4_PREFILL_RESIDENT ||
+        batch->states[item] == COLI_V4_PREFILL_CONSUMED) {
+        pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+        return 1;
+    }
+    while (batch->states[item] == COLI_V4_PREFILL_PENDING ||
+           batch->states[item] == COLI_V4_PREFILL_LOADING)
+        pthread_cond_wait(&coli_v4_prefill_loader_pool.complete,
+                          &coli_v4_prefill_loader_pool.mutex);
+    int prefetch_result = batch->results[item];
+    ColiExpertView prefetched = batch->views[item];
+    memset(&batch->views[item], 0, sizeof(batch->views[item]));
+    batch->states[item] = COLI_V4_PREFILL_CONSUMED;
+    pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+    if (prefetch_result) return 1;
+    ColiExpertKey key = {batch->layer, expert};
+    int result = coli_expert_lookup(batch->store, key, view);
+    coli_expert_release(batch->store, &prefetched);
+    if (!result) {
+        pthread_mutex_lock(&coli_v4_prefill_loader_pool.mutex);
+        coli_v4_prefill_loader_pool.hits++;
+        pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+    }
+    return result ? -1 : 0;
+}
+
+static void coli_v4_prefill_loader_batch_finish(
+        ColiV4PrefillLoadBatch *batch) {
+    if (!batch) return;
+    pthread_mutex_lock(&coli_v4_prefill_loader_pool.mutex);
+    for (;;) {
+        int unfinished = batch->inflight;
+        for (int item = 0; !unfinished && item < batch->count; item++)
+            unfinished = batch->states[item] == COLI_V4_PREFILL_PENDING ||
+                         batch->states[item] == COLI_V4_PREFILL_LOADING;
+        if (!unfinished) break;
+        pthread_cond_wait(&coli_v4_prefill_loader_pool.complete,
+                          &coli_v4_prefill_loader_pool.mutex);
+    }
+    coli_v4_prefill_loader_pool.batch = NULL;
+    pthread_cond_broadcast(&coli_v4_prefill_loader_pool.complete);
+    pthread_mutex_unlock(&coli_v4_prefill_loader_pool.mutex);
+    for (int item = 0; item < batch->count; item++)
+        if (batch->states[item] == COLI_V4_PREFILL_READY &&
+            !batch->results[item])
+            coli_expert_release(batch->store, &batch->views[item]);
+    free(batch->views); free(batch->results); free(batch->states); free(batch);
+}
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
 static int expert_prefetch_enabled(void) {
@@ -4073,6 +4340,52 @@ static int coli_v4_prefill_routeahead_verify(
     return mismatches ? -1 : 0;
 }
 
+static int coli_v4_prefill_experts_forward(
+        float *output, float *expert_output,
+        const ColiDeepSeekV4LayerWeights *weights,
+        const ColiDeepSeekV4Config *config, ColiExpertStore *store,
+        const float *input, const int *expert_ids,
+        const float *expert_weights, int selected,
+        ColiV4PrefillLoadBatch *batch) {
+    int dimension = config->hidden_size;
+    for (int current = 0; current < selected; current++) {
+        ColiExpertView expert = {0};
+        uint64_t wait_began = coli_v4_profile_on
+            ? coli_v4_profile_now_ns() : 0;
+        int lookup_result = coli_v4_prefill_loader_lookup(
+            batch, expert_ids[current], &expert);
+        if (lookup_result > 0)
+            lookup_result = coli_expert_lookup(
+                store,
+                (ColiExpertKey){weights->plan.layer, expert_ids[current]},
+                &expert);
+        if (coli_v4_profile_on)
+            coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_WAIT,
+                                coli_v4_profile_now_ns() - wait_began);
+        if (lookup_result) return -1;
+        uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
+        int done = 0;
+#ifdef COLI_V4_METAL_SEAM
+        if (coli_v4_metal_enabled() &&
+            coli_v4_metal_expert_forward(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit) == 0)
+            done = 1;
+#endif
+        int result = done ? 0 : coli_v4_expert_forward_ref(
+            expert_output, &expert, input, expert_weights[current],
+            config->swiglu_limit);
+        if (coli_v4_profile_on)
+            coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_FORWARD,
+                                coli_v4_profile_now_ns() - began);
+        coli_expert_release(store, &expert);
+        if (result) return result;
+        for (int index = 0; index < dimension; index++)
+            output[index] += expert_output[index];
+    }
+    return 0;
+}
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -4120,24 +4433,36 @@ static int moe_token_pipeline(float *output,
     int result = token < 0 || token >= config->vocab_size;
     if (!result && weights->plan.uses_hash_router && !table) result = -1;
     uint64_t router_began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
-    if (!result && weights->plan.uses_hash_router)
-        for (int i = 0; i < topk; i++)
-            indices[i] = (int)table[(size_t)token * topk + i];
+    ColiV4PrefillRouteCache *route_cache = coli_v4_prefill_route_cache;
+    int cached_route = route_cache && route_cache->current_item >= 0 &&
+        route_cache->current_item < route_cache->items &&
+        route_cache->layer == weights->plan.layer &&
+        route_cache->topk == topk && route_cache->experts == n;
+    int reroute = !cached_route || route_cache->verify;
+    if (!result && reroute && weights->plan.uses_hash_router)
+        for (int rank = 0; rank < topk; rank++)
+            indices[rank] = (int)table[(size_t)token * topk + rank];
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
-    if (!result) result = coli_v4_route_bf16(
+    if (!result && reroute) result = coli_v4_route_bf16(
         route_weights, indices, input, raw_gate, bias,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
 #else
-    if (!result) result = coli_v4_route(
+    if (!result && reroute) result = coli_v4_route(
         route_weights, indices, input, gate, bias,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
 #endif
-    if (!result && coli_v4_prefill_route_cache &&
-        coli_v4_prefill_route_cache->verify)
+    if (!result && cached_route && route_cache->verify)
         result = coli_v4_prefill_routeahead_verify(
-            coli_v4_prefill_route_cache, indices, route_weights, token);
+            route_cache, indices, route_weights, token);
+    if (!result && cached_route) {
+        size_t offset = (size_t)route_cache->current_item * topk;
+        memcpy(indices, route_cache->idx + offset,
+               (size_t)topk * sizeof(*indices));
+        memcpy(route_weights, route_cache->w + offset,
+               (size_t)topk * sizeof(*route_weights));
+    }
 
 #ifdef COLI_M4_TRACE
     if (!result) coli_m4_record_routing(indices, n, topk);
@@ -4169,12 +4494,13 @@ static int moe_token_pipeline(float *output,
     }
 #endif
 
+    int prefill_loader_active = route_cache && route_cache->loader;
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_COUNT] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_COUNT] = {{0}};
     int loader_active[DUAL_EXPERT_LOADER_COUNT] = {0};
-    if (!result) {
+    if (!result && !prefill_loader_active) {
         int preload = selected < DUAL_EXPERT_LOADER_COUNT
             ? selected : DUAL_EXPERT_LOADER_COUNT;
         for (int i = 0; i < preload; i++) {
@@ -4192,7 +4518,7 @@ static int moe_token_pipeline(float *output,
     ExpertLoadJob job = {0};
     ExpertLoadHandle loader = {0};
     int loader_active = 0;
-    if (!result) {
+    if (!result && !prefill_loader_active) {
         job.store = store;
         job.key = (ColiExpertKey){weights->plan.layer, expert_ids[0]};
         job.result = -1;
@@ -4217,6 +4543,12 @@ static int moe_token_pipeline(float *output,
     }
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
+    if (prefill_loader_active) {
+        if (!result)
+            result = coli_v4_prefill_experts_forward(
+                output, expert_output, weights, config, store, input,
+                expert_ids, expert_weights, selected, route_cache->loader);
+    } else {
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     for (int current = 0; !result && current < selected; current++) {
         int slot = current % DUAL_EXPERT_LOADER_COUNT;
@@ -4309,6 +4641,7 @@ static int moe_token_pipeline(float *output,
         if (!job.result) coli_expert_release(store, &job.view);
     }
 #endif
+    }
     if (!result)
         for (int i = 0; i < d; i++)
             output[i] = coli_bf16_round(output[i] + shared_output[i]);
@@ -4478,6 +4811,15 @@ int coli_v4_block_window_batch_ref(
                     "v4_prefill_routeahead active layer=%d start=%d chunk=%d unique=%d\n",
                     weights->plan.layer, start_position, batch,
                     route_cache->n_unique);
+            int capacity = coli_v4_prefill_store_capacity(experts);
+            if (capacity > 0 && route_cache->n_unique <= capacity)
+                route_cache->loader = coli_v4_prefill_loader_batch_start(
+                    experts, weights->plan.layer, route_cache->unique_experts,
+                    route_cache->n_unique);
+            else if (capacity > 0)
+                fprintf(stderr,
+                        "v4_prefill_loader fallback layer=%d unique=%d capacity=%d\n",
+                        weights->plan.layer, route_cache->n_unique, capacity);
             previous_route_cache = coli_v4_prefill_route_cache;
             coli_v4_prefill_route_cache = route_cache;
             route_cache_active = 1;
@@ -4506,6 +4848,10 @@ int coli_v4_block_window_batch_ref(
             ffn_post, ffn_comb, hc, d);
         if (!result) coli_bf16_round_array(
             outputs_hc + (size_t)item * hd, hd);
+    }
+    if (route_cache && route_cache->loader) {
+        coli_v4_prefill_loader_batch_finish(route_cache->loader);
+        route_cache->loader = NULL;
     }
     if (route_cache_active)
         coli_v4_prefill_route_cache = previous_route_cache;
@@ -6086,6 +6432,8 @@ typedef struct V4HotPolicy {
 
 static pthread_mutex_t hot_policies_mutex = PTHREAD_MUTEX_INITIALIZER;
 static V4HotPolicy *hot_policies;
+_Thread_local int coli_v4_prefill_lookup_active;
+uint64_t coli_v4_prefill_leased_eviction_attempts;
 
 static double hot_now(void) {
     struct timespec value;
@@ -6220,6 +6568,28 @@ static V4HotPolicy *hot_find(ColiExpertStore *store) {
     while (policy && policy->store != store) policy = policy->next;
     pthread_mutex_unlock(&hot_policies_mutex);
     return policy;
+}
+
+int coli_v4_prefill_store_capacity(ColiExpertStore *store) {
+    if (!store || !store->state || !hot_find(store)) return 0;
+    V4ExpertStoreState *state = store->state;
+    return state->slots_per_layer;
+}
+
+int coli_v4_prefill_store_resident(ColiExpertStore *store, ColiExpertKey key) {
+    if (!store || !store->state || !hot_find(store)) return 0;
+    V4ExpertStoreState *state = store->state;
+    if (!get_record(state, key)) return 0;
+    int resident = 0;
+    pthread_mutex_lock(&state->mutex);
+    V4ExpertSlot *slots = layer_slots(state, key.layer);
+    for (int slot = 0; slot < state->slots_per_layer; slot++)
+        if (slots[slot].slab && slots[slot].expert == key.expert) {
+            resident = 1;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+    return resident;
 }
 
 /* Persist the learned expert-usage history WITHOUT waiting for engine destroy.
@@ -6506,6 +6876,9 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         memset(view, 0, sizeof(*view));
         return -1;
     }
+    if (coli_v4_prefill_lookup_active && slot->references)
+        __atomic_fetch_add(&coli_v4_prefill_leased_eviction_attempts,
+                           UINT64_C(1), __ATOMIC_RELAXED);
     if (!slot->slab) {
         const size_t page = 16384u;
         size_t capacity = (size_t)state->record_bytes + 8192u;
