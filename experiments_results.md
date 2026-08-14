@@ -1930,3 +1930,57 @@ deep queues.
 Baseline re-pinned this session: p064 43.554 s (sd 0.249), p256 113.735 s (sd 0.864), golden md5
 confirmed. Engine work is HALTED pending user decision, since the pre-committed gate said stop
 and proceeding on revised evidence is a scope decision, not a technical one.
+
+---
+
+## E52. Prefill route-ahead + overlap loader — **works, is bit-exact, gives 7-9.5 %. And E51's diagnosis was WRONG.**
+
+Built the pivoted design (route-ahead + continuous overlap at QD2-4, after GATE A killed deep
+queues). It works correctly and it under-delivers, because the bottleneck is not what E51 said.
+
+### What was built (commits 1bfaf9b, 29561ce — both default OFF)
+- **Route-ahead** (T6): after batched attention, before the per-token loop, route every token in the
+  chunk and cache `idx/w` + the layer's deduplicated unique-expert set (mean 86.7/layer, range
+  73-107). Verified bit-exact vs re-routing: **tokens=3010 ranks=18060 mismatches=0**.
+- **Continuous-overlap loader** (T7): dedicated worker pool (QD default 4, clamped 1-8), separate
+  from the global 3-worker decode pool, continuous refill rather than burst, per-expert waits,
+  publishes through the existing hot path. **prefetched=3689 hits=3689** (every prefetch used),
+  **leased_eviction_attempts=0**, max_inflight=4. The token loop consumes the cached routes
+  (`:4446` re-routes only under VERIFY).
+- **Golden md5 `5d04890413ff539e802985ce8c727814` holds with the gate ON and OFF** — pure I/O
+  reordering, as contracted.
+
+### Measured (p064, cold, ttft)
+| config | ttft | vs its own baseline |
+|---|---|---|
+| OFF, default kernels | 43.006 s | — |
+| **prefetch ON, default kernels** | **40.006 s** | **7.0 %** |
+| OFF, `--fast-kernels` | 39.352 s | — |
+| **prefetch ON + `--fast-kernels`** | **35.597 s** | **9.5 %** |
+
+**GATE B (>=15 % on the feature) is NOT met: 7.0-9.5 %.**
+
+### Why — E51's "84 % is SSD wait" was a bad inference, now retracted
+E51 computed I/O time by subtracting *warm decode* compute (0.41 ms/op) from prefill's 2.50 ms/op
+and attributing the remainder to I/O. That remainder is mostly **slow compute**, not I/O. Three
+independent measurements say so:
+1. **QD sweep in-engine**: QD1 41.966 s, QD4 39.571 s, QD8 39.990 s. Moving queue depth buys 2.4 s
+   and then nothing. If I/O were 84 % of the wall this curve would be steep.
+2. **Arithmetic**: 53.6 GB at the measured QD4 saturation (7.03 GB/s) is **7.6 s of a 43 s wall**,
+   and it is fully overlappable.
+3. **Residual per-op**: subtracting even the full I/O gives **1.96 ms/expert-op** (default kernels)
+   versus **0.41-0.76 ms** warm — 3-5x higher.
+
+**The real cause: in decode most experts are rows16 hot-PACKED and use the fast fused kernel; in
+prefill they are cold/UNPACKED and take the slower fallback path.** Prefill is
+**compute-bound on the unpacked-expert kernel**, not I/O-bound. That is why `--fast-kernels`
+(router only) moved prefill 8.5 % on its own, and why deeper queues did nothing.
+
+### Incidental finding
+Layers 0-2 need **188/184/188** unique experts against a slot capacity of **164**, so those three
+layers fall back to on-demand entirely (`v4_prefill_loader fallback`). 40 of 43 layers use the
+prefetch path.
+
+**Status: engine work paused at the pre-committed gate.** The feature is correct, bit-exact, and
+default-OFF; it is worth 7-9.5 % if kept. The larger prize is now clearly the unpacked-expert
+compute path, which is a different change.
