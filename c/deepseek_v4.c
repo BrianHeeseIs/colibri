@@ -3469,6 +3469,96 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 #endif
 
 typedef struct {
+    int layer;
+    int items;
+    int topk;
+    int experts;
+    int current_item;
+    int unique_capacity;
+    int n_unique;
+    int verify;
+    int *idx;
+    float *w;
+    int *unique_experts;
+} ColiV4PrefillRouteCache;
+
+static pthread_once_t coli_v4_prefill_routeahead_once = PTHREAD_ONCE_INIT;
+static int coli_v4_prefill_routeahead_enabled_value;
+static int coli_v4_prefill_routeahead_verify_value;
+static _Thread_local ColiV4PrefillRouteCache *coli_v4_prefill_route_cache;
+static pthread_mutex_t coli_v4_prefill_routeahead_verify_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+static uint64_t coli_v4_prefill_routeahead_verify_tokens;
+static uint64_t coli_v4_prefill_routeahead_verify_ranks;
+static uint64_t coli_v4_prefill_routeahead_verify_mismatches;
+static int coli_v4_prefill_routeahead_first_mismatch_reported;
+
+static void coli_v4_prefill_routeahead_verify_report(void) {
+    pthread_mutex_lock(&coli_v4_prefill_routeahead_verify_mutex);
+    uint64_t tokens = coli_v4_prefill_routeahead_verify_tokens;
+    uint64_t ranks = coli_v4_prefill_routeahead_verify_ranks;
+    uint64_t mismatches = coli_v4_prefill_routeahead_verify_mismatches;
+    pthread_mutex_unlock(&coli_v4_prefill_routeahead_verify_mutex);
+    fprintf(stderr,
+            "v4_prefill_routeahead verify tokens=%llu ranks=%llu mismatches=%llu\n",
+            (unsigned long long)tokens, (unsigned long long)ranks,
+            (unsigned long long)mismatches);
+}
+
+static void coli_v4_prefill_routeahead_init(void) {
+    const char *enabled = getenv("COLI_V4_PREFILL_PREFETCH");
+    coli_v4_prefill_routeahead_enabled_value =
+        enabled && *enabled && atoi(enabled) != 0;
+    const char *verify = getenv("COLI_V4_PREFILL_PREFETCH_VERIFY");
+    coli_v4_prefill_routeahead_verify_value =
+        coli_v4_prefill_routeahead_enabled_value &&
+        verify && *verify && atoi(verify) != 0;
+    if (coli_v4_prefill_routeahead_verify_value)
+        atexit(coli_v4_prefill_routeahead_verify_report);
+}
+
+static int coli_v4_prefill_routeahead_enabled(void) {
+    pthread_once(&coli_v4_prefill_routeahead_once,
+                 coli_v4_prefill_routeahead_init);
+    return coli_v4_prefill_routeahead_enabled_value;
+}
+
+static ColiV4PrefillRouteCache *coli_v4_prefill_route_cache_create(
+        int layer, int items, int topk, int experts) {
+    ColiV4PrefillRouteCache *cache = calloc(1, sizeof(*cache));
+    if (!cache) return NULL;
+    size_t routes = (size_t)items * topk;
+    cache->layer = layer;
+    cache->items = items;
+    cache->topk = topk;
+    cache->experts = experts;
+    cache->current_item = -1;
+    cache->unique_capacity = experts < (int)routes ? experts : (int)routes;
+    cache->verify = coli_v4_prefill_routeahead_verify_value;
+    cache->idx = malloc(routes * sizeof(*cache->idx));
+    cache->w = malloc(routes * sizeof(*cache->w));
+    cache->unique_experts = malloc(
+        (size_t)cache->unique_capacity * sizeof(*cache->unique_experts));
+    if (!cache->idx || !cache->w || !cache->unique_experts) {
+        free(cache->unique_experts);
+        free(cache->w);
+        free(cache->idx);
+        free(cache);
+        return NULL;
+    }
+    return cache;
+}
+
+static void coli_v4_prefill_route_cache_destroy(
+        ColiV4PrefillRouteCache *cache) {
+    if (!cache) return;
+    free(cache->unique_experts);
+    free(cache->w);
+    free(cache->idx);
+    free(cache);
+}
+
+typedef struct {
     ColiExpertStore *store;
     ColiExpertKey key;
     ColiExpertView view;
@@ -3883,6 +3973,106 @@ static void coli_m4_emit_chunk(const ColiM4ChunkTrace *trace) {
 }
 #endif
 
+static int coli_v4_prefill_routeahead_build(
+        ColiV4PrefillRouteCache *cache,
+        const ColiDeepSeekV4LayerWeights *weights,
+        const ColiDeepSeekV4Config *config,
+        const float *branches, const float *inputs_hc,
+        const float *posts, const float *combs, const int *tokens) {
+    int d = config->hidden_size;
+    int hc = config->hc_mult;
+    int n = config->n_routed_experts;
+    int topk = config->num_experts_per_tok;
+    size_t hd = (size_t)hc * d;
+    float *route_state = malloc(hd * sizeof(*route_state));
+    float *route_reduced = malloc((size_t)d * sizeof(*route_reduced));
+    float *route_normalized = malloc((size_t)d * sizeof(*route_normalized));
+    float *route_post = malloc((size_t)hc * sizeof(*route_post));
+    float *route_comb = malloc((size_t)hc * hc * sizeof(*route_comb));
+    const uint16_t *raw_gate = value(weights, "ffn.gate.weight", NULL);
+    const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
+    const float *bias = value(weights, "ffn.gate.bias", NULL);
+    int result = !route_state || !route_reduced || !route_normalized ||
+                 !route_post || !route_comb || !raw_gate;
+    for (int item = 0; !result && item < cache->items; item++) {
+        result = coli_v4_hc_post(
+            route_state, branches + (size_t)item * d,
+            inputs_hc + (size_t)item * hd,
+            posts + (size_t)item * hc,
+            combs + (size_t)item * hc * hc, hc, d);
+        if (!result) coli_bf16_round_array(route_state, hd);
+        if (!result) result = normalized_hc_pre(
+            route_reduced, route_post, route_comb, route_normalized,
+            route_state, weights, config, "ffn", "ffn_norm.weight");
+        if (!result && (tokens[item] < 0 || tokens[item] >= config->vocab_size))
+            result = -1;
+        if (!result && weights->plan.uses_hash_router && !table) result = -1;
+        int *indices = cache->idx + (size_t)item * topk;
+        float *route_weights = cache->w + (size_t)item * topk;
+        if (!result && weights->plan.uses_hash_router)
+            for (int rank = 0; rank < topk; rank++)
+                indices[rank] = (int)table[(size_t)tokens[item] * topk + rank];
+        if (!result) result = coli_v4_route_bf16(
+            route_weights, indices, route_normalized, raw_gate, bias,
+            weights->plan.uses_hash_router ? indices : NULL,
+            n, d, topk, config->routed_scaling_factor);
+        for (int rank = 0; !result && rank < topk; rank++) {
+            int expert = indices[rank];
+            int seen = 0;
+            for (int unique = 0; unique < cache->n_unique; unique++)
+                if (cache->unique_experts[unique] == expert) {
+                    seen = 1;
+                    break;
+                }
+            if (!seen)
+                cache->unique_experts[cache->n_unique++] = expert;
+        }
+    }
+    free(route_comb);
+    free(route_post);
+    free(route_normalized);
+    free(route_reduced);
+    free(route_state);
+    return result;
+}
+
+static int coli_v4_prefill_routeahead_verify(
+        const ColiV4PrefillRouteCache *cache,
+        const int *indices, const float *route_weights, int token) {
+    int item = cache->current_item;
+    const int *cached_indices = cache->idx + (size_t)item * cache->topk;
+    const float *cached_weights = cache->w + (size_t)item * cache->topk;
+    int mismatches = 0;
+    pthread_mutex_lock(&coli_v4_prefill_routeahead_verify_mutex);
+    coli_v4_prefill_routeahead_verify_tokens++;
+    coli_v4_prefill_routeahead_verify_ranks += (uint64_t)cache->topk;
+    for (int rank = 0; rank < cache->topk; rank++) {
+        int weight_differs = memcmp(
+            &cached_weights[rank], &route_weights[rank],
+            sizeof(cached_weights[rank])) != 0;
+        if (cached_indices[rank] == indices[rank] && !weight_differs) continue;
+        mismatches++;
+        coli_v4_prefill_routeahead_verify_mismatches++;
+        if (!coli_v4_prefill_routeahead_first_mismatch_reported) {
+            uint32_t cached_bits, routed_bits;
+            memcpy(&cached_bits, &cached_weights[rank], sizeof(cached_bits));
+            memcpy(&routed_bits, &route_weights[rank], sizeof(routed_bits));
+            fprintf(stderr,
+                    "v4_prefill_routeahead first_mismatch layer=%d item=%d "
+                    "token=%d rank=%d cached_idx=%d routed_idx=%d "
+                    "cached_w=%.9g cached_w_bits=0x%08x "
+                    "routed_w=%.9g routed_w_bits=0x%08x\n",
+                    cache->layer, item, token, rank,
+                    cached_indices[rank], indices[rank],
+                    cached_weights[rank], (unsigned)cached_bits,
+                    route_weights[rank], (unsigned)routed_bits);
+            coli_v4_prefill_routeahead_first_mismatch_reported = 1;
+        }
+    }
+    pthread_mutex_unlock(&coli_v4_prefill_routeahead_verify_mutex);
+    return mismatches ? -1 : 0;
+}
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -3944,6 +4134,10 @@ static int moe_token_pipeline(float *output,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
 #endif
+    if (!result && coli_v4_prefill_route_cache &&
+        coli_v4_prefill_route_cache->verify)
+        result = coli_v4_prefill_routeahead_verify(
+            coli_v4_prefill_route_cache, indices, route_weights, token);
 
 #ifdef COLI_M4_TRACE
     if (!result) coli_m4_record_routing(indices, n, topk);
@@ -4238,6 +4432,9 @@ int coli_v4_block_window_batch_ref(
     }
     int result = 0;
     const char *phase = "attention hyper-connection";
+    ColiV4PrefillRouteCache *route_cache = NULL;
+    ColiV4PrefillRouteCache *previous_route_cache = NULL;
+    int route_cache_active = 0;
 #ifdef COLI_M4_TRACE
     ColiM4ChunkTrace m4_trace = {
         .layer = weights->plan.layer,
@@ -4267,8 +4464,28 @@ int coli_v4_block_window_batch_ref(
     if (!result) result = coli_v4_attention_window_batch_ref(
         branches, attention, weights, config, normalized,
         start_position, batch, error, error_size);
+    if (!result && coli_v4_prefill_routeahead_enabled()) {
+        phase = "prefill route-ahead";
+        route_cache = coli_v4_prefill_route_cache_create(
+            weights->plan.layer, batch, config->num_experts_per_tok,
+            config->n_routed_experts);
+        if (!route_cache) result = -1;
+        if (!result) result = coli_v4_prefill_routeahead_build(
+            route_cache, weights, config, branches, inputs_hc,
+            posts, combs, tokens);
+        if (!result) {
+            fprintf(stderr,
+                    "v4_prefill_routeahead active layer=%d start=%d chunk=%d unique=%d\n",
+                    weights->plan.layer, start_position, batch,
+                    route_cache->n_unique);
+            previous_route_cache = coli_v4_prefill_route_cache;
+            coli_v4_prefill_route_cache = route_cache;
+            route_cache_active = 1;
+        }
+    }
     if (!result) phase = "attention post / FFN hyper-connection";
     for (int item = 0; !result && item < batch; item++) {
+        if (route_cache_active) route_cache->current_item = item;
         float *state = states + (size_t)item * hd;
         result = coli_v4_hc_post(
             state, branches + (size_t)item * d,
@@ -4290,12 +4507,15 @@ int coli_v4_block_window_batch_ref(
         if (!result) coli_bf16_round_array(
             outputs_hc + (size_t)item * hd, hd);
     }
+    if (route_cache_active)
+        coli_v4_prefill_route_cache = previous_route_cache;
 #ifdef COLI_M4_TRACE
     coli_m4_active_trace = m4_previous_trace;
     if (!result && coli_m4_prefill_active) coli_m4_emit_chunk(&m4_trace);
     free(m4_trace.selections);
     free(m4_trace.counts);
 #endif
+    coli_v4_prefill_route_cache_destroy(route_cache);
     free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
     free(reduced); free(combs); free(posts); free(branches);
     free(normalized); free(states);
