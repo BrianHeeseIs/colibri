@@ -350,3 +350,38 @@ Wave-1 attack.
 (unchanged from v2 — llama.cpp MUL_MAT_ID/mmap/PRs #24524 #25294 #20962 d#12985 d#4167 d#24528;
 MLX gather_qmm + load.cpp; arXiv 2603.19289, 2606.15453, 2607.24787, 2602.03921; ACM Diff-MoE;
 Apple specs/manpages; local RESULTS §2-§13, experiments E13-E27; line refs = c/deepseek_v4.c.)
+
+
+---
+
+## Campaign state 2026-08-14 (ft-deepmetal @ 5b1c0a3)
+
+### Headline — rigorous same-build A/B, flag toggled, 3 interleaved runs each, 60-token generation
+| build | mean decode_wall | sd | md5 |
+|---|---|---|---|
+| default | 38554.8 ms | 234.7 | `5d04890413ff539e802985ce8c727814` (byte-identical to pre-campaign) |
+| `--fast-sparse-attn` | **34311.2 ms** | 49.7 | `7155bab905cbfa70aa06afa08f757cee` |
+
+**11.01 % faster (1.1237x)** with the opt-in reassociated kernel set, default bit-exact.
+Separately, the default decode path is 1.38-1.42x faster than the pre-M15 baseline from the
+4-row matvec work (E33), which IS byte-identical.
+
+### What `--fast-sparse-attn` enables
+- `attn_sparse` 4-accumulator NEON (E37) — 4.53x on the phase
+- `router` 4-accumulator NEON (E40) — 10.76x on the phase
+It does **not** include the LM head (E41 reverted, see below). The flag name is now historical;
+it means "reassociated-FP kernel set".
+
+### *** STANDING RULE: phases are not independent ***
+E41 built a NEON LM head: **11.71x microbench, 3.67x on the phase, 11.2 % SLOWER decode_wall.**
+`accounted_pct` stayed 98.5 %; the time reappeared in `expert_forward` (+2208.8 ms) and
+`shared_expert` (+414.5 ms). The head streams ~1 GiB of BF16 vocab weights per token, so running
+it 3.7x faster evicts the resident expert slabs from shared cache and `expert_forward` refetches
+from DRAM. Reverting restored both. **Validate every kernel change on `decode_wall` using a
+same-build A/B toggle — never on its own `phase=` number.** This pattern has now bitten three
+times (E39, E40 Tier 1, E41).
+
+### Remaining phase budget (steady state, default build)
+`expert_forward` 26.6 % is the only phase large enough to justify real risk. `hc_norm` 4.0 %,
+`indexer` 2.5 %, `compressor` 1.9 % are small AND all stream large arrays, so they carry the same
+cache-pollution backfire risk for little upside.
