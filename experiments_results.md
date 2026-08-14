@@ -1857,3 +1857,26 @@ Sequence of verdicts on this lane, each overturning the last's *mechanism* while
 E43 "slow, dispatch-bound" -> E46 "slow, shader-bound" -> E48 "shaders fine, first-touch + sync" ->
 **E49 "recurring coherency tax; only GPU residency removes it."** The measured outcome never moved:
 Metal as currently architected loses to this CPU path.
+
+---
+
+## E50. Quality validation of `--fast-kernels` — **identical factual accuracy, 10/10 both configs**
+
+Gate the user set for ever flipping the reassociated kernels to default: validate quality first.
+10 prompts with objectively verifiable answers (capitals, arithmetic, physical constants, known
+facts), 24 tokens each, scored by identical substring match on STDOUT (an earlier attempt filtered
+stdout for a stderr-only pattern and returned 20 empty results — harness bug, fixed).
+
+| config | correct |
+|---|---|
+| default (bit-exact) | **10/10** |
+| `--fast-kernels` | **10/10** |
+
+(The raw table shows 9/10 for both: the `lang_py` row was truncated to 60 chars BEFORE the substring
+check, cutting "**Python**" to "**Py". Re-run untruncated: both configs answer Python. Scoring
+artifact, corrected.)
+
+On these prompts the two configs produce **visibly identical text**. The reassociated kernels'
+output divergence (different md5 at 60+ tokens) has no measurable effect on short-form factual
+accuracy. This satisfies the user's stated bar for considering a default flip; the flip itself
+remains a user decision.

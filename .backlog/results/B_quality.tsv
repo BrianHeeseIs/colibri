@@ -1,0 +1,20 @@
+capital_fr	default	YES	The capital of France is **Paris**.<｜end▁of▁sentence｜> 
+capital_fr	fast	YES	The capital of France is **Paris**.<｜end▁of▁sentence｜> 
+capital_jp	default	YES	The capital of Japan is **Tokyo**.<｜end▁of▁sentence｜> 
+capital_jp	fast	YES	The capital of Japan is **Tokyo**.<｜end▁of▁sentence｜> 
+math_add	default	YES	42<｜end▁of▁sentence｜> 
+math_add	fast	YES	42<｜end▁of▁sentence｜> 
+planet	default	YES	The largest planet in our solar system is **Jupiter**.   It 
+planet	fast	YES	The largest planet in our solar system is **Jupiter**.   It 
+elem	default	YES	The chemical symbol for gold is **Au**.   This comes from th
+elem	fast	YES	The chemical symbol for gold is **Au**.   This comes from th
+year_moon	default	YES	The first humans landed on the Moon in the year **1969**.   
+year_moon	fast	YES	The first humans landed on the Moon in the year **1969**.   
+lang_py	default	no	The programming language created by Guido van Rossum is **Py
+lang_py	fast	no	The programming language created by Guido van Rossum is **Py
+ocean	default	YES	The deepest ocean on Earth is the **Pacific Ocean**.   More 
+ocean	fast	YES	The deepest ocean on Earth is the **Pacific Ocean**.   More 
+math_mul	default	YES	144<｜end▁of▁sentence｜> 
+math_mul	fast	YES	144<｜end▁of▁sentence｜> 
+speed	default	YES	The approximate speed of light in a vacuum is **299,792,458*
+speed	fast	YES	The approximate speed of light in a vacuum is **299,792,458*
