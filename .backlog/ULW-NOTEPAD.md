@@ -199,3 +199,59 @@ Q3. NEW: --fast-sparse-attn now covers attn_sparse + router and will likely cove
     alias for compat), or leave as is?
 Q4. NEW: Metal/GPU offload of expert_forward (26.6% of decode) is the largest remaining lane
     but is a big, risky change. Worth opening, or keep to CPU kernels?
+
+## SESSION STATE 2026-08-14 03:51 — ft-deepmetal @ 5b1c0a3 (pushed)
+
+### E41 REVERTED — the most important finding of the night
+Fast NEON LM head: 11.71x microbench, 3.67x on the head phase... and 11.2% SLOWER decode_wall.
+Mechanism MEASURED (accounted_pct 98.5% both ways, so nothing hidden):
+  head          2091.3 -> 554.8   (-1536.5)
+  router        1956.9 -> ~176    (-1780)
+  expert_forward 10594.4 -> 12803.2 (+2208.8)   <-- the time comes back HERE
+  shared_expert  2406.1 -> 2820.6   (+414.5)
+Head streams ~1 GiB BF16 vocab weights/token; 3.7x faster => evicts resident expert slabs from
+shared cache => expert_forward refetches from DRAM. Revert snaps expert_forward back to ~10.5s
+and wall back to 34148-34514 (matches E40 reference 34197.5/34246.8). Toggle definitive both ways.
+
+### *** STANDING RULE FOR ALL FUTURE WORK IN THIS REPO ***
+PHASES ARE NOT INDEPENDENT. They contend for shared cache + memory bandwidth.
+A phase-local speedup can be NET NEGATIVE.
+=> ALWAYS validate on decode_wall, NEVER on the phase= number alone.
+=> ALWAYS use a same-build A/B toggle (cross-build comparison hides this).
+Third time this pattern bit us: E39 (hoist regressed f(1) 2x), E40 Tier 1 (regressed default
+3.83%), E41 (regressed wall 11%).
+
+### Where things actually stand (60-token warm, M3 Max)
+  default : decode_wall ~38.5-38.7 s   md5 5d04890413ff539e802985ce8c727814  (bit-exact, unchanged)
+  flagged : decode_wall ~34.1-34.5 s   md5 7155bab905cbfa70aa06afa08f757cee  (~11% faster)
+  --fast-sparse-attn = attn_sparse (E37) + router (E40). Head NOT included (E41 reverted).
+
+### Landed and pushed tonight
+  E33 M15b 4-row matvec        1.38-1.42x cumulative decode, byte-identical
+  E34 loader depth             NEGATIVE, rejected (cold-cache artifact)
+  E34b cache-policy retraction methodology fix
+  E35 steady-state profile     expert_wait 17.9%->6.0%, found attn_sparse
+  E36 attn_sparse root cause   clang fmul+lane-extract+serial add
+  E37 attn_sparse NEON         4.53x phase, opt-in (not bit-exact)
+  E38 M4 gated out             zero model code, batch primitives re-dequantize
+  E39 dequant hoisting         bitwise-identical but f(1) 2x worse, lane closed
+  E40 router NEON              10.76x phase, opt-in, default provably untouched
+  E41 LM head NEON             REVERTED (cache pollution, +11% wall)
+
+### Remaining candidates (all now suspect under the standing rule)
+  hc_norm    4.0%  0.3245 ms/call x 18834
+  indexer    2.5%  0.8146 ms/call x 4599
+  compressor 1.9%  0.3246 ms/call x 8979
+  These are SMALL and all read/write large arrays -> high risk of the same cache-pollution
+  backfire for little upside. Recommend NOT pursuing without a same-build A/B harness first.
+  expert_forward 26.6% is the only phase big enough to be worth real risk -> GPU/Metal lane.
+
+## Questions For User (ASK AT "good morning"/"good afternoon")
+Q3. --fast-sparse-attn now covers attn_sparse + router. Name is misleading. Rename to
+    --fast-kernels with --fast-sparse-attn kept as a hidden compat alias, or leave it?
+Q4. expert_forward is 26.6% of decode and the only phase big enough to justify real risk.
+    Metal/GPU offload (coli_v4_metal_expert_forward exists, backend_metal_v4.o builds) is the
+    largest remaining lane but is big and risky. Open it, or stay on CPU?
+Q5. Given E41, should I build a same-build A/B toggle harness (env var selecting kernel variant
+    at runtime) so future kernel work can be measured without cross-build confounds? I think
+    yes - it would have caught E41 in one run instead of six.
