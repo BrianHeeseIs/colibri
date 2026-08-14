@@ -335,3 +335,50 @@ ABANDON, and T2a was precisely the model code the gate existed to avoid writing.
 is the gate working, not work left undone.
 T1a's intent (a byte-identical harness) is already satisfied in practice: golden md5
 5d04890413ff539e802985ce8c727814 + the multi-line block extractor, used as the gate in E37/E40/E41.
+
+================================================================================
+# ULW SESSION 2 — 2026-08-14 12:05 — Metal cache-heating + cache preservation
+================================================================================
+
+## USER REQUEST (verbatim intent)
+1. Take cache heating into account for the Metal tests BEFORE writing Metal off.
+2. Look into ways of preserving pre-heated cache between runs to save time.
+   Implement if feasible WITHOUT affecting test scores. Maybe a ram disk.
+
+## WHY (1) IS A REAL CONCERN — user is right, I may have mis-concluded E43
+E43 measured METAL=1 as 2.67x slower on expert_forward (5188.6 -> 13841.8 ms).
+BUT: I have been burned by cold-cache artifacts TWICE this campaign already
+  - E34: loader-depth "2.3x win" was 100% cold-cache artifact on the first sweep row
+  - E41-adjacent: cold first-run-after-rebuild inflated numbers repeatedly
+The METAL=1 runs REQUIRED a full rebuild (rm -f c/*.o) immediately before them.
+=> The METAL=1 measurement may include cold page-cache / cold expert-cache effects
+   that the METAL=0 run (done later, warmer) did not pay.
+ALSO: metal reject histogram showed layout=5455 rejects => 43.1% of experts fall back
+to CPU. A mixed GPU/CPU run may thrash the expert cache differently than pure CPU.
+=> MUST re-measure with rigorous interleaved warm A/B, same binary, multiple runs.
+
+## KNOWN COLD/WARM MECHANICS IN THIS ENGINE (established earlier)
+- expert cache: 164 slots/layer x 43 layers = 7052 records, 13.37 MB each, ~87.81 GiB
+- .coli_usage (29127 bytes) drives autopin; I freeze/restore it around every run
+- hit_rate rises 34% (5-tok cold) -> 76% (70-tok) -> 86% (184-tok) -> 88.4% (220-tok)
+- cache is only 24.7% full after a 17-token run => short runs are ALL compulsory misses
+- model load itself is cheap (~0.5s); ttft excludes it (timer :8175->:8218)
+- 60-token run reads ~24 GB; 220-token reads ~96 GB
+=> Between-process, the OS page cache holds the safetensors shards; that is the thing
+   a ram disk / preload could preserve. The in-process expert slab cache dies with the
+   process.
+
+## SCENARIO CONTRACT (binding, both artifacts required per scenario)
+S1. Metal fair-fight: interleaved warm A/B, same binary, N>=3 each, cache-state equalized.
+    PASS = a defensible verdict on METAL=1 vs 0 with variance reported.
+    Artifact: raw per-run decode_wall/expert_forward + metal reject counters.
+S2. Cache-preservation mechanism identified + measured for time saved.
+    PASS = measured warmup-time delta with mechanism on vs off.
+    Artifact: wall-clock of a fixed benchmark sequence with/without.
+S3. Score neutrality: preservation must NOT change measured results.
+    PASS = golden md5 5d04890413ff539e802985ce8c727814 unchanged AND
+           decode_wall within run-to-run variance of the no-mechanism baseline.
+    Artifact: md5 + 3-run decode_wall distributions both ways.
+
+## Now
+Survey skills, fire parallel explores, then plan agent.
