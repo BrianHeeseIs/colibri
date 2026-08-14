@@ -43,7 +43,7 @@ the earlier draft double-counted them.
 `deepseek-v4-RESULTS.md` §12 cause #3: *"Unified memory gives the GPU no bandwidth advantage. Both
 processors read the same DRAM."*
 
-Measured (`/tmp/bwprobe.m`, one 4 GB `MTLResourceStorageModeShared` buffer, same physical pages):
+Measured (`validation/probes/bwprobe.m`, one 4 GB `MTLResourceStorageModeShared` buffer, same physical pages):
 
 | path | streaming read |
 |---|---|
@@ -60,7 +60,7 @@ scalar GCD scan and the GPU side is an ideal hot linear read, so the ratio is an
 best case that the MoE path never reaches (the MoE path runs at 4.58 GB/s effective — §2.4). It is
 **excluded from all speedup arithmetic in §6/§7.**
 
-**Hardened against the dead-code-elimination objection** (`/tmp/bw2.m`): the GPU kernel was rewritten
+**Hardened against the dead-code-elimination objection** (`validation/probes/bw2.m`): the GPU kernel was rewritten
 to perform an *unconditional* `out[gid] = sum` write, and both sides are checksum-verified against the
 known exact sum. The GPU checksum matches **exactly** at every size, proving the loads were not
 eliminated. The ratio is stable across sizes far larger than any cache:
@@ -118,7 +118,7 @@ restructure.**
 
 ### 2.1 Why S=1 loses — measured on the real shape
 
-`/tmp/sweep_mxfp4.m`, `/tmp/sweep2.m`, `/tmp/cpu_mxfp4.c`. Real gate/up shape I=4096, O=2048,
+`validation/probes/sweep_mxfp4.m`, `validation/probes/sweep2.m`, `validation/probes/cpu_mxfp4.c`. Real gate/up shape I=4096, O=2048,
 MXFP4 block 32. **Microseconds per token for one matrix:**
 
 | S | CPU | GPU (simple) | GPU (tiled+uchar4) | best GPU | verdict |
@@ -678,12 +678,12 @@ COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_GROUPED_STATS=1 \
 
 ```bash
 # premise: CPU vs GPU bandwidth on one unified buffer
-clang -fobjc-arc -O2 -framework Metal -framework Foundation /tmp/bwprobe.m -o /tmp/bwprobe && /tmp/bwprobe 4096
+clang -fobjc-arc -O2 -framework Metal -framework Foundation validation/probes/bwprobe.m -o /tmp/bwprobe && /tmp/bwprobe 4096
 
 # S-sweep on the real gate/up shape
-clang -fobjc-arc -O2 -framework Metal -framework Foundation /tmp/sweep_mxfp4.m -o /tmp/sweep_mxfp4 && /tmp/sweep_mxfp4
-clang -fobjc-arc -O2 -framework Metal -framework Foundation /tmp/sweep2.m      -o /tmp/sweep2      && /tmp/sweep2
-clang -O3 /tmp/cpu_mxfp4.c -o /tmp/cpu_mxfp4 && /tmp/cpu_mxfp4
+clang -fobjc-arc -O2 -framework Metal -framework Foundation validation/probes/sweep_mxfp4.m -o /tmp/sweep_mxfp4 && /tmp/sweep_mxfp4
+clang -fobjc-arc -O2 -framework Metal -framework Foundation validation/probes/sweep2.m      -o /tmp/sweep2      && /tmp/sweep2
+clang -O3 validation/probes/cpu_mxfp4.c -o /tmp/cpu_mxfp4 && /tmp/cpu_mxfp4
 
 # measured N (engine's own log)
 env COLI_V4_PREFILL_PREFETCH=1 COLI_V4_SAVE_USAGE=0 ./c/deepseek_v4 models/deepseek-v4-flash \
