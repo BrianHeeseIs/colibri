@@ -8,8 +8,8 @@ successive mechanism hypotheses and identified the real target.
 ## Gates
 | gate | criterion | measured | result |
 |---|---|---|---|
-| **A** | QD8 >= 2x QD1 | **1.34** (QD1 5.227 GB/s, saturates 7.028 at QD4) | **STOP** — deep-queue design killed |
-| **B** | >= 15 % ttft on p256 | **2.70 %** | **FAIL** — feature kept anyway, by explicit user decision |
+| **GATE A** | QD8 >= 2x QD1 | **1.34** (QD1 5.227 GB/s, saturates 7.028 at QD4) | **STOP** — deep-queue design killed |
+| **GATE B** | >= 15 % ttft on p256 | **2.70 %** | **FAIL** — feature kept anyway, by explicit user decision |
 
 ## The attribution that ended the guessing (E54)
 p064, prefetch OFF, 43.544 s wall, sums to 100 % with 1.55 % residual:
