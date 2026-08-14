@@ -459,3 +459,20 @@ Only viable mechanism = PERSISTENT SERVE PROCESS (option 1). Proven working:
    COLD  (one-shot, per-process): hit_rate ~75-88%
    WARM  (serve, steady state):   hit_rate ~98.3%
    Must document decode throughput at BOTH, with confounds controlled.
+
+## T3 DONE 12:34 — build_toggle.sh
+.backlog/metal/build_toggle.sh builds BOTH variants from clean object state (encodes the
+rm -f c/*.o trap that produced wrong conclusions twice):
+  c/deepseek_v4.cpu    metal_syms=0   objects=26
+  c/deepseek_v4.metal  metal_syms=13  objects=27
+Default c/deepseek_v4 restored to the .cpu variant. Doc scaffolds created.
+
+## T4 DONE 12:40 — GOLDEN GATE PASSED + COLD operating point pinned
+Interleaved 3-run A/B, one-shot, 60-token, CPU binary. CSV: .backlog/results/T4_cold_oneshot.csv
+  default  decode_wall mean 39194.0 ms sd 107.2  hit_rate 77.97%  md5 5d048904 GOLDEN x3
+  fast     decode_wall mean 35284.3 ms sd 247.7  hit_rate 78.51%  md5 7155bab9
+  => --fast-kernels is 9.97% faster COLD.
+CAVEAT: absolute numbers ~2% above yesterday's reference (38554.8 / 34311.2) for BOTH configs
+=> consistent machine drift, not a regression. The A/B RATIO is the durable quantity
+   (9.97% today vs 11.01% yesterday). Always compare within a session.
+*** COLD OPERATING POINT = hit_rate ~78% *** (this is what every one-shot benchmark measures)
