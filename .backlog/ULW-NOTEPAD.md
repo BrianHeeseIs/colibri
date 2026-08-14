@@ -748,3 +748,28 @@ Fire 2 explores (kernel internals; packing mechanics+cost) -> plan agent -> dele
   S1 microbench must confirm the v17_fallback vs rows16_v10 gap at real shapes.
   If the measured kernel gap is <1.5x, the premise is wrong and the residual is elsewhere
   (pack-on-miss, slab first-touch page faults, mutex, buffered scale reads) -> STOP.
+
+## 19:52 — USER: instrument the miss path directly. NO MORE HYPOTHESES.
+Three mechanism errors in a row (E46 shaders / E51 SSD wait / E53 kernel). Outcome
+measurements held every time; explanations did not. Root cause of MY error: hypothesising
+mechanism from arithmetic on AGGREGATE numbers instead of measuring inside the engine.
+
+### RULE FOR THIS LANE (binding)
+Measure FIRST, attribute SECOND, propose a fix ONLY from attribution data.
+The instrumentation must be NEUTRAL: time every stage, do not pre-judge which one matters.
+No fix may be proposed until the attribution sums to ~100% of the measured prefill wall.
+
+### Surviving facts (have never been retracted)
+- prefill miss rate 23.6% (4257/18060) vs steady decode 5-12%
+- the 87.81 GiB expert cache FILLS during prefill
+- store mutex is held for: slot select, slab alloc, publish, and pack (read is outside it)
+- engine parallelises expert matmul via OpenMP; single-thread kernel 4.0-4.4 ms/expert but
+  engine shows 0.41 (decode) / 1.96 (prefill) ms/op => decode gets ~10.8x, prefill ~2.3x.
+  *** THAT THREAD-SCALING GAP IS ITSELF UNEXPLAINED AND MUST BE MEASURED TOO. ***
+- prefetch (default OFF) currently buys 7-9.5%; golden md5 holds ON and OFF
+
+### Stages to instrument (miss path + hit path + contention)
+  A slot select (under mutex)      D publish/relock (under mutex)
+  B slab alloc + FIRST TOUCH       E pack (under mutex, pinned only)
+  C SSD read (outside mutex)       F mutex WAIT (time blocked acquiring) <- serialization proof
+  G expert compute (the matmul)    H route (already cached under prefetch)
