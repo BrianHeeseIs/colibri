@@ -333,9 +333,17 @@ achievable.** The design must therefore specify, and T6 must implement:
    164 slots, the loader cannot fetch wave N+1 at all** — §4.8 and §4.9 would contradict each other.
    Therefore:
    ```
-   compute_wave_size <= capacity - loader_reserve      (loader_reserve > 0, tunable, default 16)
-   wave_count        =  ceil(n_unique / compute_wave_size)
+   configured_reserve = 16                      /* tunable */
+   effective_reserve  = min(configured_reserve, capacity - 1)   /* MUST clamp - see below */
+   compute_wave_size  = capacity - effective_reserve            /* always >= 1 */
+   wave_count         = ceil(n_unique / compute_wave_size)
    ```
+   **The clamp is mandatory, not defensive.** `slots_per_layer` floors at `routed_topk` = **6**
+   (`:1022-1023`) and `minimum_slots` is `min(experts_per_layer, 6)` (`:6692`), so a small `--ram`
+   can legally yield `capacity = 6`. An unclamped `capacity - 16` is **negative**, making
+   `compute_wave_size <= 0` and the `ceil` division invalid. **Degenerate case:** if
+   `compute_wave_size < 2` there is no room to both compute and prefetch — disable the batched path
+   for that layer and fall back to S=1, logging the reason. Do not attempt single-slot waves.
    Each wave is one command buffer; its leases are released after its wait. Wave boundaries must not
    break the ascending-expert-id combine (§4.5) — accumulate into a **persistent per-token fp32
    accumulator across waves, visited in ascending id order**.
@@ -512,7 +520,7 @@ Serialisation: T4/T5 both touch the .metal source -> sequential within Wave 2 if
 | **T3** | Gather/permute (sort, counts, offsets, CSR) | T1 | sorted uniques **strictly ascending**; `permute∘unpermute == identity`; per-token slots == topk |
 | **T4** | Batched FP4 grouped-matvec kernel | T1,T2 | == oracle **0 ULP at S=1 AND S=8**; threadgroup mem ≤ 32768 B; `bench_matmul.m` reproduces **≥7x@S=8** — **turns T1 GREEN** |
 | **T5** | Per-token per-128col fp8 QDQ + UE8M0 bit-trick | T1,T2 | 2-token differing-dynamic-range probe → independent scales, 0 ULP; UE8M0 v=0/255 match `quant.h` |
-| **T6** | Host glue: one command buffer + zero-copy slab | T2,T3,T4,T5 | seam returns 0; 0 ULP @S=8; **dispatch count == n_unique** (~94, not 384); **exactly ONE** `waitUntilCompleted` per chunk |
+| **T6** | Host glue: per-wave command buffers + zero-copy slab | T2,T3,T4,T5 | seam returns 0; 0 ULP @S=8; `dispatches == n_unique` (~94, not 384); **`waits == waves`** (per WAVE, not per chunk); `leaked_leases == 0`; rollback exercised via `COLI_V4_TEST_FAIL_ACQUIRE_AT` |
 | **T7** | Ascending-expert-id fp32 combine | T3,T6 | token routed {5,2,9,1} visits **1,2,5,9**; bit-identical to S=1 `moe_token_pipeline` (0 ULP) |
 | **T8** | Wire at `:5110-5143` (incl. batch-block phase split + route-metadata separation) | T6,T7 | `bench/golden.sh` prints `PASS golden md5=5d04890413ff539e802985ce8c727814`; `python3 c/tests/test_deepseek_v4_tiny.py` exit 0; `N=3 ./bench/ab.sh` interleaved p064 **`delta <= -10.71%`** (= 1.12x speedup; ab.sh sign is negative-is-faster); engine `phys_footprint`+non-engine ≤ ~100 GB |
 | **T9** | Chunk-cap lever 64→128→256 | T8 | each value builds + token-exact; record `{chunk, measured_N, tok_s, rss_gb}`; winner by tok/s subject to RSS ≤ ~100 GB |
@@ -541,7 +549,7 @@ hardware + commit + exact command + raw log, and report `phys_footprint`/RSS/gap
 | **E10** | hit vs miss split | instrumented | tok/s on hits only | isolates the §2.4 ceiling; quantifies the real headroom |
 | **E11** | kernel headroom | grouped kernel | GFLOP/s vs fp32 peak | current probes are 3 % of peak — measure how far an optimised kernel goes |
 | **E12** | SSD wait time | batched vs S=1 | ms of loader wait per chunk | **must not grow** vs baseline (guards §4.9) |
-| **E13** | CPU-only grouping (T-1) | no GPU | warm prefill delta | the K0 kill test — ≥1.05x to proceed |
+| **E13** | CPU-only grouping (T-1) | no GPU | **non-kernel grouping overhead fraction** (`moe_group_overhead_ns / moe_chunk_ns`) | the K0 gate — **< 0.167** to proceed. *Not* a CPU speedup test: CPU and GPU scale differently (§2.1), so CPU throughput cannot gate the Metal work. |
 
 ---
 
@@ -552,14 +560,14 @@ Every task's QA is a copy-pasteable command with a binary observable. `$MODEL=mo
 
 | task | command | PASS is exactly |
 |---|---|---|
-| **T-1** | `./bench/golden.sh ./c/deepseek_v4` then `N=3 ./bench/ab.sh "COLI_V4_MOE_GROUPED=1" ./c/deepseek_v4` | `PASS golden md5=5d04890413ff539e802985ce8c727814` AND recorded overhead fraction < 16.7 % (see K0). **Note the sign:** `ab.sh` prints `100*(on-off)/off`, so a speedup is a **NEGATIVE** delta. |
+| **T-1** | `./bench/golden.sh ./c/deepseek_v4`; then the **K0 overhead command** in the fenced block below (`ab.sh` alone is insufficient — it reports total TTFT, not gather/sort/permute/wave cost); optionally `N=3 ./bench/ab.sh "COLI_V4_MOE_GROUPED=1" ./c/deepseek_v4` for context | `PASS golden md5=5d04890413ff539e802985ce8c727814` AND `moe_group_overhead_ns / moe_chunk_ns < 0.167`. **Sign note for the optional A/B:** `ab.sh` prints `100*(on-off)/off`, so a speedup is **NEGATIVE**. |
 | **T0** | `cd c && make -f Makefile.deepseek-v4 METAL=1 2>&1 \| tail -3; ls build/metal-v4/*.air \| wc -l` | link succeeds; `nm c/deepseek_v4 \| grep -c metal` > 0; `md5 -q c/deepseek_v4` recorded to `artifacts/metal_baseline.json` |
 | **T1** | `clang -fobjc-arc -O2 -framework Metal -framework Foundation validation/metal/probe_batched_moe.m -o /tmp/pb && /tmp/pb` | exits **nonzero**, prints `RED: no batched path`; and `S=1 self-check 0 ULP` |
 | **T2** | `cd c && make -f Makefile.deepseek-v4 METAL=1 && ls *.o \| wc -l` and `make -f Makefile.deepseek-v4 deepseek-v4-clean && make -f Makefile.deepseek-v4 && ls *.o \| wc -l` | `27` then `26`; golden md5 unchanged |
 | **T3** | `clang -O2 validation/metal/test_permute.c -o /tmp/tp && /tmp/tp` | prints `sorted ascending OK`, `permute∘unpermute == identity OK`, exit 0 |
 | **T4** | `/tmp/pb` (from T1) and `./validation/metal/bench_matmul 20` | `/tmp/pb` exits **0** with `0 ULP at S=1` and `0 ULP at S=8`; bench prints gate/up S=8 speedup ≥ 7x |
 | **T5** | `clang -fobjc-arc -O2 -framework Metal -framework Foundation validation/metal/probe_fp8_twotoken.m -o /tmp/p5 && /tmp/p5` | `token0 scale != token1 scale` where required, `0 ULP`, exit 0 |
-| **T6** | `COLI_V4_METAL=1 COLI_V4_METAL_STATS=1 ./c/deepseek_v4 $MODEL "$P64" --max-tokens 1 --memory-gb 96 2>&1 \| grep -E 'metal_(dispatches\|waves\|waits\|rollbacks\|leaked)'` | `metal_dispatches=` ≈ Σ per-chunk `n_unique` (~94×86), **not** 384×86; **`metal_waves == metal_waits`**; `metal_rollbacks` consistent with injected faults; **`metal_leaked_leases=0`**. *T6 must ADD these counters — today only `metal_dispatches` exists (`:10065`).* |
+| **T6** | see fenced block below (T6-a normal, T6-b fault injection) | **`metal_waves == metal_waits`** (one command buffer and one wait **per wave**, NOT per chunk); `metal_dispatches` ≈ Σ per-chunk `n_unique` (~94×86), **not** 384×86; **`metal_leaked_leases=0`**. *T6 must ADD these counters — today only `metal_dispatches` exists (`:10065`).* |
 | **T7** | `/tmp/pb --combine-order` | prints visit order `1,2,5,9` for routing `{5,2,9,1}`; near-cancellation case `0 ULP` |
 | **T8** | `./bench/golden.sh ./c/deepseek_v4` ; `python3 c/tests/test_deepseek_v4_tiny.py --binary ./c/deepseek_v4 --fixture ./c/deepseek_v4_tiny` ; `N=3 ./bench/ab.sh "COLI_V4_MOE_GROUPED=1" ./c/deepseek_v4` | `PASS golden md5=5d04890413ff539e802985ce8c727814`; tiny oracle exit 0; **`delta <= -10.71%`** (= 1.12x; ab.sh reports `100*(on-off)/off`, so faster is negative) |
 | **T9** | for `C in 64 128 256`: rebuild with cap C; `./bench/golden.sh`; **`V4_MTP=1 V4_DRAFT=4 ./bench/golden.sh`** (DSpark ON — required, both vars, `:7924`); `N=3 ./bench/ab.sh` | golden PASS at **every** C **with DSpark OFF and ON**; CSV row `{chunk,N,tok_s,rss_gb}` per C; ASan clean (guards the `sums[64]` overflow at `:12355`) |
@@ -570,6 +578,34 @@ Every task's QA is a copy-pasteable command with a binary observable. `$MODEL=mo
 **Note on `bench_matmul.m`:** it **exists** at `validation/metal/bench_matmul.m` (7684 B) with a
 prebuilt `validation/metal/bench_matmul`. A review claimed it was missing; that claim was checked
 and is incorrect.
+
+### T6 QA commands (fenced to avoid markdown pipe escaping)
+
+```bash
+# T6-a: normal path - assert per-WAVE synchronisation and zero leaks
+COLI_V4_METAL=1 COLI_V4_METAL_STATS=1 COLI_V4_MOE_GROUPED=1 \
+  ./c/deepseek_v4 models/deepseek-v4-flash "$(cat .backlog/prefill_prompts/p064.txt)" \
+  --max-tokens 1 --memory-gb 96 2>&1 \
+  | grep -E 'metal_(dispatches|waves|waits|rollbacks|leaked_leases)='
+# PASS: metal_waves == metal_waits ; metal_leaked_leases=0 ; metal_dispatches ~= sum(n_unique)
+
+# T6-b: ROLLBACK path - fault-inject a mid-wave acquisition failure (this is the ONLY way
+# rollback is exercised; lowering --ram exercises wave SPLITTING, not rollback)
+COLI_V4_METAL=1 COLI_V4_METAL_STATS=1 COLI_V4_MOE_GROUPED=1 \
+  COLI_V4_TEST_FAIL_ACQUIRE_AT=3 \
+  ./c/deepseek_v4 models/deepseek-v4-flash "$(cat .backlog/prefill_prompts/p064.txt)" \
+  --max-tokens 1 --memory-gb 96 2>&1 \
+  | grep -E 'metal_(rollbacks|leaked_leases)='
+# PASS: metal_rollbacks > 0 ; metal_leaked_leases=0 ; and bench/golden.sh still md5-stable
+# (proves the S=1 fallback after rollback is bit-identical)
+
+# T-1 / K0: measure NON-KERNEL grouping overhead, which ab.sh cannot report
+COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_GROUPED_STATS=1 \
+  ./c/deepseek_v4 models/deepseek-v4-flash "$(cat .backlog/prefill_prompts/p064.txt)" \
+  --max-tokens 1 --memory-gb 96 2>&1 \
+  | grep -E 'moe_group_(overhead_ns|chunk_ns)='
+# PASS: overhead_ns / chunk_ns < 0.167   (= 1 - 1/1.20, the section-0 ceiling)
+```
 
 ## 7c. Verification fixtures that the naive tests would MISS
 
@@ -592,7 +628,7 @@ and is incorrect.
 | threadgroup mem > 32768 B at larger chunk | Med | kernel fails to launch | T4 static assert; T9 guards |
 | RSS > ~100 GB at chunk=256 | Med | host thrash, invalid runs | T9 residency gate; cap by residency, not speed |
 | route_cache un-gating changes prefetch behaviour | Med | regression | T8 enables for the batched path only; CPU fallback preserved |
-| N too small to pay (measured 4.10) | **Med** | plan yields <1.3x | K3 kill criterion; T9 chunk lever is the counter-move |
+| N too small to pay (measured 4.10) | **Med** | gain lands below the 1.12x gate | K3 kill criterion; T9 chunk lever is the counter-move |
 | Miss path dominates so end-to-end gain is small | **High** | headline underwhelms | §2.4 + §0 ceiling stated up front; E10 isolates hits; report honestly |
 | **`n_unique` (max 188) exceeds slot capacity (164)** | **High** | one-buffer design fails | §4.8 preflight + expert waves + rollback; T6 acceptance |
 | **Acquire-all destroys SSD/compute overlap → net SLOWER** | **High** | plan inverts its own goal | §4.9 pipelined waves; **E12** measures SSD wait directly |
