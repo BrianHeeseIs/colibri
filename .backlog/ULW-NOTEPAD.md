@@ -605,3 +605,30 @@ E45 now (it is the running critical path). E46 after T7 provides C. E47 only if 
 Expected value ranking, honestly: E45 (methodology, unlocks everything) > E46 (<=16% of prefill,
 big for long prompts) > decode batching (3.7-6.4% overall) > E47 (multiplier on a thing that may
 not exist yet).
+
+================================================================================
+# ULW SESSION 3 — 2026-08-14 15:08 — E48 reversal -> verify caveat -> BUILD batched Metal
+================================================================================
+## USER DECISIONS (question tool, 15:08)
+- Direction: "Verify the caveat, then build batched Metal". User explicitly wants fast-metal
+  execution on this Mac. Hardening parked until proven results. Prefill I/O after Metal.
+- Earlier: quality validation (task B) still queued after Metal work.
+
+## E48 state (committed 6c5114b)
+- 158x gate/up gap = FIRST-TOUCH page-mapping/coherency, NOT compute. Shaders healthy 2.35 TFLOP/s.
+- Corrected C ~= 0.086ms, R ~= 1.53ms -> batching gate PASSES.
+  Projections: decode batch-6 -> 0.341 ms/exp = 2.1x FASTER than CPU 0.719
+              prefill batch-64 -> 0.110 ms/exp = 6.5x FASTER
+- CAVEAT to verify: first-touch pool (~13s/first ~14k dispatches) must be per-slab-ONE-TIME,
+  not recurring with evictions.
+- SIGKILL incident: cp onto existing executable = stale vnode signature cache -> Killed:9.
+  ALWAYS rm before cp for binaries. build_toggle.sh hardened.
+
+## VERIFICATION DESIGN (marginal-cost method)
+Cross-length AVERAGE c_gpu is confounded (c_cpu itself drifted 0.41@30tok -> 0.73@300tok,
+likely rows16 hot-pack distribution shifting). Use MARGINAL cost instead:
+  marginal ef/dispatch between 100- and 500-token runs cancels ALL one-time pools.
+Runs needed (serial, same .metal binary, non-profile, STATS on): 4 = {100,500} x {METAL=0,1}.
+PASS if marginal Metal mixed cost/dispatch approaches (1-f)*c_cpu_marginal + f*(R+C)
+  with f=ok fraction ~0.467, i.e. clearly BELOW the 300-token average c_gpu=3.55.
+FAIL if marginal cost stays ~3.5 -> pool recurs with evictions -> projection degrades; stop.
