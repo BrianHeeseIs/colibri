@@ -314,3 +314,24 @@ Q5. Build a same-build A/B harness (env var selecting kernel variant at runtime)
 Q6. Should the opt-in reassociated kernels become the DEFAULT? They are 11.01% faster and the
     output difference is rounding-level, not quality-level. Currently default is bit-exact and
     the win is opt-in only.
+
+## 2026-08-14 04:16 — T0c CLOSED (was the last genuinely-unfinished item)
+Re-binned the preserved routing trace (.backlog/m4_traces/*.gz) at chunk 64/128/184:
+  chunk  meanS  %sel S>=8   projCUR  projHOIST  projBEST(hybrid min)
+     64   3.96      46.9%    1.186x     1.008x   1.217x
+    128   5.08      58.4%    1.203x     1.081x   1.246x
+    184   7.65      72.9%    1.224x     1.182x   1.283x
+Tripling chunk = +5.4% projected for 2.9x buffer memory. Saturates because speedup_op(64)=1.479
+is the kernel ceiling. And 1.283x charges NOTHING for gather/scatter, hybrid dispatch, or E41
+cache contention. => G0 ABANDON verdict CONFIRMED, not overturned. M4 stays dead.
+
+M5 status corrected: its telemetry gate (>=30% selections in S>=8) IS MET (46.9% @64, 72.9% @184).
+M5 is therefore BLOCKED ON THE METAL PATH NOT FIRING (E42), not on routing data. That is a user
+scope decision (Q4), so M5 is not actionable tonight.
+
+## TODO LIST RECONCILED
+All M4 downstream tasks (T1a/T1b/T2a/T3a-c/G3) are CANCELLED-BY-GATE, not skipped: G0 decided
+ABANDON, and T2a was precisely the model code the gate existed to avoid writing. Not writing it
+is the gate working, not work left undone.
+T1a's intent (a byte-identical harness) is already satisfied in practice: golden md5
+5d04890413ff539e802985ce8c727814 + the multi-line block extractor, used as the gate in E37/E40/E41.
