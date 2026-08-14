@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Runs deepseek_v4 with the REASSOCIATED-FP KERNEL SET enabled (--fast-sparse-attn).
+# Runs deepseek_v4 with every REASSOCIATED-FP KERNEL enabled (--fast-kernels).
 #
-# NOTE: the flag is named --fast-sparse-attn for backwards compatibility, but it now
-# enables ALL reassociated-FP kernels, not just sparse attention:
+# The historical filename stays because docs and benchmark scripts reference it. The flag enables:
 #   * attn_sparse : hand NEON, 4 independent FMA accumulators   (E37)  ~4.5x on that phase
 #   * router      : hand NEON, 4 independent FMA accumulators   (E40)  ~10.8x on that phase
 #
@@ -16,8 +15,12 @@
 #
 # Reference md5s (60 tokens, MoE-routing prompt, multi-line block extract):
 #   default             5d04890413ff539e802985ce8c727814
-#   --fast-sparse-attn  7155bab905cbfa70aa06afa08f757cee
+#   --fast-kernels      7155bab905cbfa70aa06afa08f757cee
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "warning: reassociated-FP kernels enabled (attn_sparse + router); output is NOT bit-identical to default" >&2
-exec "$here/c/deepseek_v4" "$@" --fast-sparse-attn
+if [[ -v COLI_V4_KERNELS ]]; then
+  echo "warning: COLI_V4_KERNELS=$COLI_V4_KERNELS overrides wrapper --fast-kernels selection; active reassociated-FP kernels change output" >&2
+else
+  echo "warning: reassociated-FP kernels enabled (attn_sparse + router); output is NOT bit-identical to default" >&2
+fi
+exec "$here/c/deepseek_v4" "$@" --fast-kernels

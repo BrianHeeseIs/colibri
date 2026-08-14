@@ -22,6 +22,20 @@ enum {
     COLI_V4_PROFILE_COUNT,
 };
 
+#define COLI_V4_KERNEL_LIST(X) \
+    X(ATTN_SPARSE, "attn_sparse", 0) \
+    X(ROUTER, "router", 1)
+
+enum {
+#define COLI_V4_KERNEL_ENUM(symbol, name, bit) COLI_V4_KERNEL_##symbol = 1u << bit,
+    COLI_V4_KERNEL_LIST(COLI_V4_KERNEL_ENUM)
+#undef COLI_V4_KERNEL_ENUM
+    COLI_V4_KERNEL_ALL = 0
+#define COLI_V4_KERNEL_ALL_BIT(symbol, name, bit) | COLI_V4_KERNEL_##symbol
+        COLI_V4_KERNEL_LIST(COLI_V4_KERNEL_ALL_BIT)
+#undef COLI_V4_KERNEL_ALL_BIT
+};
+
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
 
@@ -3059,20 +3073,20 @@ int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state) {
 #include "native_quant.h"
 
 #if defined(__aarch64__)
-static int fast_reassociated_kernels;
+static unsigned v4_active_kernels;
 #endif
 
-void coli_v4_sparse_attention_set_fast_reassociated(int enabled) {
+void coli_v4_kernels_set_active(unsigned kernels) {
 #if defined(__aarch64__)
-    fast_reassociated_kernels = enabled != 0;
+    v4_active_kernels = kernels;
 #else
-    (void)enabled;
+    (void)kernels;
 #endif
 }
 
-int coli_v4_fast_reassociated_kernels(void) {
+unsigned coli_v4_kernels_active(void) {
 #if defined(__aarch64__)
-    return fast_reassociated_kernels;
+    return v4_active_kernels;
 #else
     return 0;
 #endif
@@ -3146,7 +3160,7 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
             const float *key = kv + (size_t)index * head_dimension;
             float score;
 #if defined(__aarch64__)
-            if (fast_reassociated_kernels)
+            if (v4_active_kernels & COLI_V4_KERNEL_ATTN_SPARSE)
                 score = sparse_attention_dot_fast(query, key, head_dimension);
             else
 #endif
@@ -6635,7 +6649,7 @@ static float route_softplus(float value) {
 }
 
 #if defined(__aarch64__)
-extern int coli_v4_fast_reassociated_kernels(void);
+extern unsigned coli_v4_kernels_active(void);
 
 static inline float route_bf16_dot_fast(const uint16_t *row,
                                         const float *hidden, int count) {
@@ -6737,7 +6751,7 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale) {
 #if defined(__aarch64__)
-    if (coli_v4_fast_reassociated_kernels())
+    if (coli_v4_kernels_active() & COLI_V4_KERNEL_ROUTER)
         return route_bf16_fast(weights, indices, hidden, gate, bias,
                                forced_indices, experts, dimension, topk,
                                route_scale);
@@ -7919,12 +7933,13 @@ typedef struct {
     int greedy;
     int stop_sentence;
     int no_dspark;
-    int fast_sparse_attn;
+    unsigned requested_kernels;
     double memory_gib;
     ColiDeepSeekV4PromptMode prompt_mode;
 } V4CliOptions;
 
-extern void coli_v4_sparse_attention_set_fast_reassociated(int enabled);
+extern void coli_v4_kernels_set_active(unsigned kernels);
+extern unsigned coli_v4_kernels_active(void);
 
 static void v4_cli_usage(FILE *stream, const char *program) {
     fprintf(stream,
@@ -7939,7 +7954,7 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "  --raw-prompt         bypass the default V4 chat template\n"
         "  --stop-sentence      stop after the first sentence terminator\n"
         "  --no-dspark          disable verified speculative drafting\n"
-        "  --fast-sparse-attn   faster reassociated-FP kernels (arm64; changes output)\n"
+        "  --fast-kernels       all reassociated-FP kernels (arm64; changes output)\n"
         "  --oracle FILE        validate against an oracle JSON fixture\n"
         "  --teacher-forcing N  oracle: compare top-1 on N prompt positions\n"
         "  --greedy N           oracle: compare N greedy continuation tokens\n"
@@ -8001,6 +8016,68 @@ static int v4_cli_memory(const char *text, double *output) {
     return 0;
 }
 
+static void v4_kernel_names_emit(FILE *stream) {
+    int emitted = 0;
+#define COLI_V4_KERNEL_NAME(symbol, name, bit) \
+    fprintf(stream, "%s%s", emitted ? "," : "", name); emitted = 1;
+    COLI_V4_KERNEL_LIST(COLI_V4_KERNEL_NAME)
+#undef COLI_V4_KERNEL_NAME
+    fputs(",all,none\n", stream);
+}
+
+static int v4_kernel_mask_parse(const char *text, unsigned *output) {
+    if (!strcmp(text, "all")) {
+        *output = COLI_V4_KERNEL_ALL;
+        return 0;
+    }
+    if (!strcmp(text, "none")) {
+        *output = 0;
+        return 0;
+    }
+    if (!*text || text[strlen(text) - 1] == ',') {
+        fputs("COLI_V4_KERNELS: empty kernel name; valid names: ", stderr);
+        v4_kernel_names_emit(stderr);
+        return -1;
+    }
+    unsigned kernels = 0;
+    const char *cursor = text;
+    while (*cursor) {
+        const char *comma = strchr(cursor, ',');
+        size_t length = comma ? (size_t)(comma - cursor) : strlen(cursor);
+        unsigned matched = 0;
+#define COLI_V4_KERNEL_MATCH(symbol, name, bit) \
+        if (length == sizeof(name) - 1 && !memcmp(cursor, name, length)) \
+            matched = COLI_V4_KERNEL_##symbol;
+        COLI_V4_KERNEL_LIST(COLI_V4_KERNEL_MATCH)
+#undef COLI_V4_KERNEL_MATCH
+        if (!matched) {
+            fprintf(stderr, "COLI_V4_KERNELS: unknown kernel '%.*s'; valid names: ",
+                    (int)length, cursor);
+            v4_kernel_names_emit(stderr);
+            return -1;
+        }
+        kernels |= matched;
+        if (!comma) break;
+        cursor = comma + 1;
+    }
+    *output = kernels;
+    return 0;
+}
+
+static void v4_kernels_emit_active(void) {
+    unsigned kernels = coli_v4_kernels_active();
+    fputs("v4_kernels active=", stderr);
+    int emitted = 0;
+#define COLI_V4_KERNEL_EMIT(symbol, name, bit) \
+    if (kernels & COLI_V4_KERNEL_##symbol) { \
+        fprintf(stderr, "%s%s", emitted ? "," : "", name); \
+        emitted = 1; \
+    }
+    COLI_V4_KERNEL_LIST(COLI_V4_KERNEL_EMIT)
+#undef COLI_V4_KERNEL_EMIT
+    fputs(emitted ? "\n" : "none\n", stderr);
+}
+
 static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
     if (!options || argc < 3) return -1;
     memset(options, 0, sizeof(*options));
@@ -8037,8 +8114,9 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
             options->stop_sentence = 1;
         } else if (!strcmp(option, "--no-dspark")) {
             options->no_dspark = 1;
-        } else if (!strcmp(option, "--fast-sparse-attn")) {
-            options->fast_sparse_attn = 1;
+        } else if (!strcmp(option, "--fast-kernels") ||
+                   !strcmp(option, "--fast-sparse-attn")) {
+            options->requested_kernels = COLI_V4_KERNEL_ALL;
         } else if (!strcmp(option, "--oracle")) {
             if (++i == argc || !argv[i][0]) return -1;
             options->oracle_path = argv[i];
@@ -8068,7 +8146,11 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
     } else if (!options->prompt) {
         return -1;
     }
-    coli_v4_sparse_attention_set_fast_reassociated(options->fast_sparse_attn);
+    const char *kernel_environment = getenv("COLI_V4_KERNELS");
+    if (kernel_environment &&
+        v4_kernel_mask_parse(kernel_environment, &options->requested_kernels))
+        return -1;
+    coli_v4_kernels_set_active(options->requested_kernels);
     return 0;
 }
 
@@ -9209,17 +9291,13 @@ int main(int argc, char **argv) {
         v4_cli_usage(stderr, argc ? argv[0] : "deepseek-v4");
         return 2;
     }
-#if defined(__aarch64__)
-    if (cli.fast_sparse_attn)
+#if !defined(__aarch64__)
+    if (cli.requested_kernels)
         fprintf(stderr,
-                "v4_sparse_attn mode=fast-reassociated "
-                "warning=output-not-bit-identical-to-default\n");
-#else
-    if (cli.fast_sparse_attn)
-        fprintf(stderr,
-                "v4_sparse_attn mode=ordered "
+                "v4_kernels mode=ordered "
                 "warning=fast-reassociated-unavailable-on-this-architecture\n");
 #endif
+    v4_kernels_emit_active();
     int max_new = cli.max_new_tokens;
     int stop_sentence = cli.stop_sentence;
 

@@ -1542,3 +1542,42 @@ experts while the CPU path already runs at 36.5 GMAC/s. Poor expected value for 
 
 Diagnostics and the metallib path fix are kept (inert by default). Default build re-verified:
 26 objects, 0 Metal symbols, golden md5 `5d04890413ff539e802985ce8c727814`.
+
+---
+
+## E44. Per-kernel A/B harness + flag rename (tooling)
+
+Built in response to E41, which cost **six benchmark runs across two rebuilds** to isolate a
+phase-local win that was an 11 % wall regression — because toggling one kernel required a rebuild
+and cross-build comparison hid the cache-contention effect.
+
+**`COLI_V4_KERNELS`** now selects reassociated kernels individually at runtime from a bitmask
+registry: `attn_sparse`, `router`, plus `all` / `none`. Parsed once before any thread is created
+into a write-once file-scope static — no per-call `getenv`, no mutex, no mutable global in the hot
+path. Non-arm64 always takes the ordered path. Every run prints `v4_kernels active=...` so a
+benchmark transcript is self-describing. Unknown names **hard-fail** (exit 2) rather than silently
+no-op, since a typo would otherwise let someone "measure" a kernel that never ran — the exact
+failure this tool exists to prevent.
+
+CLI: `--fast-kernels` is now the documented flag; `--fast-sparse-attn` is kept as an undocumented
+alias so the wrapper script and existing invocations keep working. `COLI_V4_KERNELS` takes
+precedence over the CLI flag.
+
+Verified independently (60-token, warm, fresh `rm -f c/*.o` build):
+
+| case | router ms | attn_sparse ms | md5 | active |
+|---|---|---|---|---|
+| default | 1932.6 | 2929.0 | `5d048904…` **golden** | `none` |
+| `--fast-kernels` | 183.3 | 651.5 | `7155bab9…` | `attn_sparse,router` |
+| `--fast-sparse-attn` (alias) | 185.4 | 657.8 | `7155bab9…` | `attn_sparse,router` |
+| `COLI_V4_KERNELS=router` | **179.5** | **2967.0** | `e8041076…` | `router` |
+| `COLI_V4_KERNELS=attn_sparse` | **1935.4** | **625.5** | `c6d8f26e…` | `attn_sparse` |
+| `COLI_V4_KERNELS=bogus` | — | — | exit 2, names listed | — |
+
+The two single-kernel rows are the proof: one kernel fast and the other slow **in the same binary**.
+Note `COLI_V4_KERNELS=attn_sparse` reproduces md5 `c6d8f26ef47095bf6f777c11d99df080` — exactly the
+E37 flagged result from before the router kernel existed, three experiments ago.
+
+Adding a third kernel is one registry line (`X(HEAD, "head", 2)`), which automatically extends
+parsing, `all`, the error message, and the active-set log. That is how E41's head kernel should be
+re-tested if we revisit it.

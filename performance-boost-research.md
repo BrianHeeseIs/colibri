@@ -32,20 +32,30 @@ COLI_V4_SAVE_USAGE=0 <METHOD_ENVS> ./c/deepseek_v4 models/deepseek-v4-flash \
 #   (python3 -c "...700 words..." generator, 799 tok) and read time_to_first_token.
 ```
 
-## Opt-in reassociated sparse attention
+## Opt-in reassociated kernel harness (`--fast-kernels`)
 
-Apple arm64 builds support `--fast-sparse-attn`, which selects a four-accumulator NEON dot
-product for sparse-attention scores. It measured **4.53x faster** in `attn_sparse` on identical
-9417-call runs (`22639.5 ms` to `4999.3 ms`) and improved steady-state throughput by **12.5%**.
-The default remains the strictly ordered scalar reduction while retaining the allocation-free
-512-score stack scratch, so default output stays bit-identical to the original implementation.
+Apple arm64 builds support two independently selectable reassociated-FP NEON kernels:
+`attn_sparse` and `router`. `--fast-kernels` enables both. The historical
+`--fast-sparse-attn` spelling remains accepted as an undocumented alias. For per-kernel A/Bs,
+set `COLI_V4_KERNELS` to a comma-separated exact set, `all`, or `none`:
 
-This path is opt-in because reassociating floating-point additions changes sparse-attention
-scores by about `4e-7`; at longer context that difference can flip an argmax. For the 60-token
-technical-explanation gate, multiline `generated_text` has MD5
+```bash
+COLI_V4_KERNELS=attn_sparse,router ./c/deepseek_v4 ...
+COLI_V4_KERNELS=router ./c/deepseek_v4 ...
+COLI_V4_KERNELS=none ./c/deepseek_v4 ...
+```
+
+When both are present, `COLI_V4_KERNELS` wins because it is finer-grained; thus
+`COLI_V4_KERNELS=none ... --fast-kernels` selects none. Unknown names are fatal and list every
+valid name. Startup always records the effective set as `v4_kernels active=...`, making benchmark
+logs self-describing. Non-arm64 builds always use ordered kernels regardless of selection.
+
+These paths stay opt-in because reassociating floating-point additions can flip an argmax. For the
+60-token technical-explanation gate, multiline `generated_text` has MD5
 `5d04890413ff539e802985ce8c727814` in default mode and
-`c6d8f26ef47095bf6f777c11d99df080` with `--fast-sparse-attn`. The root wrapper
-`./run-deepseek-v4-fast-sparse-attention.sh` appends the flag and prints the output warning.
+`7155bab905cbfa70aa06afa08f757cee` with both fast kernels. The root wrapper
+`./run-deepseek-v4-fast-sparse-attention.sh` keeps its referenced filename, appends
+`--fast-kernels`, and prints the output warning.
 
 ---
 
@@ -360,17 +370,17 @@ Apple specs/manpages; local RESULTS §2-§13, experiments E13-E27; line refs = c
 | build | mean decode_wall | sd | md5 |
 |---|---|---|---|
 | default | 38554.8 ms | 234.7 | `5d04890413ff539e802985ce8c727814` (byte-identical to pre-campaign) |
-| `--fast-sparse-attn` | **34311.2 ms** | 49.7 | `7155bab905cbfa70aa06afa08f757cee` |
+| `--fast-kernels` | **34311.2 ms** | 49.7 | `7155bab905cbfa70aa06afa08f757cee` |
 
 **11.01 % faster (1.1237x)** with the opt-in reassociated kernel set, default bit-exact.
 Separately, the default decode path is 1.38-1.42x faster than the pre-M15 baseline from the
 4-row matvec work (E33), which IS byte-identical.
 
-### What `--fast-sparse-attn` enables
+### What `--fast-kernels` enables
 - `attn_sparse` 4-accumulator NEON (E37) — 4.53x on the phase
 - `router` 4-accumulator NEON (E40) — 10.76x on the phase
-It does **not** include the LM head (E41 reverted, see below). The flag name is now historical;
-it means "reassociated-FP kernel set".
+It does **not** include the LM head (E41 reverted, see below). Use `COLI_V4_KERNELS` for
+single-kernel A/Bs; its exact selection overrides `--fast-kernels` when both are present.
 
 ### *** STANDING RULE: phases are not independent ***
 E41 built a NEON LM head: **11.71x microbench, 3.67x on the phase, 11.2 % SLOWER decode_wall.**
