@@ -1164,3 +1164,53 @@ blast radius (`c/quant.h` only, the file already 4-row optimized in E33).
 **Artifacts kept:** `c/bench_moe_batch.c` (standalone primitive benchmark) and the
 `COLI_M4_TRACE`-gated routing histogram in `c/deepseek_v4.c`. Default build verified byte-identical
 (60-token golden md5 `5d04890413ff539e802985ce8c727814`, 0 `m4_trace` symbols in the binary).
+
+## E39. Dequant hoisting — **bitwise identical, better scaling, still NO-GO** (lane closed)
+
+E38's pivot hypothesis: `f(S)` saturates because the batch kernel re-dequantizes per item, so
+hoisting the weight decode out of the batch loop should push `speedup_op(S)` toward S.
+Prototyped in `c/bench_moe_batch.c` (no kernel/call-site edits).
+
+**Redundant work confirmed** — per (output row, 32-col group), each extra batch item repeats:
+1 `mx4_scale` decode, 16 packed-byte loads, 32 nibble extractions, 32 `mx4_lut` lookups. Only the
+32 multiply/adds are genuinely per-item. Prototype decodes 4 rows at once into 1552 B of
+worker-local scratch.
+
+**Bit-exactness: PROVEN.** 10 cases across S={1,2,4,8,64}, 475,136 output floats:
+**0 bitwise differences, max abs 0, max rel 0.** Accumulation order is unchanged (32 serial
+`x * decoded_weight` per output, then the group scale), so hoisting is arithmetic-order-preserving.
+
+| S | current ms | hoisted ms | hoisted vs current | hoisted speedup_op |
+|---|---|---|---|---|
+| 1 | 0.796 | 1.537 | **0.518x** | 1.000 |
+| 2 | 1.427 | 2.053 | 0.695x | **1.498** (was 1.079) |
+| 4 | 2.648 | 3.116 | 0.850x | **1.973** (was 1.263) |
+| 8 | 5.114 | 5.367 | 0.953x | 2.291 |
+| 12 | 7.685 | 7.396 | 1.039x | 2.494 |
+| 32 | 20.714 | 18.734 | 1.106x | 2.625 |
+| 64 | 39.392 | 35.223 | 1.118x | **2.793** (was 1.479) |
+
+Scaling improved exactly as predicted — but `f(1)` regressed 0.796 -> 1.537 ms (scratch
+write/read plus changed traversal is pure overhead when there is nothing to amortize).
+Crossover is **S ~ 10-12**; the measured distribution's dominant buckets are all below it.
+
+Projected prefill speedup on the measured distribution (47472 selections):
+
+| strategy | projected |
+|---|---|
+| grouping, current kernel | 1.179x |
+| grouping, hoisted kernel | 1.010x |
+| grouping, hybrid `min()` dispatch | **1.207x** |
+
+Bar was 1.6x. Best achievable ~1.21x for substantial complexity. **LANE CLOSED.**
+
+### The finding that redirects the campaign
+My dequant hypothesis was **wrong**. Measured cause: *"FP32 dot-product work and per-item
+activation QDQ dominate; nibble/LUT decoding is cheap."* The expert FFN is **compute-bound on the
+dot products themselves**, not on weight dequantization and not on memory bandwidth (E38 had
+already shown 5.34 GB/s is ~20x below DRAM). Consequently:
+- Batching cannot help much — there is little redundant work to amortize.
+- The only levers on expert FFN are **fewer FLOPs** or **better SIMD on the dot product**, and
+  E33's 4-row matvec already took the latter.
+This closes M4/M5-style batching as a family and points the remaining work at the still-scalar
+leaf phases (router, head, hc_norm) and at GPU offload.

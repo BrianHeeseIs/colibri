@@ -8,12 +8,15 @@
 #include <omp.h>
 #endif
 
+#include "native_quant.h"
 #include "native_quant_batch.h"
 
 enum {
     HIDDEN_SIZE = 4096,
     MOE_INTERMEDIATE_SIZE = 2048,
     MAX_BATCH = 64,
+    FP4_BLOCK_SIZE = 32,
+    FP4_ROW_TILE = 4,
 };
 
 typedef int (*BatchMatmul)(float *, const ColiTensorView *, const float *, int);
@@ -128,6 +131,151 @@ static void free_expert(ExpertWeights *expert) {
     for (size_t index = 0; index < 6; index++) free(expert->allocations[index]);
 }
 
+static void matmul_fp4_hoisted(float *outputs, const float *inputs,
+                               const uint8_t *packed, const uint8_t *scale_codes,
+                               int batch, int columns, int rows) {
+    static const float fp4_values[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    int packed_stride = (columns + 1) / 2;
+    int group_count = (columns + FP4_BLOCK_SIZE - 1) / FP4_BLOCK_SIZE;
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < rows; row += FP4_ROW_TILE) {
+        int row_indices[FP4_ROW_TILE];
+        const uint8_t *row_weights[FP4_ROW_TILE];
+        const uint8_t *row_scales[FP4_ROW_TILE];
+        float accumulators[MAX_BATCH][FP4_ROW_TILE] = {{0}};
+        for (int lane = 0; lane < FP4_ROW_TILE; lane++) {
+            row_indices[lane] = row + lane < rows ? row + lane : row;
+            row_weights[lane] = packed + (int64_t)row_indices[lane] * packed_stride;
+            row_scales[lane] = scale_codes + (int64_t)row_indices[lane] * group_count;
+        }
+        for (int group = 0; group < group_count; group++) {
+            int base = group * FP4_BLOCK_SIZE;
+            int group_length = columns - base < FP4_BLOCK_SIZE
+                                   ? columns - base : FP4_BLOCK_SIZE;
+            float weights[FP4_ROW_TILE][FP4_BLOCK_SIZE];
+            float scales[FP4_ROW_TILE];
+            for (int lane = 0; lane < FP4_ROW_TILE; lane++) {
+                union { uint32_t bits; float value; } scale;
+                scale.bits = (uint32_t)row_scales[lane][group] << 23;
+                scales[lane] = scale.value;
+                const uint8_t *block = row_weights[lane] + (base >> 1);
+                for (int offset = 0; offset < group_length; offset += 2) {
+                    uint8_t byte = block[offset >> 1];
+                    weights[lane][offset] = fp4_values[byte & 15];
+                    if (offset + 1 < group_length)
+                        weights[lane][offset + 1] = fp4_values[byte >> 4];
+                }
+            }
+            for (int item = 0; item < batch; item++) {
+                const float *input = inputs + (int64_t)item * columns + base;
+                float group_sums[FP4_ROW_TILE] = {0};
+                for (int offset = 0; offset < group_length; offset++) {
+                    float activation = input[offset];
+                    for (int lane = 0; lane < FP4_ROW_TILE; lane++)
+                        group_sums[lane] += activation * weights[lane][offset];
+                }
+                for (int lane = 0; lane < FP4_ROW_TILE; lane++)
+                    accumulators[item][lane] += group_sums[lane] * scales[lane];
+            }
+        }
+        for (int item = 0; item < batch; item++)
+            for (int lane = 0; lane < FP4_ROW_TILE; lane++)
+                if (row_indices[lane] != row || lane == 0)
+                    outputs[(int64_t)item * rows + row_indices[lane]] =
+                        accumulators[item][lane];
+    }
+}
+
+static int fp4_matmul_batch_hoisted(float *outputs, const ColiTensorView *weight,
+                                    const float *inputs, int batch) {
+    if (!outputs || !weight || !inputs || batch < 1 || batch > MAX_BATCH ||
+        weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        weight->scale_format != COLI_SCALE_UE8M0 || !weight->data ||
+        !weight->scales || weight->rows < 1 || weight->columns < 1 ||
+        weight->columns % 128 || weight->block_rows != 1 ||
+        weight->block_columns != FP4_BLOCK_SIZE)
+        return -1;
+    size_t rows = (size_t)weight->rows;
+    size_t columns = (size_t)weight->columns;
+    if (weight->data_bytes != rows * columns / 2 ||
+        weight->scale_bytes != rows * columns / FP4_BLOCK_SIZE)
+        return -1;
+    float *activations = malloc((size_t)batch * columns * sizeof(*activations));
+    uint8_t *activation_scales = malloc((size_t)batch * columns / 128);
+    if (!activations || !activation_scales) {
+        free(activation_scales);
+        free(activations);
+        return -1;
+    }
+    for (int item = 0; item < batch; item++)
+        if (coli_fp8_activation_qdq_ref(
+                activations + (size_t)item * columns,
+                activation_scales + (size_t)item * columns / 128,
+                inputs + (size_t)item * columns, columns, 128)) {
+            free(activation_scales);
+            free(activations);
+            return -1;
+        }
+    matmul_fp4_hoisted(outputs, activations, weight->data, weight->scales,
+                       batch, (int)columns, (int)rows);
+    free(activation_scales);
+    free(activations);
+    return 0;
+}
+
+static int check_equivalence_case(const char *shape, const ColiTensorView *weight,
+                                  const float *inputs, float *reference,
+                                  float *hoisted, int batch) {
+    if (coli_fp4_matmul_batch_ref(reference, weight, inputs, batch) ||
+        fp4_matmul_batch_hoisted(hoisted, weight, inputs, batch))
+        return -1;
+    size_t count = (size_t)batch * (size_t)weight->rows;
+    size_t different = 0;
+    double max_absolute = 0.0;
+    double max_relative = 0.0;
+    for (size_t index = 0; index < count; index++) {
+        if (memcmp(reference + index, hoisted + index, sizeof(float))) different++;
+        double absolute = fabs((double)reference[index] - (double)hoisted[index]);
+        double denominator = fabs((double)reference[index]);
+        double relative = denominator > 0.0 ? absolute / denominator
+                                             : (absolute > 0.0 ? INFINITY : 0.0);
+        if (absolute > max_absolute) max_absolute = absolute;
+        if (relative > max_relative) max_relative = relative;
+    }
+    printf("equivalence %-9s S=%2d outputs=%zu bitwise_different=%zu "
+           "max_abs=%.9g max_rel=%.9g\n",
+           shape, batch, count, different, max_absolute, max_relative);
+    return different ? 1 : 0;
+}
+
+static int check_fp4_equivalence(const ExpertWeights *expert,
+                                 const float *hidden_inputs,
+                                 const float *intermediate_inputs) {
+    static const int batches[] = {1, 2, 4, 8, 64};
+    float *reference = malloc((size_t)MAX_BATCH * HIDDEN_SIZE * sizeof(float));
+    float *hoisted = malloc((size_t)MAX_BATCH * HIDDEN_SIZE * sizeof(float));
+    if (!reference || !hoisted) {
+        free(hoisted);
+        free(reference);
+        return -1;
+    }
+    int result = 0;
+    for (size_t index = 0; index < sizeof(batches) / sizeof(batches[0]); index++) {
+        int batch = batches[index];
+        int gate_result = check_equivalence_case(
+            "gate/up", &expert->gate, hidden_inputs, reference, hoisted, batch);
+        int down_result = check_equivalence_case(
+            "down", &expert->down, intermediate_inputs, reference, hoisted, batch);
+        if (gate_result || down_result) result = gate_result < 0 || down_result < 0 ? -1 : 1;
+    }
+    free(hoisted);
+    free(reference);
+    return result;
+}
+
 static int run_expert(BatchMatmul matmul, const ExpertWeights *expert,
                       const float *hidden_inputs, const float *intermediate_inputs,
                       float *intermediate_outputs, float *hidden_outputs, int batch) {
@@ -151,14 +299,21 @@ static int measure(Measurement *measurement, BatchMatmul matmul,
                        intermediate_outputs, hidden_outputs, batch))
             return -1;
 
-    double calibration_start = now_seconds();
-    if (run_expert(matmul, expert, hidden_inputs, intermediate_inputs,
-                   intermediate_outputs, hidden_outputs, batch))
-        return -1;
-    double calibration = now_seconds() - calibration_start;
-    int iterations = calibration > 0.0 ? (int)ceil(0.20 / calibration) : 1;
-    if (iterations < 1) iterations = 1;
-    if (iterations > 500) iterations = 500;
+    int iterations = 1;
+    for (;;) {
+        double calibration_start = now_seconds();
+        for (int iteration = 0; iteration < iterations; iteration++)
+            if (run_expert(matmul, expert, hidden_inputs, intermediate_inputs,
+                           intermediate_outputs, hidden_outputs, batch))
+                return -1;
+        double calibration = now_seconds() - calibration_start;
+        if (calibration >= 0.25) break;
+        int calibrated_iterations = calibration > 0.0
+            ? (int)ceil((double)iterations * 0.30 / calibration)
+            : iterations * 2;
+        iterations = calibrated_iterations > iterations
+            ? calibrated_iterations : iterations + 1;
+    }
 
     double samples[MEASUREMENT_ROUNDS];
     double sum = 0.0;
@@ -185,30 +340,84 @@ static int measure(Measurement *measurement, BatchMatmul matmul,
     return 0;
 }
 
-static int benchmark_format(const char *name, BatchMatmul matmul,
-                            const ExpertWeights *expert, const float *hidden_inputs,
-                            const float *intermediate_inputs, float *intermediate_outputs,
-                            float *hidden_outputs) {
+static double interpolate_measurement(const int *batches,
+                                      const Measurement *measurements,
+                                      size_t count, double batch) {
+    for (size_t upper = 1; upper < count; upper++) {
+        if (batch <= batches[upper]) {
+            size_t lower = upper - 1;
+            double fraction = (batch - batches[lower]) /
+                              (batches[upper] - batches[lower]);
+            return measurements[lower].mean_ms + fraction *
+                (measurements[upper].mean_ms - measurements[lower].mean_ms);
+        }
+    }
+    return measurements[count - 1].mean_ms;
+}
+
+static double projected_prefill_speedup(const int *batches,
+                                        const Measurement *current,
+                                        const Measurement *hoisted,
+                                        size_t count) {
+    static const struct {
+        double batch;
+        int groups;
+    } distribution[] = {
+        {1.0, 4555}, {2.5, 3894}, {5.5, 2266}, {11.0, 853}, {27.1, 418},
+    };
+    double unbatched = 0.0;
+    double batched = 0.0;
+    for (size_t index = 0;
+         index < sizeof(distribution) / sizeof(distribution[0]); index++) {
+        unbatched += distribution[index].groups * distribution[index].batch *
+                     current[0].mean_ms;
+        batched += distribution[index].groups * interpolate_measurement(
+            batches, hoisted, count, distribution[index].batch);
+    }
+    return unbatched / batched;
+}
+
+static int benchmark_fp4_comparison(
+        const ExpertWeights *expert, const float *hidden_inputs,
+        const float *intermediate_inputs, float *intermediate_outputs,
+        float *hidden_outputs) {
     static const int batches[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64};
-    Measurement measurements[sizeof(batches) / sizeof(batches[0])];
-    printf("\n%s expert record: %zu bytes (%.3f MB decimal)\n", name,
+    enum { BATCH_COUNT = sizeof(batches) / sizeof(batches[0]) };
+    Measurement current[BATCH_COUNT];
+    Measurement hoisted[BATCH_COUNT];
+    printf("\nFP4 routed expert record: %zu bytes (%.3f MB decimal)\n",
            expert->record_bytes, (double)expert->record_bytes / 1e6);
-    printf("S | f(S) ms +/- stddev | speedup_op | effective GB/s | N\n");
-    for (size_t index = 0; index < sizeof(batches) / sizeof(batches[0]); index++) {
+    printf("scratch: %zu-byte decoded weights + %zu-byte scales + "
+           "%zu-byte max-batch accumulators per OpenMP worker\n",
+           sizeof(float) * FP4_ROW_TILE * FP4_BLOCK_SIZE,
+           sizeof(float) * FP4_ROW_TILE,
+           sizeof(float) * MAX_BATCH * FP4_ROW_TILE);
+    printf("S | current f(S) ms +/- sd | hoisted f(S) ms +/- sd | "
+           "vs current | hoisted speedup_op | N current/hoisted\n");
+    for (size_t index = 0; index < BATCH_COUNT; index++) {
         int batch = batches[index];
-        if (measure(&measurements[index], matmul, expert, hidden_inputs,
-                    intermediate_inputs, intermediate_outputs, hidden_outputs,
-                    batch))
+        if (measure(&current[index], coli_fp4_matmul_batch_ref, expert,
+                    hidden_inputs, intermediate_inputs, intermediate_outputs,
+                    hidden_outputs, batch) ||
+            measure(&hoisted[index], fp4_matmul_batch_hoisted, expert,
+                    hidden_inputs, intermediate_inputs, intermediate_outputs,
+                    hidden_outputs, batch))
             return -1;
-        double speedup = (double)batch * measurements[0].mean_ms /
-                         measurements[index].mean_ms;
-        double effective_gbps = (double)batch * (double)expert->record_bytes /
-                                (measurements[index].mean_ms * 1e6);
-        printf("%2d | %9.3f +/- %-7.3f | %10.3f | %14.3f | %d\n",
-               batch, measurements[index].mean_ms, measurements[index].stddev_ms,
-               speedup, effective_gbps, measurements[index].iterations);
+        double versus_current = current[index].mean_ms / hoisted[index].mean_ms;
+        double operation_speedup = (double)batch * hoisted[0].mean_ms /
+                                   hoisted[index].mean_ms;
+        printf("%2d | %9.3f +/- %-7.3f | %9.3f +/- %-7.3f | %10.3f | "
+               "%18.3f | %d/%d\n",
+               batch, current[index].mean_ms, current[index].stddev_ms,
+               hoisted[index].mean_ms, hoisted[index].stddev_ms,
+               versus_current, operation_speedup, current[index].iterations,
+               hoisted[index].iterations);
         fflush(stdout);
     }
+    double projection = projected_prefill_speedup(
+        batches, current, hoisted, BATCH_COUNT);
+    printf("projected prefill speedup: %.4fx (%s vs 1.6000x decision bar)\n",
+           projection, projection >= 1.6 ? "GO" : "NO-GO");
     return 0;
 }
 
@@ -239,12 +448,15 @@ int main(void) {
 #else
     printf("OpenMP disabled\n");
 #endif
-    int result = benchmark_format(
-        "FP4 routed", coli_fp4_matmul_batch_ref, &fp4_expert,
-        hidden_inputs, intermediate_inputs, intermediate_outputs, hidden_outputs) ||
-        benchmark_format(
-            "FP8 shared", coli_fp8_matmul_batch_ref, &fp8_expert,
-            hidden_inputs, intermediate_inputs, intermediate_outputs, hidden_outputs);
+    printf("FP4 scratch block=%d weights (%zu bytes/row)\n",
+           FP4_BLOCK_SIZE, sizeof(float) * FP4_BLOCK_SIZE);
+    int equivalence = check_fp4_equivalence(
+        &fp4_expert, hidden_inputs, intermediate_inputs);
+    if (equivalence > 0)
+        fprintf(stderr, "FP4 hoisted equivalence FAILED\n");
+    int result = equivalence || benchmark_fp4_comparison(
+        &fp4_expert, hidden_inputs, intermediate_inputs,
+        intermediate_outputs, hidden_outputs);
     printf("output_guard=%g\n", (double)output_guard);
 
     free_expert(&fp8_expert);
