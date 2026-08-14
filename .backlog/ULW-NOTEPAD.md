@@ -547,3 +547,61 @@ at once => more experts batchable per round trip in DECODE too. Worth revisiting
 ### Sequencing decision
 Run AFTER T7 produces the PROFILE numbers. Do not build before the gate. If the gate passes,
 prototype on PREFILL first (bigger prize, more parallelism), not decode.
+
+## SCHEDULED EXPERIMENTS 12:55 (user-requested) — E45 / E46 / E47
+
+### E45. Cycled-prompt warm protocol — CONFIRMED BY USER, this is T5/T6, run next
+Protocol: cycle a FIXED SET of distinct prompts; repeat the cycle N times.
+  - distinct within a cycle => kv_prefix_reuse returns 0 => full attention reset each request
+    (c/kv_prefix.h:116-127) => no KV accumulation, no prefill skipping
+  - same prompt recurs each cycle => cycle k vs cycle 1 is a CONTROLLED comparison of the
+    SAME workload at different cache temperatures
+  - NEVER compare two different prompts to each other (that was the E43-era mistake: 4 distinct
+    prompts = 4 different workloads, not a series)
+  - report decode-only throughput separately from all-request hit_pct. They span DIFFERENT
+    windows: hit_pct covers session_generate incl. prefill (:9174-9203); tok_s divides by
+    stats.decode_sec which starts AFTER prefill (:9204-9217). Never infer decode warmth from hit_pct.
+Deliverable: warm steady-state definition + the 4-cell cold/warm x default/fast table (T8).
+
+### E46. PREFILL GPU batch (M5-GPU) — SCHEDULED, double-gated
+Idea: within ONE prefill layer, a 64-token chunk issues 384 expert-ops over ~93 unique experts,
+ALL INDEPENDENT. Enqueue them in ONE Metal command buffer instead of 384 synchronous round-trips.
+Amortization is 64x better than decode:
+      C     decode b=6        prefill b=384
+   0.05   0.311 (1.32x)      0.054 (7.58x)
+   0.10   0.352 (1.16x)      0.104 (3.94x)
+   0.20   0.436 (0.94x)      0.204 (2.01x)
+   0.40   0.602 (0.68x)      0.403 (1.02x)
+=> prefill gate is FAR more permissive: build if C <= ~0.35 ms (decode needs C <= 0.10).
+
+*** HONEST CEILING — I OVER-CLAIMED EARLIER AND AM CORRECTING IT ***
+I said prefill is "almost entirely expert-bound". It is expert-bound, but in prefill that means
+**I/O-bound, not compute-bound**:
+   prefill 646 ms/token / 258 expert-ops = 2.50 ms/op
+   warm CPU expert COMPUTE (from decode)  = 0.41 ms/op
+   gap 2.09 ms/op = cold-miss SSD wait (prefill hit_rate 34%->76%->86%, E38)
+=> compute is only ~16% of prefill. GPU batching cannot touch the other 84%.
+=> CEILING on prefill GPU batching is ~16% of prefill, NOT the 2-7x the amortization table implies.
+=> And per E35's Amdahl lesson, making compute ~7x faster would EXPOSE more of the I/O wait,
+   so realized gain will be below the ceiling.
+Still worth it for long prompts: 799-token prompt is ~516 s of prefill; 16% = ~83 s saved.
+GATES (all three must pass before building):
+  G1 T7 PROFILE gives implied C <= 0.35 ms
+  G2 weights are zero_copy (not copy_fallback) - else a 13.37MB memcpy per dispatch dominates
+  G3 measured prefill compute/IO split confirms compute >= ~15% of prefill wall
+      (cheap: run prefill with a hot cache - i.e. second pass over the same prompt in serve mode -
+       so misses ~0, and see how much prefill time remains. That isolates compute from I/O.)
+
+### E47. dspark speculative widening for DECODE batching — SCHEDULED, gated on E46
+Decode can only batch 6 because tokens are sequential. BUT dspark speculative drafting (flag
+--no-dspark disables it) produces SEVERAL candidate tokens per step => several tokens' experts
+become available simultaneously => decode batch width grows from 6 to 6*k.
+   k=4 -> batch 24 -> at C=0.10: (1.514+24*0.10)/24 = 0.163 ms/exp = 2.5x vs CPU
+Only worth attempting if E46 proves batched GPU dispatch works at all. Order: E46 then E47.
+GATE: E46 shows a real measured win on prefill.
+
+### PRIORITY CALL
+E45 now (it is the running critical path). E46 after T7 provides C. E47 only if E46 lands.
+Expected value ranking, honestly: E45 (methodology, unlocks everything) > E46 (<=16% of prefill,
+big for long prompts) > decode batching (3.7-6.4% overall) > E47 (multiplier on a thing that may
+not exist yet).
