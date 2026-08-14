@@ -705,3 +705,34 @@ Two candidate fixes (must measure before choosing):
 Key code refs (from E46 T0a): packed hot -> coli_fp4_dual_matvec_rows16_v10 (:6586);
 cold/unpacked -> fallback (:6573); rows16 marker only set for packed hot slots (:6132).
 GATE: microbench both kernels at real shapes + measure pack cost, BEFORE engine work.
+
+================================================================================
+# ULW SESSION 4 — 2026-08-14 19:30 — UNPACKED-EXPERT KERNEL LANE
+================================================================================
+## Goal
+Close the 3-5x per-op gap between prefill (cold/UNPACKED experts -> v17_fallback kernel)
+and decode (rows16 hot-PACKED -> fused rows16_v10 kernel).
+
+## Confirmed dispatch (c/deepseek_v4.c:7181-7202)
+  coli_v4_expert_forward_ref:
+    #ifndef COLI_FP4_ROWS16_KERNEL -> ALWAYS v17_fallback
+    else if (gate.block_rows != 16 || down.block_rows != 16 || up.block_rows != 16)
+         -> v17_fallback                                    <-- COLD/UNPACKED PATH
+    else -> coli_fp4_dual_matvec_rows16_v10 (fused gate+up) <-- PACKED HOT PATH
+  So a cold expert takes v17_fallback for ALL THREE matmuls, and loses the gate/up fusion.
+
+## Scenario contract (BINDING - both artifacts required each)
+S1 HAPPY: microbench v17_fallback vs rows16_v10 at REAL shapes (gate/up 2048x4096,
+   down 4096x2048), n>=20 warm, bit-exactness checked.
+   PASS = a defensible ms/op for each + the true gap ratio. Artifact: bench stdout.
+S2 EDGE: measure PACK cost (hot_pack_slot equivalent) per expert, and the break-even
+   (how many uses of a packed expert repay one pack).
+   PASS = pack ms/expert + break-even N. Artifact: bench stdout.
+S3 REGRESSION: golden md5 5d04890413ff539e802985ce8c727814 unchanged for any engine change;
+   decode path + global 3-worker pool untouched.
+   PASS = bench/golden.sh PASS. Artifact: script output.
+Kill criterion: if the fallback-vs-rows16 gap at real shapes is <1.5x, the whole premise is
+wrong (the 3-5x residual is elsewhere) -> STOP, report, do not touch the engine.
+
+## Now
+Fire 2 explores (kernel internals; packing mechanics+cost) -> plan agent -> delegate.
