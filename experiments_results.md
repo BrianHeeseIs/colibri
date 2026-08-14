@@ -2035,3 +2035,66 @@ the store mutex) is the remaining suspect.
 E51 "84 % SSD wait" (retracted by E52), and now E53 "unpacked kernel". Each time the *outcome*
 measurement held and the *explanation* did not. **The next step must be direct instrumentation of
 the miss path, not a fourth hypothesis.** No engine code was written for this lane.
+
+---
+
+## E54. Neutral in-engine attribution of prefill — **the measurement that should have come first**
+
+After three wrong mechanism hypotheses, instrumented the engine directly instead of theorising.
+`COLI_V4_PREFILL_TRACE` (compile-gated, inert by default, 31.8-32.7 ns/sample overhead, golden md5
+unchanged) times every prefill stage and reports a table that **sums to the wall with a 1.55 %
+residual**.
+
+### Top-level, prefetch OFF, p064 (43.544 s wall)
+| stage | ms | % |
+|---|---|---|
+| **MoE** | 26,147 | **60.05** |
+| **Attention** | 14,449 | **33.18** |
+| FFN norm | 983 | 2.26 |
+| attention norm | 979 | 2.25 |
+| HC post (x2) | 272 | 0.62 |
+| head | 37 | 0.09 |
+| residual | 676 | 1.55 |
+
+### Inside MoE (store stages; nested worker totals overlap main-thread work)
+| stage | ms | % of wall | calls | mean |
+|---|---|---|---|---|
+| **miss read + first touch** | 18,928 | **43.47** | 4,257 | 4.446 ms |
+| miss pack | 1,330 | 3.06 | 483 | 2.755 ms |
+| hit pack | 900 | 2.07 | 6,704 | 134 us |
+| miss relock/publish | 669 | 1.54 | 4,257 | 157 us |
+| hit mutex wait | 461 | 1.06 | 13,803 | 33 us |
+| miss mutex wait | 231 | 0.53 | 4,257 | 54 us |
+| miss slab alloc | 38 | 0.09 | 4,159 | 9 us |
+| miss slot select | 20 | 0.05 | 4,257 | 5 us |
+
+### What this KILLS (every prior suspect, quantified)
+| suspect | lane | measured share |
+|---|---|---|
+| mutex serialization | E52-era | **1.59 %** |
+| packing cost | E53 | 5.12 % |
+| unpacked kernel speed | E53 | **0 %** (already killed at 1.099x) |
+| prefill/decode thread-scaling gap | my 4th | **0 %** — prefill 0.6947 ms/op @39.28 % efficiency vs decode 0.7059 ms/op @39.51 %. **Expert compute is identical in both phases**; the "4.8x per-op gap" was an artefact of my aggregate arithmetic, not a real effect. |
+
+### What it REVEALS
+1. **Expert miss read + first touch is 43.5 % of prefill** (4257 misses x 4.446 ms). Confirmed as
+   the single largest MoE component — the one thing prefetch actually targets.
+2. **Attention is 33.2 % of prefill (14.4 s, 168 ms per layer-chunk call x 86)** and has been
+   touched by **no lane in this entire campaign**. It is the largest untouched block in prefill.
+3. **Route-ahead costs 3,386 ms (8.4 %)** — the overhead I added. MoE drops 26,147 -> 19,507
+   (-6,640) but route-ahead gives back 3,386, netting the measured ~7 %.
+
+### Measured feature stack (p064 ttft, cold)
+| config | ttft |
+|---|---|
+| default | 42.780 s |
+| `--fast-kernels` | 38.942 s |
+| prefetch ON | 40.452 s |
+| **prefetch ON + `--fast-kernels`** | **36.392 s (-14.9 %)** |
+
+(I predicted the fast router would recover ~3.1 s of route-ahead overhead and lift prefetch to
+~14.5 %; measured, prefetch saves ~2.3-2.6 s regardless of router speed. **Another projection that
+did not survive contact** — the 14.9 % above is the two features stacked, measured, not modelled.)
+
+**Rule earned the hard way: attribute inside the engine before proposing a mechanism.** Three
+hypotheses and four suspects died to a table that took one instrumented run.
