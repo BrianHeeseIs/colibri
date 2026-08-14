@@ -3774,6 +3774,93 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
     return result;
 }
 
+#ifdef COLI_M4_TRACE
+typedef struct {
+    int layer;
+    int chunk;
+    int tokens;
+    int topk;
+    int experts;
+    int recorded_tokens;
+    int *counts;
+    int *selections;
+} ColiM4ChunkTrace;
+
+static _Thread_local ColiM4ChunkTrace *coli_m4_active_trace;
+_Thread_local int coli_m4_prefill_active;
+_Thread_local int coli_m4_prefill_chunk;
+static FILE *coli_m4_trace_file;
+
+static void coli_m4_record_routing(const int *indices, int experts, int topk) {
+    ColiM4ChunkTrace *trace = coli_m4_active_trace;
+    if (!trace || !indices || experts != trace->experts || topk != trace->topk ||
+        trace->recorded_tokens >= trace->tokens) return;
+    int token = trace->recorded_tokens++;
+    int *selection = trace->selections + (size_t)token * topk;
+    for (int rank = 0; rank < topk; rank++) {
+        int expert = indices[rank];
+        selection[rank] = expert;
+        if (expert >= 0 && expert < experts) trace->counts[expert]++;
+    }
+}
+
+static void coli_m4_emit_chunk(const ColiM4ChunkTrace *trace) {
+    if (!trace || trace->recorded_tokens != trace->tokens) return;
+    int unique = 0, maximum = 0;
+    int buckets[5] = {0};
+    int selections_ge2 = 0, selections_ge4 = 0;
+    for (int expert = 0; expert < trace->experts; expert++) {
+        int count = trace->counts[expert];
+        if (!count) continue;
+        unique++;
+        if (count > maximum) maximum = count;
+        if (count == 1) buckets[0]++;
+        else if (count <= 3) buckets[1]++;
+        else if (count <= 7) buckets[2]++;
+        else if (count <= 15) buckets[3]++;
+        else buckets[4]++;
+        if (count >= 2) selections_ge2 += count;
+        if (count >= 4) selections_ge4 += count;
+    }
+    int total = trace->tokens * trace->topk;
+    fprintf(stderr,
+            "M4 layer=%d chunk=%d tokens=%d selections=%d unique=%d "
+            "mean=%.6f max=%d groups_1=%d groups_2_3=%d groups_4_7=%d "
+            "groups_8_15=%d groups_16_plus=%d selections_ge2_pct=%.6f "
+            "selections_ge4_pct=%.6f\n",
+            trace->layer, trace->chunk, trace->tokens, total, unique,
+            unique ? (double)total / unique : 0.0, maximum,
+            buckets[0], buckets[1], buckets[2], buckets[3], buckets[4],
+            total ? 100.0 * selections_ge2 / total : 0.0,
+            total ? 100.0 * selections_ge4 / total : 0.0);
+
+    if (!coli_m4_trace_file) {
+        const char *path = getenv("COLI_M4_TRACE_PATH");
+        if (!path || !*path) path = "/tmp/m4_routing_trace.txt";
+        coli_m4_trace_file = fopen(path, "w");
+        if (!coli_m4_trace_file) {
+            fprintf(stderr, "M4 raw trace open failed path=%s error=%s\n",
+                    path, strerror(errno));
+            return;
+        }
+        fprintf(coli_m4_trace_file, "layer\tchunk\ttoken");
+        for (int rank = 0; rank < trace->topk; rank++)
+            fprintf(coli_m4_trace_file, "\texpert_%d", rank);
+        fputc('\n', coli_m4_trace_file);
+        fprintf(stderr, "M4 raw trace path=%s\n", path);
+    }
+    for (int token = 0; token < trace->tokens; token++) {
+        const int *selection = trace->selections + (size_t)token * trace->topk;
+        fprintf(coli_m4_trace_file, "%d\t%d\t%d",
+                trace->layer, trace->chunk, token);
+        for (int rank = 0; rank < trace->topk; rank++)
+            fprintf(coli_m4_trace_file, "\t%d", selection[rank]);
+        fputc('\n', coli_m4_trace_file);
+    }
+    fflush(coli_m4_trace_file);
+}
+#endif
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -3836,6 +3923,9 @@ static int moe_token_pipeline(float *output,
         n, d, topk, config->routed_scaling_factor);
 #endif
 
+#ifdef COLI_M4_TRACE
+    if (!result) coli_m4_record_routing(indices, n, topk);
+#endif
     int selected = 0;
     for (int expert_id = 0; !result && expert_id < n; expert_id++) {
         for (int rank = 0; rank < topk; rank++) {
@@ -4126,6 +4216,24 @@ int coli_v4_block_window_batch_ref(
     }
     int result = 0;
     const char *phase = "attention hyper-connection";
+#ifdef COLI_M4_TRACE
+    ColiM4ChunkTrace m4_trace = {
+        .layer = weights->plan.layer,
+        .chunk = coli_m4_prefill_chunk,
+        .tokens = batch,
+        .topk = config->num_experts_per_tok,
+        .experts = config->n_routed_experts,
+    };
+    ColiM4ChunkTrace *m4_previous_trace = coli_m4_active_trace;
+    if (coli_m4_prefill_active) {
+        m4_trace.counts = calloc(
+            (size_t)m4_trace.experts, sizeof(*m4_trace.counts));
+        m4_trace.selections = malloc(
+            (size_t)batch * m4_trace.topk * sizeof(*m4_trace.selections));
+        if (m4_trace.counts && m4_trace.selections)
+            coli_m4_active_trace = &m4_trace;
+    }
+#endif
     for (int item = 0; !result && item < batch; item++)
         result = normalized_hc_pre(
             reduced, posts + (size_t)item * hc,
@@ -4160,6 +4268,12 @@ int coli_v4_block_window_batch_ref(
         if (!result) coli_bf16_round_array(
             outputs_hc + (size_t)item * hd, hd);
     }
+#ifdef COLI_M4_TRACE
+    coli_m4_active_trace = m4_previous_trace;
+    if (!result && coli_m4_prefill_active) coli_m4_emit_chunk(&m4_trace);
+    free(m4_trace.selections);
+    free(m4_trace.counts);
+#endif
     free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
     free(reduced); free(combs); free(posts); free(branches);
     free(normalized); free(states);
@@ -7525,6 +7639,11 @@ static const float *v4_mainh_get(int64_t position) {
 
 #include "deepseek_v4_dspark.inc"
 
+#ifdef COLI_M4_TRACE
+extern _Thread_local int coli_m4_prefill_active;
+extern _Thread_local int coli_m4_prefill_chunk;
+#endif
+
 static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
@@ -7539,6 +7658,9 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     }
     float *state = *state_ptr, *next = *next_ptr;
     size_t hd = (size_t)config->hc_mult * config->hidden_size;
+#ifdef COLI_M4_TRACE
+    int m4_chunk_base = coli_m4_prefill_chunk;
+#endif
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
@@ -7547,6 +7669,10 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
         for (int offset = 0; !result && offset < batch; offset += 64) {
             int chunk = batch - offset;
             if (chunk > 64) chunk = 64;
+#ifdef COLI_M4_TRACE
+            if (coli_m4_prefill_active)
+                coli_m4_prefill_chunk = m4_chunk_base + offset / 64;
+#endif
             result = coli_v4_block_window_batch_ref(
                 next + (size_t)offset * hd, attention[layer_id],
                 &layer, config, experts, state + (size_t)offset * hd,
@@ -8173,12 +8299,22 @@ int coli_v4_session_generate(ColiV4Session *session,
         }
 
     double setup_done = spec_now();
+#ifdef COLI_M4_TRACE
+    coli_m4_prefill_active = 1;
+    coli_m4_prefill_chunk = 0;
+#endif
     if (target_batch(engine, &state, &next, attention, index, config, experts,
                      session->prompt_ids + reuse, reuse, fresh,
                      error, error_size)) {
+#ifdef COLI_M4_TRACE
+        coli_m4_prefill_active = 0;
+#endif
         kv_prefix_taint(&session->fed);
         return -1;
     }
+#ifdef COLI_M4_TRACE
+    coli_m4_prefill_active = 0;
+#endif
     session->state = state;
     session->next = next;
 #ifdef COLI_V4_TEST_HOOKS

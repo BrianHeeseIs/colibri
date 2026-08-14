@@ -1093,3 +1093,74 @@ non-arm64 always takes the ordered path. Wrapper: `run-deepseek-v4-fast-sparse-a
 **Methodology lesson (third of the campaign):** an 8-token gate is too short to catch FP-ordering
 regressions, just as it was too short for `attn_sparse` cost (understated ~7x) and too short for
 cache behaviour (E34b). Correctness gates must run at the length where the effect can appear.
+
+---
+
+## E38. M4 `moe_batch` — **gated OUT before any model code; pivot identified** (branch ft-moe_batch)
+
+Plan-gated optimization: during prefill, group a 64-token chunk's tokens by routed expert, lease
+each expert once, run its FFN as a batched S=group matmul. Two measurement tasks ran in parallel
+BEFORE any implementation, with go/no-go thresholds fixed in advance
+(GO >=1.25x, GRAY 1.10-1.25x, ABANDON <1.10x, plus a skew veto requiring speedup_op(2) >= 1.6).
+
+### T0b — real routing is MUCH more clustered than uniform (good news)
+`COLI_M4_TRACE`-gated instrumentation, measured on real prompts:
+
+| prompt | layer-chunks | unique experts/chunk | mean S | max S | % selections S>=2 | S>=4 |
+|---|---|---|---|---|---|---|
+| p064 (70 tok) | 86 | 58.99 | 3.560 | 63 | 87.5 % | 67.2 % |
+| p256 (184 tok) | 129 | 92.91 | 3.961 | 64 | 90.4 % | 70.9 % |
+
+Full 64-token chunks touch only **~93 unique experts vs the ~199 uniform-random expectation**,
+mean group **S = 4.1**. My pre-registered uniform estimate of S~1.93 was pessimistic by ~2x.
+
+### T0a — but the batch primitive cannot exploit it (the killer)
+`coli_fp4_matmul_batch_ref` / `coli_fp8_matmul_batch_ref` **re-dequantize per batch item.**
+Loop nesting in `c/quant.h:1431-1450`:
+
+```
+for (o ...)                     /* output rows */
+  for (s = 0; s < S; s++)       /* batch  <-- dequant lives INSIDE */
+    for (g ...) { c0 = mx4_scale(...);
+      for (k ...) g0 += x * mx4_lut[weight]; }
+```
+
+Measured on M3 Max (16 OMP threads, real dims gate/up 2048x4096, down 4096x2048, no fast-math):
+
+| S | fp4 f(S) ms | speedup_op | | S | fp8 f(S) ms | speedup_op |
+|---|---|---|---|---|---|---|
+| 1 | 1.023 | 1.000 | | 1 | 1.221 | 1.000 |
+| 2 | 1.896 | **1.079** | | 2 | 2.235 | **1.093** |
+| 4 | 3.240 | 1.263 | | 4 | 4.052 | 1.205 |
+| 8 | 6.299 | 1.300 | | 8 | 7.336 | 1.332 |
+| 64 | 44.264 | 1.479 | | 64 | 55.477 | 1.409 |
+
+speedup_op saturates at ~1.48x instead of approaching S. The residual gain is loop/cache
+overhead amortization, **not** dequant amortization.
+
+### G0 decision: ABANDON as specified
+Projected FFN speedup over the MEASURED distribution
+(`sum(S_i*f(1)) / sum(f(S_i))`, p256, buckets S=1/2.5/5.5/11/27.1):
+**1.2406x** -> GRAY, below the 1.25 GO bar. Skew veto also fires (speedup_op(2)=1.079 vs 1.6).
+**No model code was written.** Cost of this decision: ~25 min of parallel measurement.
+
+Note the veto's premise was itself wrong - it assumed singletons dominate, and they do not
+(mean S = 4.1). The binding constraint is the primitive, not the routing.
+
+### The pivot this exposes (E39 lane)
+Because `f(S)` is dominated by re-dequantization, the correct target is **the primitive, not the
+call site**. Hoisting the dequant out of the batch loop (dequantize a weight block once into a
+small float buffer, then run S dot products against it) does **not** change arithmetic order, so
+it is bit-exact-safe. Projected against the same measured distribution:
+
+| marginal item cost after hoisting | projected prefill speedup |
+|---|---|
+| 1/2 of f(1) | **1.60x** |
+| 1/3 of f(1) | **1.99x** |
+
+vs 1.24x for grouping on the current primitive. Same routing data, far better lever, smaller
+blast radius (`c/quant.h` only, the file already 4-row optimized in E33).
+
+**Artifacts kept:** `c/bench_moe_batch.c` (standalone primitive benchmark) and the
+`COLI_M4_TRACE`-gated routing histogram in `c/deepseek_v4.c`. Default build verified byte-identical
+(60-token golden md5 `5d04890413ff539e802985ce8c727814`, 0 `m4_trace` symbols in the binary).
