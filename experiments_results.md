@@ -2143,3 +2143,60 @@ recorded as such: this is a kept-despite-failing-gate call made explicitly, not 
 declared uninitialized then used in arithmetic under `set -u`. `ab.sh` aborted on it immediately;
 `golden.sh` never reached that path. All three fixed; harness tests still pass; golden re-verified
 after the patch.
+
+---
+
+## E56. Closing the T11/T12 gaps — bit-exactness at the *gate* lengths, and why interleaving saved the verdict
+
+Re-examining the checklist skeptically found one item I had marked done on weaker evidence than it
+required.
+
+### The gap: "golden md5 stable across prompt lengths" was never actually tested
+`bench/golden.sh` runs a **single hardcoded prompt** ("Write a detailed technical explanation of how
+a mixture-of-experts transformer routes tokens."). Passing it proves bit-exactness for *that* prompt
+only. The gates were fought on **p064 (61 words) and p256 (165 words)** — neither had ever been
+checked for output equality. Determinism at one length does not imply it at another: the feature
+changes *routing/prefetch order*, and the plausible failure mode is length-dependent.
+
+Built the missing canary (golden's exact `ext()` extraction + snapshot/restore cold-state handling,
+`--max-tokens 32`):
+
+| prompt | OFF vs ON | md5 |
+|---|---|---|
+| p064 | **identical** | `12f5fac018e335613d4018e595e70703` (201 B) |
+| p256 | **identical** | `4b146c969f31b97cefb5f5cfb251b207` (196 B) |
+
+**Bit-exactness now holds at both gate lengths, not just golden's prompt.** The claim is finally
+backed by the evidence it always needed.
+
+### T12: default path verified, not assumed
+The gate is fail-safe by construction:
+```c
+const char *enabled = getenv("COLI_V4_PREFILL_PREFETCH");
+coli_v4_prefill_routeahead_enabled_value = enabled && *enabled && atoi(enabled) != 0;
+```
+Unset -> `NULL` -> OFF. Empty string -> OFF. `"0"` -> OFF. Any malformed value that is not a nonzero
+integer -> OFF. Residual cost on the default path is one `getenv` at init. No perf regression: the
+OFF arm (43.065 s) is *faster* than the pinned pre-feature baseline (43.554 s).
+
+### The drift, and why GATE B's verdict survives it
+The ab.sh OFF arms did not match the pinned baseline:
+
+| prompt | pinned | ab OFF | drift |
+|---|---|---|---|
+| p064 | 43.554 | 43.065 | -1.12 % |
+| p256 | 113.735 | 111.442 | **-2.02 %** |
+
+The machine was ~1-2 % faster than when the baseline was pinned. This is exactly the hazard
+interleaving exists to defeat — and had I compared ON against the **stale pinned baseline** instead
+of the paired OFF arm:
+
+| prompt | naive (ON vs pinned) | true (interleaved) | overstated |
+|---|---|---|---|
+| p064 | -7.26 % | -6.20 % | 1.17x |
+| **p256** | **-4.67 %** | **-2.70 %** | **1.73x** |
+
+I would have published a **1.73x inflated** p256 number. It still would have failed the 15 % gate, so
+the verdict is unchanged — but the honest margin is 2.70 %, not 4.67 %.
+
+**Rule earned: never diff against a baseline measured at a different time. Pair every A with its B.**

@@ -39,6 +39,23 @@ arithmetic on aggregates.
 Each time the *outcome* measurement held and the *explanation* did not.
 **Rule earned: attribute inside the engine before proposing a mechanism.**
 
+## Correctness canaries
+Bit-exact **at both gate lengths**, not merely at golden's single prompt (E56):
+
+| prompt | OFF vs ON | md5 |
+|---|---|---|
+| p064 | identical | `12f5fac018e335613d4018e595e70703` |
+| p256 | identical | `4b146c969f31b97cefb5f5cfb251b207` |
+| golden (60 tok) | identical | `5d04890413ff539e802985ce8c727814` |
+
+Default path is fail-safe: unset / empty / `"0"` all resolve OFF; one `getenv` at init is the only
+residual cost, and the OFF arm is faster than the pre-feature pinned baseline.
+
+## Methodology note that changed a published number
+The host drifted ~2 % faster between pinning the baseline and running GATE B. Diffing ON against the
+**stale pinned baseline** would have reported p256 as -4.67 % instead of the true interleaved
+-2.70 % — a **1.73x inflation**. Every number here is from paired OFF/ON runs for this reason.
+
 ## Measured feature stack (p064 ttft, cold)
 | config | ttft |
 |---|---|
