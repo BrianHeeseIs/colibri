@@ -674,3 +674,18 @@ Revised design: route-ahead + CONTINUOUS OVERLAP at QD2-4 (not deep queue). Proj
 Baseline pinned: p064 43.554 sd 0.249 / p256 113.735 sd 0.864. rebaseline.sh had an unbound-var
 bug (local status under set -u) - fixed, harness tests still green.
 Engine work HALTED per the gate; pivot decision put to user.
+
+## 17:10 — USER PIVOT APPROVED. Building revised design.
+GATE A killed the DEEP-QUEUE mechanism (correctly - SSD saturates QD4, ratio 1.34).
+We are NOT building deep queues. Revised target, from the same instruments:
+  in-engine prefill I/O = 1.25 GB/s vs 5.23 GB/s same-SSD QD1 => 4.2x headroom
+  p064 42.7s = 10.2s raw I/O + 7.4s compute + 25.0s (59%) PIPELINE OVERHEAD
+  ideal overlapped at QD4 ~7.6s
+DESIGN: route-ahead (know the layer's ~93 experts before the token loop) + CONTINUOUS
+OVERLAP at QD2-4. Not burst, not deep queue: keep 2-4 reads permanently in flight so the
+SSD is never idle while compute runs, and remove per-op serialization.
+SAFEGUARDS UNCHANGED: default OFF env gate; golden md5 bit-identical (pure I/O reordering);
+GATE B >=15% on p256 else revert; decode path + global 3-worker pool untouched.
+LAYOUT INTEL AVAILABLE: each layer = ONE shard; all 256 scale groups contiguous, all 256
+weight groups contiguous (21930/21930 neighbors adjacent) => adjacent needed experts in a
+layer can be coalesced into ONE larger pread per stream.
