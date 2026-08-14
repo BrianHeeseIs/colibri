@@ -1812,3 +1812,48 @@ Both runs of this test initially died with `Killed: 9`. Crash report: `EXC_CRASH
 Signature Invalid), Taskgated Invalid Signature`. Cause: `cp` onto an EXISTING executable rewrites
 the vnode in place and macOS keeps a per-vnode signature cache -> next exec is killed. Fix: `rm`
 before `cp` (fresh inode). `build_toggle.sh` hardened accordingly.
+
+---
+
+## E49. First-touch caveat verification — **FAILS. The ~2 ms residual RECURS. Batching dead again.**
+
+E48 passed the batching gate contingent on one unverified assumption: that the first-touch pool
+(GPU page-mapping/coherency of expert slabs) is one-time-per-slab. The user approved verifying
+before building. **The verification falsified the assumption.**
+
+**Method — marginal cost, not average.** Cross-length *averages* are confounded (c_cpu itself
+drifted 0.41 -> 0.73 ms across run lengths as rows16 hot-packing shifts). The *marginal* cost
+between a 100- and a 500-token run cancels every one-time pool by construction. Four serial
+non-profile runs, same `.metal` binary, `COLI_V4_METAL_STATS=1`:
+
+| | METAL=0 ef | METAL=1 ef | ok | layout |
+|---|---|---|---|---|
+| 100 tok | 18106.4 | 59285.7 | 16413 | 14289 |
+| 500 tok | 96609.6 | 253612.4 | 56340 | 77562 |
+
+Marginal dispatches = 103200 = exactly 400 tokens x 258 (prefill cancels — sanity proof the method
+works). Marginal `c_cpu` = **0.761 ms**; marginal Metal mixed = 1.883 ms at GPU fraction f = 0.387;
+solving: **marginal `c_gpu` = 3.66 ms** — versus the 1.62 ms (R+C) prediction if first-touch were
+one-time, and statistically identical to the 300-token *average* of 3.55.
+
+**=> A recurring ~2.05 ms/dispatch cost exists that is neither sync (R=1.53) nor compute (C=0.086).**
+Mechanism consistent with **CPU-write -> GPU-read coherency**: every cache miss rewrites a 13.37 MB
+slab from the CPU, and the GPU must re-pull those dirty pages across the fabric. The CPU never pays
+this — it wrote the bytes, they are warm in its own cache. (Conservative note: the CPU fallbacks in
+the Metal run are the rows16-packed fast-kernel experts, so true c_gpu is if anything higher.)
+
+**Batching verdict re-run with the recurring residual:** batching removes only R.
+`batched-6 = (R + 6*(C+2.05))/6 = 2.39 ms/expert` vs CPU 0.761 -> **3.1x SLOWER. Dead.**
+Prefill batching dies harder — prefill is majority misses, so the coherency tax is at its worst.
+
+**What this leaves for fast-Metal on this machine:** the coherency tax is structural to the
+current design (CPU writes shared slabs in place, GPU reads them). The one architecture that
+removes it is a **GPU-resident expert cache**: experts uploaded ONCE per miss via async blit into
+`MTLStorageModePrivate` buffers (GPU-optimal, never CPU-rewritten), evicted GPU-side. Upload cost
+~13.37 MB per miss on the loader thread, hidden behind compute like today's SSD loads. That is a
+substantially larger build than batching - it is the real M5 - and it is the ONLY remaining path.
+
+Sequence of verdicts on this lane, each overturning the last's *mechanism* while the outcome held:
+E43 "slow, dispatch-bound" -> E46 "slow, shader-bound" -> E48 "shaders fine, first-touch + sync" ->
+**E49 "recurring coherency tax; only GPU residency removes it."** The measured outcome never moved:
+Metal as currently architected loses to this CPU path.
