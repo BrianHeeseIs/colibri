@@ -1,0 +1,5 @@
+n,ts,wall_s,tokens,tok_s,prompt_tok,footprint_gb,rss_gb,gap_gb,comp_start_gb,comp_end_gb,gate,pass
+1,23:45:26,199,64,0.3216,124,96,80.1,15.9,67.6,20.1,FAIL,warm
+2,23:48:10,163,64,0.3926,105,96,91.4,4.6,20.1,8.1,FAIL,warm
+3,23:50:33,143,64,0.4476,54,96,40.8,55.2,8.1,59.9,FAIL,warm
+4,23:53:06,152,64,0.4211,61,96,84.7,11.3,59.9,13.3,FAIL,warm

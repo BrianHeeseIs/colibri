@@ -15,6 +15,12 @@ BASE=/Users/cptn/workbench/ai/colibri
 MODEL=$BASE/models/deepseek-v4-flash
 RAM=${V4RAM:-96}; NTOK=${NTOK:-128}
 PREFETCH=${PREFETCH:-0}
+V4DRAFT=${V4DRAFT:-4}; V4NGRAM=${V4NGRAM:-1}   # these two DO preserve prior behaviour
+# SAVEUSAGE=0 freezes .coli_usage for the whole arm. prewarm_ab.sh:17-19 documents why this
+# is mandatory for any multi-arm A/B: without it a later arm starts from a LARGER history
+# than an earlier one, and part of the measured delta is 'more history', not the variable.
+SAVEUSAGE=${SAVEUSAGE:-0}   # NOTE: this DEFAULT CHANGES prior behaviour (was implicitly ON).
+                            # Freezing is correct for A/B; set SAVEUSAGE=1 to let history persist.
 TAG=${TAG:-}   # e.g. TAG=_pf1 keeps prefetch results separate
 GATE_COMPRESSOR_GB=${GATE_COMPRESSOR_GB:-20}
 cd "$BASE/validation/dsv4"
@@ -125,7 +131,7 @@ run_pass(){                      # $1=label  $2=csv
   done
 }
 
-echo "=== COLD vs WARM @ --ram $RAM, $NTOK tok/prompt, COLI_V4_EXPERT_PREFETCH=$PREFETCH ==="
+echo "=== COLD vs WARM @ --ram $RAM, $NTOK tok/prompt, V4_DRAFT=$V4DRAFT V4_NGRAM=$V4NGRAM, PREFETCH=$PREFETCH ==="
 echo "--- tearing down for a genuinely cold start ---"
 pkill -f 'coli serve' 2>/dev/null; pkill -f openai_server 2>/dev/null
 pkill -f 'libexec/colibri/deepseek_v4' 2>/dev/null
@@ -133,7 +139,7 @@ tmux send-keys -t colibri-lab:0.0 C-c 2>/dev/null
 for i in $(seq 1 30); do sleep 2; [ -z "$(lsof -ti:8090 2>/dev/null)" ] && break; done
 sleep 4
 echo "  pre-start compressor: $(comp_gb) GB (gate limit ${GATE_COMPRESSOR_GB})"
-tmux send-keys -t colibri-lab:0.0 "clear && env V4_DRAFT=4 V4_NGRAM=1 COLI_V4_EXPERT_PREFETCH=$PREFETCH COLI_MODEL=$MODEL $BASE/bin/coli serve --ram $RAM --port 8090" Enter
+tmux send-keys -t colibri-lab:0.0 "clear && env V4_DRAFT=$V4DRAFT V4_NGRAM=$V4NGRAM COLI_V4_SAVE_USAGE=$SAVEUSAGE COLI_V4_EXPERT_PREFETCH=$PREFETCH COLI_MODEL=$MODEL $BASE/bin/coli serve --ram $RAM --port 8090" Enter
 MID=""
 for i in $(seq 1 90); do
   sleep 5

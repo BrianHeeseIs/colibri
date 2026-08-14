@@ -2200,3 +2200,92 @@ I would have published a **1.73x inflated** p256 number. It still would have fai
 the verdict is unchanged — but the honest margin is 2.70 %, not 4.67 %.
 
 **Rule earned: never diff against a baseline measured at a different time. Pair every A with its B.**
+
+---
+
+## E57. STOCK vs RECOMMENDED, measured end-to-end — **the +80.7 % composition is WRONG, and the sign is inverted**
+
+The comparison nobody had run: `(--ram 48, no speculation)` against `(--ram 96, V4_DRAFT=4 V4_NGRAM=1)`
+in **one interleaved session**. RESULTS.md quotes n-gram at +18.5 % and `--ram 48->96` at +33.8 %
+cold / +52.5 % warm; I composed those to a **modelled +58.6 % cold / +80.7 % warm** and explicitly
+labelled it unverified. It is now verified, and it is wrong.
+
+### Design
+ABBA (A1 stock, B1 reco, B2 reco, A2 stock), fresh engine per arm, `NTOK=64`, 4 coding prompts,
+cold + warm, compressor gated **before and after** every prompt, frozen `.coli_usage`
+(`599f3d12`, 29127 B) restored **and md5-verified before and after each arm**.
+
+### Result — the recommended config is SLOWER
+A2 vs B2, both on a quiet machine, both **8/8 gate-clean**:
+
+| pass | # | stock (ram48, no spec) | reco (ram96, n-gram) | delta |
+|---|---|---|---|---|
+| cold | 1 | 0.3122 | 0.2936 | −6.0 % |
+| cold | 2 | 0.4267 | 0.3765 | −11.8 % |
+| cold | 3 | 0.6154 | 0.5766 | −6.3 % |
+| cold | 4 | 0.5714 | 0.4384 | −23.3 % |
+| **cold mean** | | **0.4814** | **0.4213** | **−12.5 %** |
+| warm | 1 | 0.3879 | 0.3516 | −9.4 % |
+| warm | 2 | 0.4238 | 0.4156 | −1.9 % |
+| warm | 3 | 0.6154 | 0.5714 | −7.1 % |
+| warm | 4 | 0.5565 | 0.5378 | −3.4 % |
+| **warm mean** | | **0.4959** | **0.4691** | **−5.4 %** |
+
+**0/4 wins for the recommended config in BOTH passes. 8/8 paired losses.**
+
+| | modelled | measured | miss |
+|---|---|---|---|
+| cold | +58.6 % | **−12.5 %** | −71.1 pp |
+| warm | +80.7 % | **−5.4 %** | −86.1 pp |
+
+### Why the composition failed
+The two source figures came from **different workloads**, and composing across them was invalid —
+which I flagged as an assumption and which is now disproven, not merely doubted:
+
+- n-gram's **+18.5 %** was measured on **10 fixed prompts on ONE topic, 24 tokens** — maximally
+  repetitive, which is the ideal case for prompt-lookup drafting. This experiment uses **4 diverse
+  coding prompts**, where drafts miss. §2 already recorded the mechanism: each rejected suffix
+  forces a recurrent-attention replay, and that tax cancels the saved forward passes.
+- the RAM figures came from a different session at 128 tok/prompt.
+
+### CONFOUND, stated plainly
+This arm moves **two variables at once** (48->96 GB *and* speculation off->on). It answers
+*"is the recommended config faster than stock on this workload?"* — **no, it is 5-12 % slower** —
+but it does **not** attribute that loss to RAM or to speculation individually. Splitting them needs
+two more arms (`ram96 + no-spec`, `ram48 + spec`). **Do not cite this as evidence against `--ram 96`
+alone or against n-gram alone.**
+
+### The ABBA order prevented publishing a false positive
+Ambient load was measured directly, on **identical config** (A1 vs A2, `--ram 48`, no spec):
+
+| pass | busy (27.9 GB non-engine) | quiet (9.7 GB) | effect |
+|---|---|---|---|
+| cold | 0.3718 | 0.4814 | **+29.5 %** |
+| warm | 0.4340 | 0.4959 | **+14.2 %** |
+
+§11 documented a 22 % ambient swing; cold measured **29.5 %** here. Because the user freed memory
+mid-run, A1 ran busy and B2 ran quiet. Comparing **A1 warm vs B2 warm gives +8.1 %** — a plausible
+"directionally confirms the model, just smaller" headline. The truth from the matched-ambient pair
+is **−5.4 %**. Without the second stock arm that false positive was publishable.
+
+### Arm B1 died exactly as §11/§4d predict
+B1 ran `--ram 96` before the desktop was freed (~27.9 GB non-engine, ~122 GB total). **7 of 8 rows
+gate-failed**, compressor peaking at **73.1 GB** — the engine's own cache being squeezed. After the
+desktop was freed (12.6 GB non-engine, ~107 GB total) B2 ran **8/8 clean** with gap ~0.1 GB. This is
+the first time `--ram 96` has held gate-clean under a real workload on this host, and it confirms
+§11's rule is about **engine + non-engine total**, not the engine budget alone.
+
+### Harness defects found and fixed
+1. `coldwarm2.sh` **hardcoded `V4_DRAFT=4 V4_NGRAM=1`** at the serve launch — the no-speculation arm
+   was impossible to express. Parameterized (`V4DRAFT`/`V4NGRAM`, defaults preserve prior behaviour).
+2. `coldwarm2.sh` **never froze `.coli_usage`** — no `COLI_V4_SAVE_USAGE=0`, no snapshot restore —
+   while `prewarm_ab.sh:17-19` documents that as mandatory for multi-arm A/Bs. Caught ~2 minutes into
+   the first launch and **restarted**; added `SAVEUSAGE` (default 0) plus before/after md5 assertion.
+3. `libexec/colibri/deepseek_v4` was **stale** (Aug 13 `29ba3ead`) vs `c/deepseek_v4`
+   (`1b658b15`) — the live §10 hazard. Every `bin/coli` harness would have measured old code.
+4. `coldwarm2.sh`'s inline report crashes on tagged CSVs (`int('96_recoB1')`). Cosmetic; the
+   standalone `ab_stock_reco_report.py` parses correctly.
+
+### Standing
+n=4 per pass, one workload, one host. The **direction** is solid (8/8 paired losses, zero gate
+failures in either compared arm) but the magnitude is n=4. **The +80.7 % figure is retracted.**
