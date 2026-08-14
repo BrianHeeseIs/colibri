@@ -1984,3 +1984,54 @@ prefetch path.
 **Status: engine work paused at the pre-committed gate.** The feature is correct, bit-exact, and
 default-OFF; it is worth 7-9.5 % if kept. The larger prize is now clearly the unpacked-expert
 compute path, which is a different change.
+
+---
+
+## E53. Unpacked-expert kernel hypothesis — **DEAD at the gate. Ratio 1.099x, not the 4.8x claimed.**
+
+Third mechanism hypothesis for the prefill/decode per-op gap, killed by a pre-committed gate
+before any engine code was written.
+
+### The hypothesis
+Expert dispatch (`c/deepseek_v4.c:7188-7191`) falls back to `coli_v4_expert_forward_v17_fallback`
+unless all three tensors have `block_rows == 16`; only *pinned* slots are ever packed
+(`hot_pack_slot_locked`, gated on `hot_is_pinned` at :6853/:6919). Coverage is ~876-891 pack events
+against 7052 slots. The fallback primitives (`quant.h:1427-1476`, `:1478-1549`) walk 4 output rows
+with **scalar** accumulators; the rows16 arm64 kernel (`:12179-12203`) walks **16 output rows with
+four `float32x4_t` NEON vectors**. So: prefill runs cold/unpacked on a scalar kernel, decode runs
+hot/packed on a NEON kernel — plausibly the whole 4.8x.
+
+### The measurement (bench/kernel_gap.c, real shapes 2048x4096 / 4096x2048, n=100 warm)
+| path | ms/expert | GFLOP/s |
+|---|---|---|
+| fallback (4-row scalar) | 4.427 +/- 0.079 | 11.38 |
+| rows16 (16-row NEON) | 4.027 +/- 0.099 | 12.51 |
+| **ratio** | **1.099x** | — |
+
+Kill criterion was **< 1.5x ⇒ stop**. **1.099x. Hypothesis dead.**
+Bit-exactness confirmed as documented: max abs and max rel delta **0**, 0/4096 outputs differ.
+
+**Packing also fails independently.** Pack cost 3.846 +/- 0.080 ms/expert (13.90 GB/s against the
+4x-record_bytes traffic model), so `N_breakeven = pack_ms / (fallback_ms - rows16_ms) = 9.62 uses`.
+A prefill chunk gives an expert only ~4.4 uses (64 tokens x 6 / ~87 unique). **Packing costs more
+than it repays.** Both candidate fixes are dead on the same measurement.
+
+### The contradiction the bench exposed (more useful than the verdict)
+Single-threaded kernel cost is **4.0-4.4 ms/expert**, yet the engine measures **1.96 ms/op in
+prefill and 0.41 ms/op in warm decode** — the engine is 2.3x/10.8x *faster than one thread*.
+A thread cannot beat itself: **the engine parallelises the expert matmul** (CFLAGS carry
+`$(V4_OMPC) -lomp`). Consequences:
+1. The **ratio** stands — both kernels were measured identically, so the kernel is not the gap.
+2. The **absolute** microbench numbers do not model the engine and must not be used to project any
+   engine-level saving. Any future kernel work must be measured in-engine or with matched threading.
+
+### Where this leaves the prefill gap
+Prefill runs a **23.6 % miss rate** (4257/18060) versus 5-12 % in steady-state decode, and the
+87.81 GiB expert cache *fills during prefill* — roughly 5.8 M first-touch page faults, ~8.6 s of
+pure fault cost on the p064 timeline. Miss-handling (slab first-touch, slot select, publish under
+the store mutex) is the remaining suspect.
+
+**But I have now been wrong about mechanism three times** — E46 "shader-bound" (retracted by E48),
+E51 "84 % SSD wait" (retracted by E52), and now E53 "unpacked kernel". Each time the *outcome*
+measurement held and the *explanation* did not. **The next step must be direct instrumentation of
+the miss path, not a fourth hypothesis.** No engine code was written for this lane.
