@@ -1457,7 +1457,13 @@ Identical within noise, no `COLI_V4_METAL_STATS=1` output, output md5 unchanged
      E33's CPU 4-row kernel was built for. Setting `COLI_V4_METALLIB` explicitly still did not make
      it fire, so at least one precondition rejects every expert in this configuration.
 
-**Conclusion:** GPU offload of `expert_forward` is not a greenfield build — substantial machinery
+**[CORRECTED 2026-08-14 by E43 — the conclusion below was WRONG.]** The "never executes" finding
+was an artifact of a stale build: `make` does **not** recompile the 26 C units when the `METAL` flag
+changes, so the `#ifdef COLI_V4_METAL_SEAM` call sites stayed compiled out while the Metal object
+still linked (hence 8 Metal symbols and zero effect). `make clean` does not remove the objects
+either. A true rebuild requires `rm -f c/*.o`. With that, Metal **does** execute — see E43.
+
+**Original (superseded) conclusion:** GPU offload of `expert_forward` is not a greenfield build — substantial machinery
 already exists but is inert. The next step is diagnosing *which* precondition rejects (add a
 one-line reject-reason log), not writing new kernels. Recorded, no code changed; default build
 restored to METAL=0 and re-verified against the golden md5.
@@ -1489,3 +1495,50 @@ already turned one "certain" win into an 11 % regression.
 ">=30 % of selections in groups S>=8"; measured **46.9 % at chunk 64**, rising to 72.9 % at 184. So
 the routing data supports GPU-side grouping. However E42 established the Metal expert path never
 executes today, so M5 is blocked behind diagnosing that, not behind routing telemetry.
+
+---
+
+## E43. Metal expert path — **it works, it is bit-exact, and it is 2.67x SLOWER** (lane closed)
+
+Scoped by the user to "diagnose only, then report". Added env-gated relaxed-atomic reject counters
+to `coli_v4_metal_expert_forward` (`c/backend_metal_v4.mm`) and made the metallib path absolute in
+`c/Makefile.deepseek-v4` (it was CWD-relative; note `coli_v4_metal_init` has a compile-from-source
+fallback, so that path bug was never fatal).
+
+### First: E42's premise was a build artifact
+`make` does not recompile the 26 C units when `METAL` changes, and `make clean` does not remove the
+objects. So `make METAL=1` relinked the Metal backend while every `#ifdef COLI_V4_METAL_SEAM` call
+site stayed compiled out — 8 Metal symbols present, zero calls made. Proven by the counters:
+`ok=0` **and** `library kind=none`, i.e. the function was never invoked, not rejected.
+**A true switch requires `rm -f c/*.o`.** I fell into this twice; it is now documented.
+
+### With a true METAL=1 build, Metal fires
+Same-build A/B, 30-token generation, warm:
+
+| | expert_forward | decode_wall | metal counters |
+|---|---|---|---|
+| `COLI_V4_METAL=0` | 5188.6 ms | 18904.0 ms | `ok=0` (never called) |
+| `COLI_V4_METAL=1` | **13841.8 ms** | **26726.4 ms** | `ok=7187 layout=5455 kind=metallib` |
+
+- **56.9 %** of experts (7187/12642) dispatch to the GPU; **43.1 %** fall back to CPU.
+- Rejections are **exclusively** `block_rows/block_columns` — the rows16 hot-packed layout.
+  Every other field (format, pointers, rows, columns, row_bytes, groups) matches. So the layout
+  mismatch is *fixable*, not fundamental.
+- **Output is byte-identical** (`e451c131bc0e30aab4dbfffee2780ea4` both ways). The GPU path is
+  numerically correct.
+- **But it is 2.67x slower on the phase and 1.41x slower end-to-end.**
+
+### Why — and why fixing the layout would make it WORSE
+Per-GPU-dispatch cost works out to **~1.614 ms for one 13.37 MB expert**, versus **0.410 ms** for
+the same expert on the CPU path. The GPU is ~4x slower *per expert*, dominated by per-dispatch
+buffer binding rather than by the matmul. Since the rejected 43.1 % currently take the *fast* CPU
+path, "fixing" the rows16 layout mismatch would push more work onto the slower path and make the
+regression bigger.
+
+**Verdict: lane closed.** Making Metal competitive would require batched multi-expert dispatch to
+amortize the ~1.2 ms overhead — i.e. the M5 `gpu_gather_moe` design. E38 measured mean group size
+S=4.1 at chunk 64 (7.65 at whole-prompt), so even perfect grouping amortizes ~1.2 ms over ~4-8
+experts while the CPU path already runs at 36.5 GMAC/s. Poor expected value for a large rewrite.
+
+Diagnostics and the metallib path fix are kept (inert by default). Default build re-verified:
+26 objects, 0 Metal symbols, golden md5 `5d04890413ff539e802985ce8c727814`.

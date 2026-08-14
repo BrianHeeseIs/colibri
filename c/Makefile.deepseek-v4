@@ -102,6 +102,7 @@ V4_METAL_SOURCES := $(sort $(wildcard metal/coli_v4_*.metal))
 V4_METAL_AIR := $(patsubst metal/%.metal,$(V4_METAL_BUILD_DIR)/%.air,$(V4_METAL_SOURCES))
 V4_METAL_LIB :=
 V4_METAL_LIB_FILE := $(V4_METAL_BUILD_DIR)/deepseek_v4.metallib
+V4_METAL_LIB_PATH := $(abspath $(V4_METAL_LIB_FILE))
 V4_METAL_SOURCE_HEADER := $(V4_METAL_BUILD_DIR)/deepseek_v4_source.h
 METALXX ?= clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 METALC ?= xcrun -sdk macosx metal
@@ -152,7 +153,7 @@ $(V4_METAL_SOURCE_HEADER): $(V4_METAL_SOURCES) | $(V4_METAL_BUILD_DIR)
 			'#endif'; } > $@
 
 $(V4_METAL_BACKEND_OBJ): backend_metal_v4.mm backend_metal_v4.h backend_metal_v4_seam.h $(V4_METAL_SOURCE_HEADER)
-	$(METALXX) -DCOLI_METAL -DCOLI_V4_DEFAULT_METALLIB='"$(V4_METAL_LIB_FILE)"' -c $< -o $@
+	$(METALXX) -DCOLI_METAL -DCOLI_V4_DEFAULT_METALLIB='"$(V4_METAL_LIB_PATH)"' -c $< -o $@
 
 deepseek-v4-metal-lib: $(V4_METAL_LIB_FILE)
 

@@ -36,7 +36,49 @@ static const char *coli_v4_library_kind_value = "none";
 static int coli_v4_metal_enabled_value;
 static int coli_v4_metal_variant_value;
 static int coli_v4_metal_profile_enabled_value;
+static int coli_v4_metal_stats_enabled_value;
 static _Atomic unsigned long coli_v4_metal_dispatch_count;
+
+typedef enum {
+    COLI_V4_METAL_REJECT_VARIANT,
+    COLI_V4_METAL_REJECT_INIT,
+    COLI_V4_METAL_REJECT_QUEUE,
+    COLI_V4_METAL_REJECT_DIMS,
+    COLI_V4_METAL_REJECT_LAYOUT,
+    COLI_V4_METAL_REJECT_PIPELINES,
+    COLI_V4_METAL_REJECT_COUNT,
+} ColiV4MetalReject;
+
+typedef enum {
+    COLI_V4_METAL_TENSOR_GATE,
+    COLI_V4_METAL_TENSOR_UP,
+    COLI_V4_METAL_TENSOR_DOWN,
+    COLI_V4_METAL_TENSOR_COUNT,
+} ColiV4MetalTensor;
+
+typedef enum {
+    COLI_V4_METAL_LAYOUT_FORMAT,
+    COLI_V4_METAL_LAYOUT_POINTERS,
+    COLI_V4_METAL_LAYOUT_ROWS,
+    COLI_V4_METAL_LAYOUT_COLUMNS,
+    COLI_V4_METAL_LAYOUT_ROW_BYTES,
+    COLI_V4_METAL_LAYOUT_GROUPS,
+    COLI_V4_METAL_LAYOUT_BLOCK_DIMS,
+    COLI_V4_METAL_LAYOUT_FIELD_COUNT,
+} ColiV4MetalLayoutField;
+
+static _Atomic unsigned long coli_v4_metal_rejects[COLI_V4_METAL_REJECT_COUNT];
+static _Atomic unsigned long coli_v4_metal_successes;
+static _Atomic unsigned long coli_v4_metal_layout_tensors[COLI_V4_METAL_TENSOR_COUNT];
+static _Atomic unsigned long coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_FIELD_COUNT];
+
+static void coli_v4_metal_stats_report(void);
+
+static void coli_v4_metal_reject(ColiV4MetalReject reject) {
+    if (coli_v4_metal_stats_enabled_value)
+        atomic_fetch_add_explicit(&coli_v4_metal_rejects[reject], 1,
+                                  memory_order_relaxed);
+}
 
 typedef enum {
     COLI_V4_PROFILE_HOST_WEIGHT_MEMCPY,
@@ -255,6 +297,44 @@ static int coli_v4_ordered_cold_tensor_valid(const ColiTensorView *tensor,
            tensor->scale_bytes == (size_t)rows * groups;
 }
 
+static void coli_v4_record_layout_mismatches(
+    const ColiTensorView *tensor, int rows, int columns, size_t row_bytes,
+    size_t groups, ColiV4MetalTensor tensor_kind) {
+    if (coli_v4_ordered_cold_tensor_valid(tensor, rows, columns,
+                                          row_bytes, groups)) return;
+    atomic_fetch_add_explicit(&coli_v4_metal_layout_tensors[tensor_kind], 1,
+                              memory_order_relaxed);
+    if (!tensor) {
+        atomic_fetch_add_explicit(
+            &coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_POINTERS], 1,
+            memory_order_relaxed);
+        return;
+    }
+#define COLI_V4_LAYOUT_MISMATCH(field, condition) do { \
+        if (condition) \
+            atomic_fetch_add_explicit(&coli_v4_metal_layout_fields[field], 1, \
+                                      memory_order_relaxed); \
+    } while (0)
+    COLI_V4_LAYOUT_MISMATCH(
+        COLI_V4_METAL_LAYOUT_FORMAT,
+        tensor->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        tensor->scale_format != COLI_SCALE_UE8M0);
+    COLI_V4_LAYOUT_MISMATCH(COLI_V4_METAL_LAYOUT_POINTERS,
+                            !tensor->data || !tensor->scales);
+    COLI_V4_LAYOUT_MISMATCH(COLI_V4_METAL_LAYOUT_ROWS,
+                            tensor->rows != rows);
+    COLI_V4_LAYOUT_MISMATCH(COLI_V4_METAL_LAYOUT_COLUMNS,
+                            tensor->columns != columns);
+    COLI_V4_LAYOUT_MISMATCH(COLI_V4_METAL_LAYOUT_ROW_BYTES,
+                            tensor->data_bytes != (size_t)rows * row_bytes);
+    COLI_V4_LAYOUT_MISMATCH(COLI_V4_METAL_LAYOUT_GROUPS,
+                            tensor->scale_bytes != (size_t)rows * groups);
+    COLI_V4_LAYOUT_MISMATCH(COLI_V4_METAL_LAYOUT_BLOCK_DIMS,
+                            tensor->block_rows != 1 ||
+                            tensor->block_columns != 32);
+#undef COLI_V4_LAYOUT_MISMATCH
+}
+
 static id<MTLComputePipelineState> __attribute__((unused)) coli_v4_get_expert_pipeline(void) {
     if (coli_v4_expert_pipeline) return coli_v4_expert_pipeline;
     if (!coli_v4_device || !coli_v4_library) return nil;
@@ -301,6 +381,9 @@ __attribute__((constructor)) static void coli_v4_metal_read_environment(void) {
     coli_v4_metal_enabled_value = enabled && !strcmp(enabled, "1");
     const char *profile = getenv("COLI_V4_METAL_PROFILE");
     coli_v4_metal_profile_enabled_value = profile && !strcmp(profile, "1");
+    const char *stats = getenv("COLI_V4_METAL_STATS");
+    coli_v4_metal_stats_enabled_value = stats && !strcmp(stats, "1");
+    if (coli_v4_metal_stats_enabled_value) atexit(coli_v4_metal_stats_report);
 
     const char *variant = getenv("COLI_V4_METAL_VARIANT");
     if (!variant || !strcmp(variant, "ordered_cold"))
@@ -333,9 +416,18 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
     float *out, const ColiExpertView *expert, const float *input,
     float route_weight, float swiglu_limit) {
     if (!out || !expert || !input || swiglu_limit < 0.0f ||
-        coli_v4_metal_variant() != 0) return -1;
-    if (!coli_v4_metal_available() && !coli_v4_metal_init(NULL)) return -1;
-    if (!coli_v4_queue) return -1;
+        coli_v4_metal_variant() != 0) {
+        coli_v4_metal_reject(COLI_V4_METAL_REJECT_VARIANT);
+        return -1;
+    }
+    if (!coli_v4_metal_available() && !coli_v4_metal_init(NULL)) {
+        coli_v4_metal_reject(COLI_V4_METAL_REJECT_INIT);
+        return -1;
+    }
+    if (!coli_v4_queue) {
+        coli_v4_metal_reject(COLI_V4_METAL_REJECT_QUEUE);
+        return -1;
+    }
 
     const int64_t hidden64 = expert->down.rows;
     const int64_t intermediate64 = expert->gate.rows;
@@ -345,7 +437,10 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         expert->gate.columns != expert->up.columns ||
         expert->gate.columns != hidden64 ||
         expert->down.rows != hidden64 ||
-        expert->down.columns != intermediate64) return -1;
+        expert->down.columns != intermediate64) {
+        coli_v4_metal_reject(COLI_V4_METAL_REJECT_DIMS);
+        return -1;
+    }
 
     const int hidden = (int)hidden64;
     const int intermediate = (int)intermediate64;
@@ -361,9 +456,26 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
                                            gate_groups) ||
         !coli_v4_ordered_cold_tensor_valid(&expert->down, hidden,
                                            intermediate, down_row_bytes,
-                                           down_groups)) return -1;
+                                           down_groups)) {
+        if (coli_v4_metal_stats_enabled_value) {
+            coli_v4_record_layout_mismatches(
+                &expert->gate, intermediate, hidden, gate_row_bytes,
+                gate_groups, COLI_V4_METAL_TENSOR_GATE);
+            coli_v4_record_layout_mismatches(
+                &expert->up, intermediate, hidden, gate_row_bytes,
+                gate_groups, COLI_V4_METAL_TENSOR_UP);
+            coli_v4_record_layout_mismatches(
+                &expert->down, hidden, intermediate, down_row_bytes,
+                down_groups, COLI_V4_METAL_TENSOR_DOWN);
+        }
+        coli_v4_metal_reject(COLI_V4_METAL_REJECT_LAYOUT);
+        return -1;
+    }
 
-    if (!coli_v4_get_chain_pipelines()) return -1;
+    if (!coli_v4_get_chain_pipelines()) {
+        coli_v4_metal_reject(COLI_V4_METAL_REJECT_PIPELINES);
+        return -1;
+    }
 
     @autoreleasepool {
         const size_t input_bytes = (size_t)hidden * sizeof(*input);
@@ -598,6 +710,9 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         memcpy(out, coli_v4_output_scratch.contents, output_bytes);
         atomic_fetch_add_explicit(&coli_v4_metal_dispatch_count, 1,
                                   memory_order_relaxed);
+        if (coli_v4_metal_stats_enabled_value)
+            atomic_fetch_add_explicit(&coli_v4_metal_successes, 1,
+                                      memory_order_relaxed);
         return 0;
 #undef COLI_V4_PROFILE_FLUSH
     }
@@ -713,6 +828,67 @@ COLI_V4_METAL_EXTERN int coli_v4_metal_available(void) {
 
 COLI_V4_METAL_EXTERN const char *coli_v4_metal_library_kind(void) {
     return coli_v4_library_kind_value;
+}
+
+static void coli_v4_metal_stats_report(void) {
+    fprintf(stderr,
+            "v4_metal_reject variant=%lu init=%lu queue=%lu dims=%lu "
+            "layout=%lu pipelines=%lu ok=%lu\n",
+            atomic_load_explicit(
+                &coli_v4_metal_rejects[COLI_V4_METAL_REJECT_VARIANT],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_rejects[COLI_V4_METAL_REJECT_INIT],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_rejects[COLI_V4_METAL_REJECT_QUEUE],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_rejects[COLI_V4_METAL_REJECT_DIMS],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_rejects[COLI_V4_METAL_REJECT_LAYOUT],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_rejects[COLI_V4_METAL_REJECT_PIPELINES],
+                memory_order_relaxed),
+            atomic_load_explicit(&coli_v4_metal_successes,
+                                 memory_order_relaxed));
+    fprintf(stderr,
+            "v4_metal_layout tensor_gate=%lu tensor_up=%lu tensor_down=%lu "
+            "format=%lu pointers=%lu rows=%lu columns=%lu row_bytes=%lu "
+            "groups=%lu block_dims=%lu\n",
+            atomic_load_explicit(
+                &coli_v4_metal_layout_tensors[COLI_V4_METAL_TENSOR_GATE],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_tensors[COLI_V4_METAL_TENSOR_UP],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_tensors[COLI_V4_METAL_TENSOR_DOWN],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_FORMAT],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_POINTERS],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_ROWS],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_COLUMNS],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_ROW_BYTES],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_GROUPS],
+                memory_order_relaxed),
+            atomic_load_explicit(
+                &coli_v4_metal_layout_fields[COLI_V4_METAL_LAYOUT_BLOCK_DIMS],
+                memory_order_relaxed));
+    fprintf(stderr, "v4_metal_library kind=%s\n", coli_v4_library_kind_value);
 }
 
 COLI_V4_METAL_EXTERN void coli_v4_metal_profile_report(void) {
