@@ -478,8 +478,13 @@ real one and gives a falsely optimistic answer.
 
 **Why this is the right first move:** it exercises the *entire* risky surface — gather, ascending-id
 combine, per-token scales, lease capacity/waves, loader-overlap scheduling, the batch-block phase
-split — while the numerics stay on the already-bit-exact CPU path. If grouping does not pay on CPU,
-it will not pay on GPU either, and the Metal rewrite is dead for ~1 day of work instead of ~2 weeks.
+split — while the numerics stay on the already-bit-exact CPU path. It answers, for ~1 day of work
+instead of ~2 weeks, the two questions that do NOT depend on the compute device: **is the grouped
+pipeline token-exact**, and **how much does the scheduler itself cost**.
+
+**It does NOT decide whether the GPU kernel pays.** CPU and GPU scale differently with batch — from
+S=1 to S=16 the CPU improves 1.25x while the GPU improves 2.9x (§2.1) — so a CPU grouped scheduler
+that fails to speed up proves nothing about Metal. Only the overhead criterion (K0) transfers.
 
 **T-1 acceptance:** `bench/golden.sh` md5-stable AND token-exact; scheduler overhead measured and
 recorded; prefill delta recorded interleaved.
@@ -502,7 +507,7 @@ the GPU kernel win cannot pay for the scheduler and the Metal work is dead. Othe
 Wave 0:             T-1 CPU grouped scheduler  [KILL TEST]
 Wave 1 (parallel):  T0 baseline+harness | T1 failing oracle (RED) | T2 seam+stub
 Wave 2 (parallel):  T3 gather/permute   | T4 batched kernel       | T5 per-token QDQ scales
-Wave 3:             T6 host glue (one command buffer)
+Wave 3:             T6 host glue (per-WAVE command buffers, waits == waves)
 Wave 4:             T7 ascending-id combine
 Wave 5:             T8 wire at :5110-5143   -> T12 regression gate
 Wave 6 (parallel):  T9 chunk-cap lever   | T10 decode/spec applicability
