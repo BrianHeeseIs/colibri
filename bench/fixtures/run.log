@@ -1,0 +1,9 @@
+fixture stdout before generated block
+generated_text=First generated line
+Second generated line
+v4_profile phase=embed total_ms=20.000 calls=1
+v4_profile phase=attention total_ms=50.000 calls=2
+v4_profile phase=expert_forward total_ms=80.000 calls=3
+v4_profile phase=other total_ms=50.000
+v4_profile decode_tokens=1 decode_wall_ms=200.000 accounted_pct=75.0
+timing time_to_first_token=1.250s after_first=0.200s
