@@ -153,11 +153,17 @@ Only **37 %** of the 256-expert space is touched per chunk. Uniform-random routi
 would touch ~202 experts; the actual 94 means **routing is heavily concentrated** — which favours
 batching.
 
-**The prize at chunk=64:**
-- **4.1x fewer dispatches** (94 instead of 384)
-- **4.1x less weight traffic** (each expert's 13.37 MB read once, not 4.1 times)
-- stacked on the **3.08x** GPU bandwidth advantage
-- landing at S≈4, where the measured GPU advantage is **1.52x**
+**The prize at chunk=64 — stated as ONE effect, not a stack.** Draft 1 listed these as if they
+multiplied. They do not: fewer dispatches, less weight traffic and the higher GPU bandwidth are
+**three descriptions of the same underlying change** (reading each expert's weights once for ~4
+tokens instead of once per token). Their combined, already-measured expression is a single number:
+
+> **at S≈4 the GPU is 1.52x faster per token than the CPU on the real gate/up shape** (§2.1).
+
+That 1.52x — not 4.1x, not 3.08x, and certainly not their product — is the only quantity that enters
+the performance model in §0/§6/§7. Structural consequences worth stating separately (they change the
+*shape* of the work, not the multiplier): dispatch count falls 384 → ~94 per chunk, and each expert's
+13.37 MB is read once rather than ~4 times.
 
 ### 2.3 The independent lever
 
@@ -279,7 +285,27 @@ intermediate bf16 round, is **not bit-exact** even with a perfect reduction orde
 the routed sum completes **first**, then `+ shared_output`, then **one** final bf16
 (`:4886-4897`) — the shared expert is never folded in early.
 
-### 4.7 Other pinned numerics
+### 4.7 Exact bf16 stage boundaries (pinned)
+
+Every bf16 rounding site is semantic. The full ordered chain a batched kernel must reproduce, per
+token per expert (`:7681-7695`):
+
+1. activation QDQ (fp8, per token, per 128-col block) — inside the matvec
+2. **gate** GEMV, **up** GEMV
+3. **bf16-round `gate` AND `up`** — `coli_bf16_round_array` **BEFORE** swiglu (`:7684-7685`)
+4. swiglu with limit clamp (`:1641`, `:7686`)
+5. **`activated[i] = bf16_round(activated[i] * route_weight)`** — route weight applied and rounded
+   **BEFORE** the down matvec (`:7690-7691`)
+6. **down** GEMV (`:7692`)
+7. **bf16-round the expert output** — `coli_bf16_round_array(output, ...)` **after** down and
+   **before** this expert is accumulated into the routed sum (`:7695`)
+8. routed sum accumulates in **fp32, ascending expert id, no per-add rounding** (§4.5)
+9. `+ shared_output`, then **ONE** final bf16 (`:4886-4897`)
+
+Moving, adding, or omitting **any** of rounds 3, 5, 7 or 9 breaks bit-exactness even with a perfect
+reduction order.
+
+### 4.7b Other pinned numerics
 
 - bf16 round `:11949` — RNE with tie, exponent-all-ones skip
 - swiglu `:1641` — `gate = fmin(gate, limit)`, `up = fmax(-limit, fmin(up, limit))`
@@ -301,10 +327,18 @@ records), and layers 0–2 already fall back today at 188/184/188.
 achievable.** The design must therefore specify, and T6 must implement:
 
 1. **Preflight**: compare `n_unique` against `coli_v4_prefill_store_capacity()` before acquiring.
-2. **Expert waves**: if `n_unique > capacity`, split the chunk's experts into `ceil(n_unique/capacity)`
-   waves, each wave one command buffer, each wave's leases released before the next acquires.
-   Wave boundaries must not break the ascending-expert-id combine (§4.5) — accumulate into a
-   persistent per-token fp32 accumulator across waves, in ascending id order.
+2. **Expert waves with reserved loader headroom.** A wave must NOT be sized at full capacity.
+   Victim selection requires `references == 0` (`:7241`) and lookup fails when no slot is free
+   (`:7256`), while the miss loader itself holds `references = 1` (`:7324`). **If wave N holds all
+   164 slots, the loader cannot fetch wave N+1 at all** — §4.8 and §4.9 would contradict each other.
+   Therefore:
+   ```
+   compute_wave_size <= capacity - loader_reserve      (loader_reserve > 0, tunable, default 16)
+   wave_count        =  ceil(n_unique / compute_wave_size)
+   ```
+   Each wave is one command buffer; its leases are released after its wait. Wave boundaries must not
+   break the ascending-expert-id combine (§4.5) — accumulate into a **persistent per-token fp32
+   accumulator across waves, visited in ascending id order**.
 3. **Partial-acquisition rollback**: if acquisition fails mid-wave, release everything acquired so
    far and fall back to the S=1 path for that layer-chunk. No leaked leases.
 4. **Whole-layer fallback**: preserved and tested, not assumed.
@@ -366,9 +400,21 @@ today.
 ### 5.4 Dispatch model
 
 Today: one command buffer + one `waitUntilCompleted` **per token-expert** (384 per chunk).
-Target: **one command buffer per chunk**, `n_unique` (~94) kernel dispatches inside it, **one**
-`waitUntilCompleted`. The lease invariant is preserved because the single blocking wait still
-precedes every `coli_expert_release` for that chunk.
+
+Target: **one command buffer per WAVE** (not per chunk — §4.8 proves a chunk may need >1 wave when
+`n_unique` exceeds `capacity - loader_reserve`), with that wave's experts dispatched inside it and
+**one wait per wave**. The lease invariant holds because each wave's blocking wait precedes that
+wave's `coli_expert_release` calls.
+
+**Exact contract (this is what T6 asserts):**
+```
+command_buffers == wave_count
+waits           == wave_count
+dispatches      == n_unique          (summed over waves)
+releases        occur after the corresponding wait, never before
+leaked leases   == 0
+```
+In the common case `n_unique <= compute_wave_size` this degenerates to `wave_count == 1`.
 
 ### 5.4b Route-cache un-gating is NOT a one-line change
 
@@ -406,17 +452,43 @@ a free asset.
 Both reviewers independently proposed the same cheapest-earliest detector, and it reorders the plan.
 
 **Do not write a single line of Metal until this passes.** Implement the gather/permute/grouped/
-unpermute pipeline **entirely on CPU**, reusing the *existing* exact batched references
-(`coli_fp4_matmul_batch_ref :12389`, `coli_fp8_matmul_batch_ref :12317`). No GPU, no new kernel, no
-seam change. Then measure warm prefill.
+unpermute pipeline **entirely on CPU**. No GPU, no new kernel, no seam change.
+
+**Layout constraint (found in review — the naive version of this task is impossible).**
+`coli_fp4_matmul_batch_ref` (`:12389`) rejects any view with `block_rows != 1` (`:12396`), but warm
+**pinned experts are rows16** (`hot_fill_view :7063`). So the existing batched ref **cannot be used
+on the warm path**. T-1 must therefore do ONE of:
+  - **(a)** scope T-1 to **cold-layout experts only** and state that explicitly in its result, or
+  - **(b)** add a rows16 batched reference (`coli_fp4_matmul_batch_rows16_ref`) as part of T-1, or
+  - **(c)** unpack rows16 → rows1 in the gather step and pay that cost, measuring it separately.
+**(a) is the cheapest honest option and is the default**; (b) is required before T-1's result can be
+generalised to the warm path.
+
+**T-1 must use the SAME policy as the eventual GPU path** — capacity preflight, wave sizing with
+`loader_reserve`, rollback, and loader overlap — otherwise it measures an easier problem than the
+real one and gives a falsely optimistic answer.
 
 **Why this is the right first move:** it exercises the *entire* risky surface — gather, ascending-id
 combine, per-token scales, lease capacity/waves, loader-overlap scheduling, the batch-block phase
 split — while the numerics stay on the already-bit-exact CPU path. If grouping does not pay on CPU,
 it will not pay on GPU either, and the Metal rewrite is dead for ~1 day of work instead of ~2 weeks.
 
-**T-1 acceptance:** golden md5-stable AND token-exact; warm prefill delta recorded interleaved.
-**T-1 KILL (K0): if CPU grouping yields < 1.05x warm prefill, STOP. Do not proceed to Metal.**
+**T-1 acceptance:** `bench/golden.sh` md5-stable AND token-exact; scheduler overhead measured and
+recorded; prefill delta recorded interleaved.
+
+**What T-1 can and cannot decide (corrected in review).** T-1 must NOT be used as a simple
+CPU-speed kill for the GPU work: the plan's own data shows the two scale differently — from S=1 to
+S=16 the **CPU improves only 1.25x while the GPU improves 2.9x** (§2.1). A CPU grouped scheduler
+failing to speed up therefore does **not** prove GPU grouping cannot pay.
+
+T-1's real job is **correctness + scheduler-overhead measurement**:
+- does gather/permute/ascending-combine/wave/rollback stay **token-exact**? (hard gate)
+- what is the **non-kernel overhead** of grouping (gather, sort, permute, unpermute, wave management)
+  as a fraction of the chunk?
+
+**K0 (revised): kill only if measured non-kernel grouping overhead exceeds the available Metal
+headroom** — i.e. if `overhead_fraction >= 1 - 1/1.20` (≈16.7 %, the full-prefill ceiling from §0),
+the GPU kernel win cannot pay for the scheduler and the Metal work is dead. Otherwise proceed.
 
 ```
 Wave 0:             T-1 CPU grouped scheduler  [KILL TEST]
@@ -442,7 +514,7 @@ Serialisation: T4/T5 both touch the .metal source -> sequential within Wave 2 if
 | **T5** | Per-token per-128col fp8 QDQ + UE8M0 bit-trick | T1,T2 | 2-token differing-dynamic-range probe → independent scales, 0 ULP; UE8M0 v=0/255 match `quant.h` |
 | **T6** | Host glue: one command buffer + zero-copy slab | T2,T3,T4,T5 | seam returns 0; 0 ULP @S=8; **dispatch count == n_unique** (~94, not 384); **exactly ONE** `waitUntilCompleted` per chunk |
 | **T7** | Ascending-expert-id fp32 combine | T3,T6 | token routed {5,2,9,1} visits **1,2,5,9**; bit-identical to S=1 `moe_token_pipeline` (0 ULP) |
-| **T8** | Wire at `:5110-5143` (incl. batch-block phase split + route-metadata separation) | T6,T7 | `bench/golden.sh` prints `PASS golden md5=5d04890413ff539e802985ce8c727814`; `python3 c/tests/test_deepseek_v4_tiny.py` exit 0; `N=3 ./bench/ab.sh` interleaved p064 delta **≥1.12x** (revised — see §9 K3); engine `phys_footprint`+non-engine ≤ ~100 GB |
+| **T8** | Wire at `:5110-5143` (incl. batch-block phase split + route-metadata separation) | T6,T7 | `bench/golden.sh` prints `PASS golden md5=5d04890413ff539e802985ce8c727814`; `python3 c/tests/test_deepseek_v4_tiny.py` exit 0; `N=3 ./bench/ab.sh` interleaved p064 **`delta <= -10.71%`** (= 1.12x speedup; ab.sh sign is negative-is-faster); engine `phys_footprint`+non-engine ≤ ~100 GB |
 | **T9** | Chunk-cap lever 64→128→256 | T8 | each value builds + token-exact; record `{chunk, measured_N, tok_s, rss_gb}`; winner by tok/s subject to RSS ≤ ~100 GB |
 | **T10** | Decode/spec applicability | T8 | decode documented unchanged (control); spec verify token-exact; delta **recorded honestly incl. negative** |
 | **T11** | Full experiment sweep + record | T8,T9,T10 | every row filled and reproducible from the recorded command; negatives published |
@@ -458,11 +530,11 @@ hardware + commit + exact command + raw log, and report `phys_footprint`/RSS/gap
 | id | variable | fixed | metric | pass criterion |
 |---|---|---|---|---|
 | **E1** | S ∈ {1,4,8,16} | real gate/up shape | GPU us/token, GFLOP/s | GPU scales ≥2.4x @S=16 (matches measured 2.46x) |
-| **E2** | batched vs S=1 seam | p064 prefill | prefill ttft, interleaved n≥3 | batched **≥1.12x** (ceiling is 1.20–1.25x; 1.3x was withdrawn as above-ceiling) |
+| **E2** | batched vs S=1 seam | p064 prefill | prefill ttft, interleaved n≥3 | **`ab.sh delta <= -10.71%`** (= **1.12x**). Ceiling is 1.20–1.25x; 1.3x withdrawn as above-ceiling. **ab.sh prints `100*(on-off)/off` — faster is NEGATIVE.** |
 | **E3** | chunk ∈ {64,128,256} | batched path | measured N, tok/s, RSS | N rises with chunk; RSS ≤100 GB; token-exact at every value |
 | **E4** | dispatch count | chunk=64 | dispatches/chunk | **== n_unique (~94, not 384)** |
 | **E5** | weight traffic | chunk=64 | bytes read/chunk | ≈**4.1x** less than S=1 |
-| **E6** | realised bandwidth | grouped kernel | GB/s | ≥300 GB/s (toward the measured 370.8 ceiling) |
+| **E6** | realised bandwidth | grouped kernel | GB/s | **diagnostic only — NOT a ship criterion.** Record it; do not gate on it. The MoE path runs at 4.58 GB/s effective today (§2.4), so a streaming-bandwidth target is not the binding constraint. |
 | **E7** | spec verify batched | `target_batch` | spec tok/s, acceptance | token-exact; delta recorded (may be negative) |
 | **E8** | decode | S=1 path | tok/s | **unchanged** (control) |
 | **E9** | cold vs warm | `coldwarm2.sh` | tok/s both states | batched wins **warm**; cold is SSD-bound and expected flat (§2.4) |
@@ -480,19 +552,19 @@ Every task's QA is a copy-pasteable command with a binary observable. `$MODEL=mo
 
 | task | command | PASS is exactly |
 |---|---|---|
-| **T-1** | `./bench/golden.sh ./c/deepseek_v4` then `N=3 ./bench/ab.sh "COLI_V4_MOE_GROUPED=1" ./c/deepseek_v4` | `PASS golden md5=5d04890413ff539e802985ce8c727814` AND `AB p064 ... delta=` ≥ 5 % improvement |
+| **T-1** | `./bench/golden.sh ./c/deepseek_v4` then `N=3 ./bench/ab.sh "COLI_V4_MOE_GROUPED=1" ./c/deepseek_v4` | `PASS golden md5=5d04890413ff539e802985ce8c727814` AND recorded overhead fraction < 16.7 % (see K0). **Note the sign:** `ab.sh` prints `100*(on-off)/off`, so a speedup is a **NEGATIVE** delta. |
 | **T0** | `cd c && make -f Makefile.deepseek-v4 METAL=1 2>&1 \| tail -3; ls build/metal-v4/*.air \| wc -l` | link succeeds; `nm c/deepseek_v4 \| grep -c metal` > 0; `md5 -q c/deepseek_v4` recorded to `artifacts/metal_baseline.json` |
 | **T1** | `clang -fobjc-arc -O2 -framework Metal -framework Foundation validation/metal/probe_batched_moe.m -o /tmp/pb && /tmp/pb` | exits **nonzero**, prints `RED: no batched path`; and `S=1 self-check 0 ULP` |
 | **T2** | `cd c && make -f Makefile.deepseek-v4 METAL=1 && ls *.o \| wc -l` and `make -f Makefile.deepseek-v4 deepseek-v4-clean && make -f Makefile.deepseek-v4 && ls *.o \| wc -l` | `27` then `26`; golden md5 unchanged |
 | **T3** | `clang -O2 validation/metal/test_permute.c -o /tmp/tp && /tmp/tp` | prints `sorted ascending OK`, `permute∘unpermute == identity OK`, exit 0 |
 | **T4** | `/tmp/pb` (from T1) and `./validation/metal/bench_matmul 20` | `/tmp/pb` exits **0** with `0 ULP at S=1` and `0 ULP at S=8`; bench prints gate/up S=8 speedup ≥ 7x |
 | **T5** | `clang -fobjc-arc -O2 -framework Metal -framework Foundation validation/metal/probe_fp8_twotoken.m -o /tmp/p5 && /tmp/p5` | `token0 scale != token1 scale` where required, `0 ULP`, exit 0 |
-| **T6** | `COLI_V4_METAL=1 COLI_V4_METAL_STATS=1 ./c/deepseek_v4 $MODEL "$P64" --max-tokens 1 --memory-gb 96 2>&1 \| grep metal_dispatches` | `metal_dispatches=` ≈ sum of per-chunk `n_unique` (~94×86), **not** 384×86 |
+| **T6** | `COLI_V4_METAL=1 COLI_V4_METAL_STATS=1 ./c/deepseek_v4 $MODEL "$P64" --max-tokens 1 --memory-gb 96 2>&1 \| grep -E 'metal_(dispatches\|waves\|waits\|rollbacks\|leaked)'` | `metal_dispatches=` ≈ Σ per-chunk `n_unique` (~94×86), **not** 384×86; **`metal_waves == metal_waits`**; `metal_rollbacks` consistent with injected faults; **`metal_leaked_leases=0`**. *T6 must ADD these counters — today only `metal_dispatches` exists (`:10065`).* |
 | **T7** | `/tmp/pb --combine-order` | prints visit order `1,2,5,9` for routing `{5,2,9,1}`; near-cancellation case `0 ULP` |
-| **T8** | `./bench/golden.sh ./c/deepseek_v4` ; `python3 c/tests/test_deepseek_v4_tiny.py --binary ./c/deepseek_v4 --fixture ./c/deepseek_v4_tiny` ; `N=3 ./bench/ab.sh "COLI_V4_MOE_GROUPED=1" ./c/deepseek_v4` | `PASS golden md5=5d04890413ff539e802985ce8c727814`; tiny oracle exit 0; `delta` ≥ 12 % |
-| **T9** | for `C in 64 128 256`: rebuild with cap C, `./bench/golden.sh`, `N=3 ./bench/ab.sh` | golden PASS at **every** C; CSV row `{chunk,N,tok_s,rss_gb}` per C; no `sums[64]` overflow (ASan clean) |
+| **T8** | `./bench/golden.sh ./c/deepseek_v4` ; `python3 c/tests/test_deepseek_v4_tiny.py --binary ./c/deepseek_v4 --fixture ./c/deepseek_v4_tiny` ; `N=3 ./bench/ab.sh "COLI_V4_MOE_GROUPED=1" ./c/deepseek_v4` | `PASS golden md5=5d04890413ff539e802985ce8c727814`; tiny oracle exit 0; **`delta <= -10.71%`** (= 1.12x; ab.sh reports `100*(on-off)/off`, so faster is negative) |
+| **T9** | for `C in 64 128 256`: rebuild with cap C; `./bench/golden.sh`; **`V4_MTP=1 V4_DRAFT=4 ./bench/golden.sh`** (DSpark ON — required, both vars, `:7924`); `N=3 ./bench/ab.sh` | golden PASS at **every** C **with DSpark OFF and ON**; CSV row `{chunk,N,tok_s,rss_gb}` per C; ASan clean (guards the `sums[64]` overflow at `:12355`) |
 | **T10** | `V4_DRAFT=4 V4_NGRAM=1 ./bench/golden.sh` and spec A/B | token-exact vs S=1 verify; delta recorded incl. if negative |
-| **T11** | `./validation/dsv4/metal_sweep.sh` | every E1–E11 row present in `docs/experiments/metal-batched-moe.md`, each with its command |
+| **T11** | `./validation/dsv4/metal_sweep.sh` | every **E1–E13** row (incl. E12 SSD-wait and E13 CPU-grouping) present in `docs/experiments/metal-batched-moe.md`, each with its command and raw log |
 | **T12** | `./validation/metal/gate.sh` | exits 0 **only** if all probes 0 ULP + golden md5 + tiny oracle pass; exits nonzero otherwise |
 
 **Note on `bench_matmul.m`:** it **exists** at `validation/metal/bench_matmul.m` (7684 B) with a
@@ -505,7 +577,8 @@ and is incorrect.
 |---|---|---|
 | **Combine visits experts in encounter order** | random routing usually gives sums whose fp32 order barely matters; golden may never hit an order-sensitive case | construct expert outputs with **near-cancellation**: two experts whose contributions are large and nearly opposite, so ascending-order and encounter-order fp32 sums differ **before** the final bf16. Assert exact equality with the S=1 path. |
 | **fp8 scale shared across tokens** | two tokens with *similar* dynamic range encode the **same** exponent, hiding a shared-scale indexing bug | two tokens whose block maxima **straddle a `ceil_log2(max/448)` boundary** (e.g. just below vs just above a power of two). Assert **both the scale bytes and the QDQ outputs** differ correctly. |
-| **Lease exhaustion path** | typical layers have `n_unique` < capacity, so waves never trigger | force a layer with `n_unique > capacity` (or lower `--ram` to shrink `slots_per_layer`) and assert wave split + rollback + no leaked leases |
+| **Lease exhaustion path** | typical layers have `n_unique` < capacity, so waves never trigger | force `n_unique > compute_wave_size` by lowering `--ram` (shrinks `slots_per_layer`); assert `metal_waves > 1` and `metal_waits == metal_waves` |
+| **Rollback path** | lowering RAM triggers *wave splitting*, but never a **mid-wave acquisition failure**, so rollback is never exercised | **fault injection**: `COLI_V4_TEST_FAIL_ACQUIRE_AT=K` makes the K-th acquire in a wave fail; assert clean rollback, `metal_leaked_leases=0`, and correct S=1 fallback output |
 | **Loader overlap regression** | end-to-end timing can hide it if the kernel got faster | measure SSD wait time separately (E12) and assert it did not grow vs baseline |
 
 ## 8. Risk register
@@ -534,8 +607,10 @@ and is incorrect.
   **HALT**. Do **not** relax the bit-exact contract.
 - **K2** — `golden.sh` output diverges on any token → revert the wire; batched path stays behind the
   fallback.
-- **K0** — **T-1 CPU grouped scheduler < 1.05x warm prefill → STOP. Do not start the Metal work.**
-- **K3** — E2 batched prefill **< 1.12x** → not worth the complexity; keep opt-in, do not
+- **K0** — **T-1 grouping overhead ≥ 16.7 % of the chunk (= `1 - 1/1.20`, the §0 ceiling) → STOP.**
+  The scheduler would consume the entire available headroom before the kernel runs. (Revised: the
+  original "CPU < 1.05x" form was invalid — CPU and GPU scale differently, §2.1.)
+- **K3** — E2 `ab.sh delta > -10.71%` (i.e. **< 1.12x**) → not worth the complexity; keep opt-in, do not
   default-enable. (Rationale: measured ceiling is 1.20–1.25x, so 1.12x is ~half the available
   headroom. The original 1.15x floor and 1.3x target were set before the Amdahl bound was computed;
   1.3x is **above** the ceiling and was withdrawn.)
@@ -549,7 +624,8 @@ and is incorrect.
 
 1. All probes **0 ULP** vs the shipped CPU reference.
 2. `bench/golden.sh` token-exact and md5-stable; tiny oracle ≥ baseline.
-3. **E2 ≥ 1.12x** prefill, interleaved, md5-asserted (against a measured ceiling of 1.20–1.25x).
+3. **E2 `delta <= -10.71%`** (≥1.12x) prefill, interleaved, md5-asserted, against a measured ceiling
+   of 1.20–1.25x. **Sign discipline: `ab.sh` reports `100*(on-off)/off`; faster is negative.**
 4. **E4** dispatch count ≈ `n_unique` (~94 vs 384).
 5. Chunk winner chosen by tok/s **subject to** RSS ≤ ~100 GB.
 6. Experiment log committed; every number reproducible; negatives published.
