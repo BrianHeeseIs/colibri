@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 
@@ -268,7 +269,13 @@ Path(os.environ["FAKE_ENGINE_CLOSED"]).write_text("closed", encoding="utf-8")
 
 
 def test_adjacent_duplicate_prompts_rejected(tmp_path: Path) -> None:
-    """Adjacent repeats would let kv_prefix_reuse() extend the prior turn and skip prefill."""
+    """Adjacency rejection is CONSERVATIVE, not a V4 correctness requirement.
+
+    V4 cannot reuse here (the fed record is prompt+generation, strictly longer than a
+    repeated prompt, and kv_prefix.h:116-127 returns 0 for shorter/equal). The guard
+    exists because identical neighbours indicate a caller mistake, and would matter on
+    an engine with true longest-common-prefix reuse.
+    """
     from ab_harness import _BenchmarkRunner
 
     config = _benchmark_config(tmp_path / "fake", tmp_path / "out.csv")
@@ -310,3 +317,14 @@ def test_done_reports_prefix_reuse_when_engine_sets_it() -> None:
     frame = ProtocolReader(stream).next_event()
     assert isinstance(frame, DoneFrame)
     assert frame.prefix_reused == 1
+
+
+def test_v4_invalid_reset_strategies_hard_fail(tmp_path: Path) -> None:
+    """slot_rotate and reset_frame cannot work on V4; offering them would silently mismeasure."""
+    from ab_harness import _BenchmarkRunner
+
+    for strategy, needle in ((ResetStrategy.SLOT_ROTATE, "slot"), (ResetStrategy.RESET_FRAME, "reset_frame")):
+        config = replace(_benchmark_config(tmp_path / "fake", tmp_path / "o.csv"), strategy=strategy)
+        runner = _BenchmarkRunner(config, lambda _s: None)
+        with pytest.raises(ProtocolError, match=needle):
+            runner._validate(["alpha", "beta"])

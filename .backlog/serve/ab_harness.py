@@ -188,18 +188,30 @@ class _BenchmarkRunner:
     def _validate(self, prompts: Sequence[str]) -> None:
         if not prompts or any(not prompt for prompt in prompts):
             raise ProtocolError("at least one non-empty prompt is required")
-        # Adjacent duplicates would let kv_prefix_reuse() extend the previous turn
-        # (prior fed sequence is a strict prefix of the new prompt) and SKIP prefill.
-        # Non-adjacent repeats are safe and are REQUIRED by the cycled-prompt protocol:
-        # after turn N the fed record is prompt+generation, which is LONGER than the
-        # repeated prompt, so kv_prefix.h:116-127 returns 0 and forces a full reset.
+        # CONSERVATIVE guard, not a correctness requirement. V4's kv_prefix_reuse()
+        # (c/kv_prefix.h:116-127) returns 0 for tainted, shorter, equal, or mismatched
+        # sequences, and after any turn the fed record is prompt+generation - strictly
+        # LONGER than a repeated prompt. So reuse cannot occur even for an adjacent
+        # duplicate. We still reject adjacency because a caller who writes the same
+        # prompt twice in a row almost certainly meant distinct workloads, and because
+        # the rule would matter on an engine with true longest-common-prefix reuse.
         for a, b in zip(prompts, prompts[1:]):
             if a == b:
-                raise ProtocolError("adjacent prompts must differ (would skip prefill via KV reuse)")
-        if self._config.strategy is ResetStrategy.SLOT_ROTATE and self._config.engine.kv_slots < 2:
-            raise ProtocolError("slot_rotate requires KV_SLOTS > 1")
-        if self._config.strategy is ResetStrategy.RESET_FRAME and self._config.reset_frame is None:
-            raise ProtocolError("reset_frame strategy requires reset frame bytes")
+                raise ProtocolError(
+                    "adjacent prompts must differ (conservative: V4 cannot reuse here, "
+                    "but identical neighbours almost certainly indicate a caller mistake)")
+        # V4 rejects any slot != 0 (c/deepseek_v4.c:9044-9055) and parses only
+        # CANCEL/STOP/SUBMIT (:9035-9042) - no reset frame exists. Offering these
+        # strategies for V4 would silently measure the wrong thing.
+        if self._config.strategy is ResetStrategy.SLOT_ROTATE:
+            raise ProtocolError(
+                "slot_rotate is unusable on DeepSeek V4: the engine rejects any slot != 0 "
+                "(c/deepseek_v4.c:9044-9055). Use --reset-strategy none with distinct prompts.")
+        if self._config.strategy is ResetStrategy.RESET_FRAME:
+            raise ProtocolError(
+                "reset_frame is unusable on DeepSeek V4: the mux loop parses only "
+                "CANCEL/STOP/SUBMIT (c/deepseek_v4.c:9035-9042) and neither clears KV. "
+                "Use --reset-strategy none with distinct prompts.")
 
     @staticmethod
     def _cases(prompts: Sequence[str]) -> tuple[PromptCase, ...]:

@@ -1,0 +1,13 @@
+v4_kernels active=none
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_cli mode=chat memory=limited target_only=1
+v4_dense_resident layers=43 bytes=6.267GiB
+To understand how a mixture-of-experts (MoE) transformer routes tokens, we must first distinguish it from a standard transformer. In a standard transformer, every token in a sequence passes through the *same* set of weights in the feed-forward network (FFN) layers. In an MoE
+v4_tokens prompt=20 generated=60 total=80 expert_requests=20382 hits=15890 misses=4492 hit_rate=77.961 bytes=60055093248 target_only=1
+generated_text=To understand how a mixture-of-experts (MoE) transformer routes tokens, we must first distinguish it from a standard transformer. In a standard transformer, every token in a sequence passes through the *same* set of weights in the feed-forward network (FFN) layers. In an MoE
+timing time_to_first_token=15.248s after_first=39.272s
+v4_rows16 packed_slots=917
+v4_direct reads=4492 flock_reads=0 fallbacks=0 payload_bytes=56522440704
