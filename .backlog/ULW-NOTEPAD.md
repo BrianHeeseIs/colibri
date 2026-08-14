@@ -736,3 +736,15 @@ wrong (the 3-5x residual is elsewhere) -> STOP, report, do not touch the engine.
 
 ## Now
 Fire 2 explores (kernel internals; packing mechanics+cost) -> plan agent -> delegate.
+
+## Findings 19:32 — packing coverage is tiny, prize is large IF the premise holds
+  v4_rows16 packed_slots = 876 / 887 / 891 across runs, of 7052 total slots (~12.5%).
+  Packing is gated on PINNED slots (runtime reports pin_slots_per_layer=16 -> 688 eligible)
+  while prefill needs ~87 UNIQUE experts per layer and does 18060 expert computes.
+  => the overwhelming majority of prefill expert-ops take coli_v4_expert_forward_v17_fallback.
+  Arithmetic: at 1.96 ms/op prefill spends ~35.4s of its 43.0s wall on expert compute;
+  at the warm/packed 0.41 ms/op that would be ~7.4s => ~28s potential on p064.
+  *** UNVERIFIED PREMISE: that the 4.8x per-op ratio is caused BY THE KERNEL. ***
+  S1 microbench must confirm the v17_fallback vs rows16_v10 gap at real shapes.
+  If the measured kernel gap is <1.5x, the premise is wrong and the residual is elsewhere
+  (pack-on-miss, slab first-touch page faults, mutex, buffered scale reads) -> STOP.
