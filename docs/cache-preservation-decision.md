@@ -1,7 +1,15 @@
 # Cache preservation between benchmark runs — decision
 
-**Verdict: no IO-layer preservation is possible; a persistent process is the only lever, and it is
-not worth using for benchmarking. Ship docs + harness, change nothing in the IO path.**
+**Verdict: no *score-neutral* IO-layer preservation exists on the default direct-I/O path. A
+persistent process is the only lever, and it is not worth using for benchmarking. Ship docs +
+harness, change nothing in the IO path.**
+
+*Precision note (review):* the page cache is bypassed **because `COLI_V4_DIRECT` defaults on**, and
+`COLI_V4_DIRECT=0` explicitly restores buffered `pread` (`c/deepseek_v4.c:144-150`). So page-cache
+warming is not impossible in the absolute — it is unavailable *without changing the I/O path being
+measured*, which would make the benchmark non-representative of the shipping configuration. Partial
+residency / smaller-working-set schemes were **not measured** and are not ruled out by evidence here;
+they are simply out of scope for a benchmarking-speed exercise.
 
 ## Why RAM disk / page-cache warming are structurally dead
 | approach | why it fails here |

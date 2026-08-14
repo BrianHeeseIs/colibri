@@ -27,6 +27,15 @@ Warmup/cache-heating was a legitimate objection: the backend has real one-time c
 | `decode_wall` | 218256.8 ms | 331186.9 ms | **1.52x slower** |
 
 Pre-committed criteria were **OVERTURN ≤1.05x / CONFIRM >1.10x** → **CONFIRM.**
+
+**Two caveats on strength of evidence (raised in review):**
+- The binding contract called for **n≥3 per configuration**; the table above is n=2. Both pairs
+  agree and both ratios sit far above the 1.10x bar, but the contract was not met as written.
+- At 300 tokens the two configurations **produce different output** (see Correctness below), so
+  after the divergence point they generate different tokens, which route to different experts.
+  The workloads are therefore not strictly identical over the full window. The 30-token E43 run,
+  where outputs *were* identical, gave a consistent 2.84x — which is what keeps the verdict
+  credible despite this.
 The warmup hypothesis is **falsified**: 30 tokens gave 2.84x/1.41x; 300 tokens gives 2.84x/1.52x —
 ten times more work made Metal *worse*.
 
@@ -44,8 +53,11 @@ experts of a (token,layer) — or a whole prefill chunk — into one command buf
 (never recycle a slab with in-flight GPU work) was already handled: the expert store refuses to evict
 a slot with live references (`c/deepseek_v4.c:5609-5614`).
 
-`COLI_V4_METAL_PROFILE=1` (forwards=7060) gives the split, and solving for round-trip `R` and real
-GPU compute `C` two independent ways:
+`COLI_V4_METAL_PROFILE=1` (forwards=7060, raw log committed at
+`.backlog/results/T7b_metal_profile.log`) gives the split. Solving for round-trip `R` and real GPU
+compute `C` two ways — **note these are NOT independent**: both derive from the same PROFILE run and
+both assume profiling leaves GPU compute unchanged while adding a constant per-commit cost. They
+bound the same quantity from one dataset, so they can be wrong in the same direction:
 
 - from the 8 *extra* profile commits: `R = 0.073 ms`, `C = 3.475 ms`
 - from `submit_stage / 9`:            `R = 0.221 ms`, `C = 3.327 ms`
@@ -53,6 +65,9 @@ GPU compute `C` two independent ways:
 **Dispatch overhead is only 2–6 % of the cost.** Weights are already **fully zero-copy**
 (`zero_copy_tensors=42360`, `copy_fallback_tensors=0`). A *perfect* 6-way batch would yield
 `(0.073 + 6·3.475)/6 = 3.487 ms/expert` — still **4.9x slower than CPU**.
+
+`c_gpu` additionally assumes the layout-rejected CPU fallbacks cost the same as the global average
+CPU expert; if rejected experts are systematically cheaper or dearer, the isolated GPU figure shifts.
 
 **Root cause:** 25.2 M MACs in ~3.33 ms = **~15 GFLOP/s on an M3 Max GPU**, roughly two orders of
 magnitude below the hardware. The bottleneck is the **mxfp4/UE8M0 shaders**, not the dispatch model,
