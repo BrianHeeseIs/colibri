@@ -2098,3 +2098,48 @@ did not survive contact** — the 14.9 % above is the two features stacked, meas
 
 **Rule earned the hard way: attribute inside the engine before proposing a mechanism.** Three
 hypotheses and four suspects died to a table that took one instrumented run.
+
+---
+
+## E55. GATE B, properly measured — **FAILS on p256 (2.70 % vs 15 %), and the gain DECAYS with length**
+
+I had only ever measured p064. The gate was specified on **p256**. Closing that gap changed the
+picture, so the omission mattered.
+
+`bench/ab.sh`, interleaved OFF/ON, n=3 per prompt, cold-cache each run:
+
+| prompt | OFF | ON | delta |
+|---|---|---|---|
+| p064 (70 tok) | 43.065 s | 40.393 s | **-6.20 %** |
+| **p256 (184 tok)** | **111.442 s** | **108.429 s** | **-2.70 %** |
+
+**GATE B required >= 15 % on p256. Measured 2.70 %. Failed by a wide margin.**
+
+### The decay is the real finding
+The benefit **halves** as the prompt grows (6.20 % -> 2.70 %), which is the opposite of the naive
+expectation (longer prompt = more misses = more to prefetch). E54's attribution explains it exactly:
+attention is **33.18 % of p064** and is O(n^2) in context, so at p256 it consumes a larger share of
+a larger wall while the MoE-read saving stays roughly fixed in absolute terms. A saving aimed at
+expert I/O is a shrinking slice of a wall increasingly dominated by attention.
+
+**For long prompts the lever is ATTENTION, not expert I/O.** That is now measured, not inferred.
+
+### Directional check (T11) — PASSES
+| stage | OFF % | ON % |
+|---|---|---|
+| MoE | 60.05 | **48.68** (down, as targeted) |
+| attention | 33.18 | 35.48 (share up only because the wall shrank; absolute 14449 -> 14216 ms) |
+| route-ahead | 0 | 8.45 (the cost the feature adds) |
+
+Golden md5 `5d04890413ff539e802985ce8c727814` holds with the feature **ON** and **OFF**.
+
+### Disposition
+Per user decision the feature is **KEPT, default OFF** — it is bit-exact, zero-risk when unset, and
+worth 6.2 % on short prompts / 2.7 % on medium ones. But GATE B failed on its own terms and that is
+recorded as such: this is a kept-despite-failing-gate call made explicitly, not a passed gate.
+
+### Harness defect found and fixed
+`ab.sh` and `golden.sh` both carried the same latent bug as `rebaseline.sh` — `local status`
+declared uninitialized then used in arithmetic under `set -u`. `ab.sh` aborted on it immediately;
+`golden.sh` never reached that path. All three fixed; harness tests still pass; golden re-verified
+after the patch.

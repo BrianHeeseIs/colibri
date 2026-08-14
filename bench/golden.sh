@@ -95,7 +95,7 @@ done
 run_model() {
     local max_tokens=$1
     local log=$2
-    local status restore_status=0
+    local status=0 restore_status=0
     cp "$SNAPSHOT" "$USAGE"
     if env "${EXTRA_ENV_ARGS[@]}" COLI_V4_SAVE_USAGE=0 \
         "$BINARY" "$MODEL" "$PROMPT" --max-tokens "$max_tokens" --memory-gb 96 \

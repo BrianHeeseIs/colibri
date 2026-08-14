@@ -126,7 +126,7 @@ run_model() {
     local state=$1
     local prompt=$2
     local log=$3
-    local status restore_status=0
+    local status=0 restore_status=0
     local -a state_env
     if [[ $state == on ]]; then
         state_env=("${ON_ENV_ARGS[@]}")
