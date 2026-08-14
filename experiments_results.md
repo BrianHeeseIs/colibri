@@ -1259,3 +1259,57 @@ tiny oracle, KV-prefix); x86_64 non-arm route path cross-compiles.
 
 **Flag scope note:** `--fast-sparse-attn` now enables the whole reassociated-kernel set
 (attn_sparse + router). Name kept for compatibility; wrapper script and docs updated to say so.
+
+---
+
+## E41. LM head NEON kernel — **11.7x on the kernel, 11% SLOWER overall. REVERTED.**
+
+`head` was 4.9 % of steady-state decode (33.8354 ms/call, one call/token, vocab 129280 x hidden 4096
+= 529 M MACs/token). `head_bf16_dot` (`c/deepseek_v4.c:7345`) has an AVX2 path that deliberately
+vector-multiplies then does eight SEPARATE scalar adds to preserve summation order, and **no arm64
+path at all** — Apple Silicon fell through to a plain scalar loop.
+
+Applied the E40 playbook: 4 independent NEON FMA accumulators behind the existing
+`--fast-sparse-attn` opt-in selector. (E40's lesson was applied up front — no "bit-exact vectorize
+the decode" tier, since that was proven worthless there.)
+
+**Kernel microbench: ordered 386.939 +/- 1.357 ms -> NEON4 33.043 +/- 0.103 ms = 11.71x.**
+**In-engine phase: head 2080 -> 565 ms = 3.67x.**
+
+### And total decode got 11.2 % SLOWER
+Three warm runs per config, toggling ONLY the fast head (fast router + fast attn_sparse left on in both):
+
+| flagged config | head ms | decode_wall ms |
+|---|---|---|
+| with fast head | 565 | **38142.3** (mean of 3) |
+| without fast head | 2062 | **34307.9** (mean of 3) |
+| E40 reference (pre-E41) | 2080 | 34197.5 / 34246.8 |
+
+### Root cause — measured, not inferred
+`accounted_pct` stays 98.5 % in both configs, so nothing is unmeasured. The time reappears in the
+biggest phase:
+
+| phase | default | flagged w/ fast head | delta |
+|---|---|---|---|
+| head | 2091.3 | 554.8 | **-1536.5** |
+| router | 1956.9 | ~176 | **-1780** |
+| **expert_forward** | 10594.4 | **12803.2** | **+2208.8** |
+| **shared_expert** | 2406.1 | **2820.6** | **+414.5** |
+
+Reverting the fast head snaps `expert_forward` straight back to 10548.7 / 10494.0 and the wall to
+34514.0 / 34148.9 — matching the E40 reference. The toggle is definitive in both directions.
+
+**Mechanism:** the LM head streams ~1 GiB of BF16 vocab weights per token. Running it 3.7x faster
+pushes that GiB through the shared cache 3.7x faster, evicting the resident expert slabs, so
+`expert_forward` — the single largest phase — must refetch from DRAM. The kernel gain is real and
+is handed back with interest to a bigger phase.
+
+**REVERTED. Nothing from E41 ships.**
+
+### Campaign-level lesson (applies to all future work here)
+**A phase-local speedup can be net-negative.** On this machine the phases are not independent: they
+contend for shared cache and memory bandwidth. Any future kernel win MUST be validated on
+`decode_wall`, never on its own `phase=` number — and ideally with a same-build A/B toggle, since
+cross-build comparisons hide this effect. This is the third time this campaign that a
+"clearly good" local change was wrong (E40 Tier 1 regressed the default 3.83 %; E39 hoisting
+regressed f(1) 2x; now E41 regressed the wall 11 %).
