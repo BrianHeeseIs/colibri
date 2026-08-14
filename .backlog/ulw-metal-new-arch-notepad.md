@@ -190,3 +190,15 @@ STATE AT RESUME:
   golden PASSES on it: md5=5d04890413ff539e802985ce8c727814, Metal inactive unless COLI_V4_METAL=1
 - NEXT: T-1 = CPU-only grouped scheduler (the K0 kill test). NOT a CPU-speed gate;
   it measures (a) token-exactness of grouping, (b) non-kernel overhead fraction vs 0.167.
+
+### F16. ATTENTION LANE probed (E59) - promising but unscoped
+validation/probes/attn_fp8_sweep.m, real shapes, FAIR CPU baseline (256-LUT + 4-way ILP, 12 thr):
+  S=64: wq_a 3.26x, wq_b 6.90x (GPU 572 GF/s vs CPU 83), wkv 4.42x, wo_b 7.56x -> per-layer 6.0x
+  S=1 : GPU LOSES (0.16-0.89x). crossover ~S=16. Same batch-decides-the-sign story.
+FIRST RUN SAID 45x - that was MY strawman CPU (scalar e4m3 per element). Engine uses a 256 LUT
+(:12350). Fixed -> 6.9x. Never publish the 45x.
+SCOPING: projections = 3.40 s of the 14.4 s attention block = 7.8% of the 43.5 s wall.
+  6.0x on them alone = 1.070x full prefill. NOT ENOUGH ALONE (gate is 1.12x).
+DECISIVE UNKNOWN: the other 11.0 s of attention (QK^T/softmax/AV/RoPE/DSA indexer/recurrent
+compressor :2603/:2688). Dense+batchable -> lane >> MoE lane. Recurrent -> lane capped ~1.07x.
+=> B3 ATTENTION ATTRIBUTION IS NOW THE CRITICAL MEASUREMENT. Do not scope attention work before it.

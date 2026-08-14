@@ -2398,3 +2398,58 @@ review rounds** (Momus, Oracle, and a third code-grounded reviewer), and approve
 round found a real defect, including in my own fixes — the sign of `bench/ab.sh`
 (`100*(on-off)/off`, so a speedup is **negative**, meaning my gates would have passed a slowdown),
 a wave/loader deadlock, and a `loader_reserve` that could exceed a capacity which floors at 6.
+
+---
+
+## E59. Attention lane feasibility — **dense projections are 6.0x GPU-favorable, but only 7.8 % of the wall**
+
+E54 established attention is **33.18 %** of prefill (14.4 s of 43.5 s) and untouched by any campaign.
+Unlike MoE it looked structurally ideal for the GPU: it **already batches to S=64**
+(`coli_fp8_matmul_batch_ref(..., batch)` at `:2592/:2632/:2644/:2772`) and its weights are **resident**
+(dense set in RAM), so it has **none** of MoE's blockers — no SSD bound, no lease capacity, no
+eviction risk. Probed it directly (`validation/probes/attn_fp8_sweep.m`).
+
+### Real V4 attention shapes, dense fp8 (E4M3 + F32 128x128 block scales)
+
+| shape (rows x cols) | S | CPU ms | GPU ms | GPU/CPU | CPU GF/s | GPU GF/s |
+|---|---|---|---|---|---|---|
+| `wq_a` 4096->1024 | 64 | 8.72 | 2.67 | 3.26x | 61.6 | 200.8 |
+| **`wq_b` 1024->32768** | 64 | 51.82 | 7.51 | **6.90x** | 82.9 | **572.1** |
+| `wkv` 4096->512 | 64 | 3.10 | 0.70 | 4.42x | 86.5 | 382.1 |
+| `wo_b` 1024->4096 | 64 | 8.34 | 1.10 | 7.56x | 64.3 | 486.3 |
+| **per-layer total** | 64 | **71.98** | **11.98** | **6.0x** | | |
+
+At S=1 the GPU **loses** (0.16x–0.89x); crossover is around S=16. Same story as everywhere else in
+this project: **batch size, not kernel quality, decides the sign.**
+
+### Methodology note — I had to fix my own strawman first
+The first run reported **up to 45x**. That was an artefact: my CPU reference called a scalar
+`e4m3_decode()` per element, while the engine precomputes a **256-entry LUT** (`:12350`) and uses
+SIMD. Re-running with a LUT + 4-way ILP dropped CPU from ~12 GF/s to **62–87 GF/s** and the ratio
+from 45x to **6.9x**. The 45x number was never real and is recorded here only as a caution.
+
+### Scoping the prize — and why this is NOT yet a win
+- dense projections, CPU: 71.98 ms x 43 layers = **3.10 s per 64-token chunk**
+- p064 = 70 tokens = chunk(64) + chunk(6) -> **~3.40 s**
+- that is **24 % of the 14.4 s attention block**, and **7.8 % of the 43.5 s prefill wall**
+
+Applying the measured 6.0x to *only* these projections:
+```
+saved = 3.40 * (1 - 1/6.0) = 2.84 s
+full-prefill speedup = 43.5 / (43.5 - 2.84) = 1.070x
+```
+**7.0 %. Not enough on its own**, and below the 1.12x gate the batched-MoE plan already commits to.
+
+### The decisive unknown
+**What is the other 11.0 s of the attention block?** Candidates: QK^T, softmax, AV, RoPE, the DSA
+sparse indexer, and the recurrent compressor (`:2603`) / KV ring (`:2688`).
+
+- If those are dense and batchable -> the attention lane is **substantially larger than the MoE lane**
+  (which measures 1.52x at the real N=4.10).
+- If they are recurrent/sequential -> they are **not batchable at all** and this lane is capped near
+  1.07x.
+
+**These two outcomes differ by an order of magnitude, and nothing measured so far distinguishes them.**
+Per the rule this project earned the hard way — *attribute inside the engine before proposing a
+mechanism* (E48/E52/E53/E54 each died for violating it) — **B3 attention attribution is now the
+critical next measurement.** No attention work should be scoped until the 11.0 s is broken down.
