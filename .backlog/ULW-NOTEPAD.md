@@ -255,3 +255,20 @@ Q4. expert_forward is 26.6% of decode and the only phase big enough to justify r
 Q5. Given E41, should I build a same-build A/B toggle harness (env var selecting kernel variant
     at runtime) so future kernel work can be measured without cross-build confounds? I think
     yes - it would have caught E41 in one run instead of six.
+
+## 2026-08-14 04:00 — activation-QDQ hoist CONSIDERED AND REJECTED (arithmetic only, no code)
+Found real redundancy: coli_fp4_dual_matvec_ref (c/deepseek_v4.c:11004-11010) mallocs a 16KB
+activation buffer and runs coli_fp8_activation_qdq_ref on `input` EVERY call. All 6 experts in a
+layer get the SAME ffn_normalized input, so 258 QDQ passes/token where 43 would do (83% redundant).
+BUT: QDQ is ~12.3K ops vs 25.2M MACs per expert op = 0.049% of the work.
+Hoisting all 215 redundant calls saves ~0.04% of expert_forward ~= 4 ms of a 34.3 s run.
+REJECTED on arithmetic. No code written. (Same discipline as E38: do the sums before building.)
+
+Also confirms expert_forward is in decent shape: 0.69 ms per expert op for 25.2M MACs
+= 36.5 GMAC/s (73 GFLOP/s) on CPU. E33's 4-row matvec did its job. The remaining lever on
+that phase is GPU offload, not more CPU micro-optimization.
+
+## FINAL A/B (same binary, flag toggled, 3 interleaved runs each, 60-token gen)
+  default  mean 38554.8 ms  sd 234.7   md5 5d04890413ff539e802985ce8c727814 (bit-exact)
+  flagged  mean 34311.2 ms  sd  49.7   md5 7155bab905cbfa70aa06afa08f757cee
+  => 11.01% faster (1.1237x). expert_forward identical in both (10476-10672) = no cache pollution.
