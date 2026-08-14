@@ -1880,3 +1880,53 @@ On these prompts the two configs produce **visibly identical text**. The reassoc
 output divergence (different md5 at 60+ tokens) has no measurable effect on short-form factual
 accuracy. This satisfies the user's stated bar for considering a default flip; the flip itself
 remains a user decision.
+
+---
+
+## E51. Prefill I/O stage-0 gates — **GATE A kills the deep-queue design and finds the real bottleneck**
+
+Plan-gated lane (route-ahead + deep-queue burst prefetch). Stage-0 instruments built and run
+BEFORE any engine code, per campaign law.
+
+### Layout intel (bench/layer_contig.py, 11008 records verified)
+**Each layer lives wholly in ONE shard** (`model-(L+2)-of-00048`); within a layer **all 256 scale
+groups form one contiguous run and all 256 weight groups another** — 21930/21930 same-stream
+neighbors byte-contiguous, zero violations. No FLOCK-packed whole records (scale stream separate).
+Multi-record coalescing within a stream is trivially possible by layout.
+
+### GATE A: QD sweep on real offsets (bench/qd_sweep.c) — STOP
+| QD | GB/s |
+|---|---|
+| 1 | 5.227 |
+| 4 | **7.028 (saturation)** |
+| 8 | 7.029 |
+| 16-32 | 6.66-6.63 (declining) |
+
+`ratio_qd8_qd1 = 1.34 < 1.5` → **pre-committed STOP fired. The deep-queue burst design is dead**
+— this SSD gives QD1 5.2 GB/s and saturates at ~7.0 GB/s by QD4. Latency scales linearly with QD
+(p50 2.5 → 58.7 ms), so deep queues only buy queueing delay.
+
+### But the sweep exposed the actual bottleneck (fresh instrumented p064 run)
+| quantity | value |
+|---|---|
+| prefill wall (ttft, cold) | 42.70 s |
+| payload read | 53.6 GB in 4257 direct reads |
+| **effective I/O rate in-engine** | **1.25 GB/s** |
+| same SSD, same pattern, QD1 (microbench) | 5.23 GB/s |
+| raw I/O time at QD1 | 10.2 s |
+| warm compute (18060 ops x 0.41 ms) | 7.4 s |
+| ideal serialized | 17.7 s |
+| ideal overlapped at QD4 | **~7.6 s** |
+| **unexplained by I/O or compute** | **25.0 s (59 % of wall)** |
+
+**The engine achieves 24 % of its own SSD's QD1 bandwidth during prefill.** The bottleneck is not
+queue depth and never was — it is the per-op pipeline: route→handoff→load→compute serialized per
+expert through a 3-slot condvar loader, slab alloc + mutex publish + hot-packer contention per
+miss, plus buffered (non-direct) scale reads. Route-ahead remains the enabler (know the layer's
+~93 experts before the loop), but the design revision is **continuous overlap at QD2-4**, not
+deep queues.
+
+**Revised honest projection:** p064 42.7 s → ~10 s (~4.3x); p256 113.7 s → ~25 s (~4.5x).
+Baseline re-pinned this session: p064 43.554 s (sd 0.249), p256 113.735 s (sd 0.864), golden md5
+confirmed. Engine work is HALTED pending user decision, since the pre-committed gate said stop
+and proceeding on revised evidence is a scope decision, not a technical one.

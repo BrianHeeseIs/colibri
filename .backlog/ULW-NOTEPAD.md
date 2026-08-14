@@ -664,3 +664,13 @@ Golden: md5 5d04890413ff539e802985ce8c727814 must hold with flag OFF at every co
   bg_83a5d3d4  T2 layer_contig.py + artifacts/layer_contig.json (11008 records expected)
   bg_4214b328  T3 harness: golden.sh/rebaseline.sh/ab.sh/build.sh/shares.sh + fixture tests
 Wave 2 (serial, model process): T4 re-baseline -> T5 QD sweep -> GATE A decision.
+
+
+## 17:05 — GATE A FIRED (STOP) + real bottleneck found. AWAITING USER.
+QD sweep: QD1 5.23 GB/s, saturates 7.03 at QD4, ratio 1.34 -> deep-queue design DEAD.
+BUT in-engine prefill I/O is 1.25 GB/s = 24% of the SSD's own QD1. 59% of p064 wall is
+pipeline overhead (neither I/O nor compute). Ideal overlapped at QD4 ~7.6s vs 42.7 measured.
+Revised design: route-ahead + CONTINUOUS OVERLAP at QD2-4 (not deep queue). Projection ~4.3-4.5x.
+Baseline pinned: p064 43.554 sd 0.249 / p256 113.735 sd 0.864. rebaseline.sh had an unbound-var
+bug (local status under set -u) - fixed, harness tests still green.
+Engine work HALTED per the gate; pivot decision put to user.

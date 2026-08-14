@@ -85,7 +85,7 @@ sample_sd() {
 run_model() {
     local prompt=$1
     local log=$2
-    local status restore_status=0
+    local status=0 restore_status=0
     cp "$SNAPSHOT" "$USAGE" || restore_status=$?
     if (( status == 0 && restore_status != 0 )); then
         status=$restore_status
