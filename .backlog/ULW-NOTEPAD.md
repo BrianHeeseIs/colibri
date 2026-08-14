@@ -409,3 +409,53 @@ Manual check: `... "The capital of France is" --max-tokens 24` -> stdout is
   `The capital of France is **Paris**.<|end of sentence|>`
 => Fix: read stdout directly (no awk needed), or merge 2>&1 and use the block extractor.
 Task B is NOT invalidated, just re-run needed.
+
+## AGENT RESULTS 12:30 — all three in
+
+### bg_229920ec Metal buffer lifecycle — my E43 verdict is MOSTLY architectural, but I DID miss warmup
+AMORTIZABLE (first-call only), which a 30-token run charges unfairly:
+  - lazy coli_v4_metal_init: device + metallib load/compile + probe pipeline + queue (:423-426, :740-768)
+  - chain pipelines built on FIRST expert dispatch, then memoized (:367-376, :475-478)
+  - scratch buffers allocated on first need, reused by capacity (:277-285)
+  - ONE MTLBuffer per registered slab via newBufferWithBytesNoCopy = ZERO-COPY weights (:201-221)
+NOT AMORTIZABLE (every single dispatch):
+  - input memcpy (:552), output memcpy (:710)
+  - weight buffer resolution x6 tensors (:557-568) - zero-copy IF slab registered else memcpy
+  - ONE command buffer + ONE encoder created per expert (:575-577)
+  - *** ONE SYNCHRONOUS [command_buffer waitUntilCompleted] PER EXPERT (:698-699) ***
+=> ~240 expert dispatches/token x 60 tokens = ~14,400 BLOCKING GPU round trips. That is the
+   architectural cost and no amount of cache heating removes it. Explains 1.614 ms/dispatch.
+COUNTERS AVAILABLE: COLI_V4_METAL_STATS=1 -> reject histogram + metal_dispatches;
+   COLI_V4_METAL_PROFILE=1 -> per-stage ms_per_expert + zero_copy_tensors vs copy_fallback_tensors.
+   WARNING: PROFILE=1 inserts 9 commit/wait per dispatch (:592-606) so it DISTORTS timing.
+   Use STATS for timing runs, PROFILE only for stage attribution.
+
+### bg_327551ae macOS cache warming — options 2 and 3 are STRUCTURALLY DEAD
+  - RAM disk: hdiutil docs - RAM disks use WIRED memory, cannot page out. 100GB on 128GB machine
+    = severe pressure. AND benchmark-invalid: changes storage medium vs prod APFS/SSD.
+  - posix_fadvise: DOES NOT EXIST on macOS. madvise(MADV_WILLNEED) is for MAPPED ranges only;
+    our engine uses pread not mmap => not applicable.
+  - F_RDADVISE: advisory only, forwarded to VNOP_IOCTL, FS decides. Hint not guarantee.
+  - vmtouch: works (mincore/msync/mlock) but pinning bounded by RLIMIT_MEMLOCK; changes eviction
+    behavior => benchmark-invalid unless prod also pins.
+  - *** DECISIVE: our engine sets F_NOCACHE (COLI_V4_DIRECT default ON) for expert reads, so the
+    OS unified buffer cache is DELIBERATELY BYPASSED. Page-cache warming cannot help expert IO
+    at all. ***
+  - Measurement tools if ever needed: mincore, vmtouch -v, vm_stat, footprint, fs_usage, purge.
+
+### CONCLUSION ON USER REQUEST 2
+Only viable mechanism = PERSISTENT SERVE PROCESS (option 1). Proven working:
+  identical prompts: hit_pct 75.2 -> 98.3 -> 98.3, wall 53.1 -> 44.2 -> 43.3 s
+  BUT that improvement is CONFOUNDED by KV prefix reuse (same prompt on same slot).
+  DISTINCT prompts: hit_pct 75.2 -> 91.1 -> 93.6 -> 95.0 (real heating) but
+    wall 52.7 -> 48.0 -> 54.0 -> 69.4 and tok/s 1.491 -> 1.457 -> 1.369 -> 1.091 (DEGRADES)
+  => second confound: single KV slot ACCUMULATES context across turns (truncate-and-extend),
+     so attention cost grows every request. Must reset between benchmark requests.
+=> Serve mode IS the answer but the harness must control BOTH confounds.
+
+## USER ADDED REQUEST (12:30)
+"I do want to record warmed cache performance too though, make sure to test, collect and document"
+=> Both operating points are first-class deliverables:
+   COLD  (one-shot, per-process): hit_rate ~75-88%
+   WARM  (serve, steady state):   hit_rate ~98.3%
+   Must document decode throughput at BOTH, with confounds controlled.
