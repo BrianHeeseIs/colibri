@@ -314,3 +314,41 @@ MY LANE ACTUALLY WORKS: attn_total_ms 14553.0 (E64 baseline) -> 11610.3, i.e. -2
 Isolation verified: with ONLY COLI_V4_METAL_ATTN=1 -> metal_dispatches=0, metal_fp8_dispatches=256.
 The lazy init added in A3 is what makes the clean experiment possible.
 EXPECTATION for the clean A/B: ~2.94s saved on a 42.4s wall = ~1.075x, NOT the 1.18x projected.
+
+### ===== STATE AT END OF SESSION 2 (resumable) =====
+BRANCH ft-metal-new-arch, pushed to fork. Tree clean. Engine idle. Seed 599f3d12 intact.
+
+SHIPPED (both bit-exact, both default OFF, verified together):
+  COLI_V4_MOE_GROUPED=1   grouped MoE scheduler   p064 1.043x / p256 1.021x   (E61)
+  COLI_V4_METAL_ATTN=1    bit-exact Metal fp8 attention projections
+                          p064 1.107x / p256 1.135x                          (E71)
+  BOTH TOGETHER           p064 1.163x / p256 1.169x, composition VERIFIED    (E72)
+  golden md5=5d04890413ff539e802985ce8c727814 holds in every combination.
+
+MEASUREMENT-ONLY KNOBS: COLI_V4_MOE_GROUPED_STATS, COLI_V4_MOE_GROUPED_DUMP,
+  COLI_V4_ATTN_STATS (12-slot, residual 0.21%), COLI_V4_METAL_STATS (fp8 counters).
+
+NEXT (A6, de-risked and quantified, NOT implemented):
+  Fuse wo_a's 8 per-group dispatches into ONE 3-D dispatch over (O,S,groups).
+  Measured feasibility: 2.36x at S=64, 5.58x at S=6, 7.93x at S=1 (E74).
+  Projected: attention lane 1.107x -> ~1.145x. MUST be measured, not assumed.
+  Bit-exactness holds by construction (each (group,o,s) is an independent accumulation) but
+  must still be PROVEN at 0 ULP, not asserted.
+  Work required: new fused kernel in c/metal/coli_v4_fp8_matmul.metal, a seam entry taking
+  groups + strides, and restructuring the wo_a loop at :2818-2840 to drop the per-group
+  gather/scatter memcpy (the kernel can index `attended` directly with the group offset).
+
+OTHER OPEN LEVERS (value order, none measured):
+  1. raise the attention chunk cap above 64 so more work runs at large S. Same
+     N-is-the-bottleneck conclusion E60 reached from the MoE side, arrived at independently
+     from attention. MUST respect the 7 cap sites incl. the __m256 sums[64] stack hazard :12355.
+  2. move the fp8 QDQ to the GPU (1273.5 ms = 17% of projections, measured).
+  3. F19 decoupling for MoE (measured N would rise 4.14 -> 7.99, E62).
+
+TRAPS CONFIRMED THIS SESSION (all cost real time, all now documented):
+  - MTLCompileOptions.fastMathEnabled defaults YES and silently destroys Dekker double-float
+  - Metal has NO fp64 at all (compiler error, not a slow path)
+  - my weight cache overflowed silently at 512 entries (needed 1032) -> permanent CPU fallback
+  - enabling COLI_V4_METAL=1 alongside ATTN confounds the A/B with the known-1.118x-slower MoE path
+  - subtracting figures ACROSS RUNS gave a 77% claim that direct measurement put at 17%
+  - ab.sh delta sign: 100*(on-off)/off, so FASTER IS NEGATIVE
