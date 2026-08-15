@@ -8,7 +8,7 @@ so the browser needs no configuration.
 
 One resident engine (model stays loaded), requests serialised by a lock.
 """
-import json, os, subprocess, threading, time, uuid, signal, sys
+import collections, json, os, subprocess, threading, time, uuid, signal, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT  = "/Users/cptn/workbench/ai/colibri"
@@ -18,6 +18,7 @@ DIST  = os.path.join(ROOT, "web", "dist")
 PORT  = int(os.environ.get("PORT", "8000"))
 CTX   = int(os.environ.get("CTX", "8192"))
 MODEL_ID = "deepseek-v4-flash"
+PROFILE_TURNS = 120
 
 FLAGS = dict(kv.split("=", 1) for kv in os.environ.get(
     "FLAGS",
@@ -25,7 +26,72 @@ FLAGS = dict(kv.split("=", 1) for kv in os.environ.get(
 ).split() if "=" in kv)
 
 lock = threading.Lock()
+state_lock = threading.Lock()
 proc = None
+tiers = None
+hwinfo = None
+emap = {"rows": 0, "cols": 0, "map": ""}
+hits = ""
+hits_seq = 0
+profile = collections.deque(maxlen=PROFILE_TURNS)
+profile_seq = 0
+
+def consume_telemetry(fields):
+    """Route one line-framed telemetry record into dashboard state."""
+    global tiers, hwinfo, emap, hits, hits_seq, profile_seq
+    if not fields:
+        return False
+    kind = fields[0]
+    with state_lock:
+        if kind == "HWINFO" and len(fields) >= 7:
+            parts = " ".join(fields[6:]).split("|")
+            hwinfo = {"cores": int(fields[1]), "ram_total_gb": float(fields[2]),
+                      "ram_avail_gb": float(fields[3]), "gpus": int(fields[4]),
+                      "vram_total_gb": float(fields[5]),
+                      "cpu": parts[0].strip() if parts else "",
+                      "gpu": parts[1].strip() if len(parts) > 1 else ""}
+        elif kind == "TIERS" and len(fields) >= 6:
+            tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
+                     "disk": int(fields[3]), "vram_gb": float(fields[4]),
+                     "ram_gb": float(fields[5])}
+        elif kind == "EMAP" and len(fields) == 4:
+            emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
+        elif kind == "HITS" and len(fields) == 4:
+            hits = fields[3]
+            hits_seq += 1
+        elif kind == "PROF" and len(fields) >= 10:
+            profile.append({
+                "wall_s": float(fields[1]),
+                "prompt_tokens": int(fields[2]),
+                "completion_tokens": int(fields[3]),
+                "expert_disk_s": float(fields[4]),
+                "expert_wait_s": float(fields[5]),
+                "expert_matmul_s": float(fields[6]),
+                "attention_s": float(fields[7]),
+                "lm_head_s": float(fields[8]),
+                "forwards": int(fields[9]),
+            })
+            profile_seq += 1
+        else:
+            return False
+    return True
+
+def experts_snapshot():
+    with state_lock:
+        return {**emap, "hits": hits, "seq": hits_seq}
+
+def profile_snapshot():
+    with state_lock:
+        return {"seq": profile_seq, "turns": list(profile)}
+
+def health_telemetry_snapshot():
+    with state_lock:
+        result = {}
+        if tiers is not None:
+            result["tiers"] = dict(tiers)
+        if hwinfo is not None:
+            result["hwinfo"] = dict(hwinfo)
+        return result
 
 def start_engine():
     global proc
@@ -41,13 +107,21 @@ def start_engine():
             raise SystemExit("[bridge] engine died during startup")
         if b"READY" in line:
             break
-    proc.stdout.readline()                     # initial STAT frame
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            raise SystemExit("[bridge] engine died during telemetry startup")
+        fields = line.decode("utf-8", "replace").split()
+        consume_telemetry(fields)
+        if fields and fields[0] == "EMAP":
+            break
     print(f"[bridge] engine READY in {time.time()-t0:.1f}s -> http://127.0.0.1:{PORT}/", flush=True)
 
 def engine_stream(prompt, max_tokens):
     """Yield ('text', chunk) then ('done', stats)."""
     rid = "w%d" % (int(time.time() * 1000) % 10_000_000)
     payload = prompt.encode("utf-8")
+    done_stats = None
     with lock:
         proc.stdin.write(
             f"SUBMIT {rid} 0 {len(payload)} {max_tokens} 0.0 1.0 0\n".encode("ascii")
@@ -67,12 +141,14 @@ def engine_stream(prompt, max_tokens):
                 yield ("text", chunk.decode("utf-8", "replace"))
             elif f[0] == "DONE":
                 # DONE <id> STAT <completion> <tok/s> <hit%> <rss> <prompt> <cap> [<reuse>]
-                stats = {}
+                done_stats = {}
                 if len(f) >= 8:
-                    stats = {"completion_tokens": int(float(f[3])), "tok_s": float(f[4]),
-                             "expert_hit_pct": float(f[5]), "rss_gb": float(f[6]),
-                             "prompt_tokens": int(float(f[7]))}
-                yield ("done", stats); return
+                    done_stats = {"completion_tokens": int(float(f[3])), "tok_s": float(f[4]),
+                                  "expert_hit_pct": float(f[5]), "rss_gb": float(f[6]),
+                                  "prompt_tokens": int(float(f[7]))}
+            elif consume_telemetry(f) and f[0] == "TIERS" and done_stats is not None:
+                yield ("done", done_stats)
+                return
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -96,19 +172,16 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"object": "list",
                 "data": [{"id": MODEL_ID, "object": "model", "owned_by": "colibri"}]}))
         if p in ("/health", "/v1/health"):
-            import multiprocessing
             return self._send(200, json.dumps({
                 "status": "ok", "kv_slots": 1,
                 "scheduler": {"active": 1 if lock.locked() else 0, "capacity": 1, "queued": 0,
                               "max_queue": 1, "queue_timeout_seconds": 0, "admitted": 0,
                               "completed": 0, "rejected": 0, "timed_out": 0, "cancelled": 0},
-                "hwinfo": {"cores": multiprocessing.cpu_count(), "ram_total_gb": 128.0,
-                           "ram_avail_gb": 0.0, "gpus": 1, "vram_total_gb": 0.0,
-                           "cpu": "Apple M3 Max", "gpu": "Apple M3 Max (40c)"}}))
+                **health_telemetry_snapshot()}))
         if p in ("/profile", "/v1/profile"):
-            return self._send(200, json.dumps({"turns": []}))
+            return self._send(200, json.dumps(profile_snapshot()))
         if p in ("/v1/experts", "/experts"):
-            return self._send(200, json.dumps({"experts": []}))
+            return self._send(200, json.dumps(experts_snapshot()))
         rel = "index.html" if p == "/" else p.lstrip("/")
         full = os.path.normpath(os.path.join(DIST, rel))
         if not full.startswith(DIST) or not os.path.isfile(full):
