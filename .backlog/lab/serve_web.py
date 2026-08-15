@@ -223,22 +223,11 @@ class H(BaseHTTPRequestHandler):
         def frame(obj):
             self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n"); self.wfile.flush()
 
-        # The engine budgets prompt + generation against ONE context window: v4_serve_one
-        # rejects when prompt_count + max_tokens > context, and the UI happily sends
-        # max_completion_tokens = CTX. Clamp here with a pessimistic estimate since the
-        # engine, not us, tokenises.
-        # NOTE: upstream 8c40fbd makes the ENGINE clamp correctly (max_tokens is a ceiling).
-        # Once that commit is adopted this block becomes redundant and should be removed.
-        est_prompt = len(prompt.encode("utf-8")) // 2 + 32
-        budget = CTX - est_prompt - 8
-        if budget < 16:
-            frame({"id": cid, "choices": [{"index": 0, "delta": {"content":
-                   f"\n[prompt too long for CTX={CTX}; start a new chat or raise CTX]"},
-                   "finish_reason": "stop"}]})
-            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush(); return
-        if max_tokens > budget:
-            print(f"[bridge] clamping max_tokens {max_tokens} -> {budget} (CTX={CTX}, est prompt {est_prompt})", flush=True)
-            max_tokens = budget
+        # No client-side clamp: upstream 8c40fbd makes max_tokens a CEILING in the engine,
+        # which clamps to (context - prompt_count) using the REAL tokenised prompt length and
+        # emits "[V4] max_tokens N clamped to M". Our old estimate-based clamp guessed at that
+        # length and could only ever be more conservative than the engine's own answer.
+        # CONTEXT_EXCEEDED now means the only honest thing: the prompt itself does not fit.
 
         try:
             began = time.time(); first = None; stats = {}
