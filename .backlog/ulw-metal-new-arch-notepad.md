@@ -235,3 +235,56 @@ v1/v2 dispatched 1D over O only = 2048 threads on 40 GPU cores. fp8 attention pr
 CAUTION: my coupon-collector extrapolation of N vs tokens saturates unique at ~95, but the MEASURED
 max at chunk=64 is 188. Model contradicts data -> N at larger chunks is UNMEASURED. T9 must read it
 from the engine's unique= log. Do not attach a perf claim to the extrapolation.
+
+### F19. DESIGN IMPROVEMENT - decouple the MoE batch from the attention chunk
+Today target_batch (:8879) is `for layer { for offset+=64 { attention -> MoE } }`, so MoE's batch is
+FORCED to equal attention's 64-token chunk. That is what pins N=4.10 in the flat part of the E60
+kernel curve.
+MoE does not need attention's batch. Restructure to:
+   for layer { for offset+=64 { ATTENTION only, buffer ffn_norm[token] } ; ONE grouped MoE over ALL
+   tokens of the layer }
+=> raises the MoE batch to WHOLE-PROMPT scope WITHOUT touching any of the 7 batch-cap sites,
+   including the __m256 sums[64] stack-overflow hazard at :12355, and without disturbing attention's
+   recurrent compressor (:2611) or causal KV ring (:2694).
+=> buffer cost is tiny: 799 tokens x 4096 x 4B = 13.1 MB.
+TRADEOFF: n_unique per MoE call also rises, so more waves vs capacity 164 - the plan's wave design
+already covers it. UNMEASURED: actual N and n_unique at whole-prompt scope; must be read from the
+engine's unique= log (same caution as E60).
+
+### ===== SESSION 2 RESULTS (E58-E64) =====
+E58 premise overturned: GPU 3.1x CPU bandwidth (hardened, checksum-verified). Prefill ALREADY
+     layer-outer/chunk-inner with 64 tok in flight; only MoE discards it. S=1 is the real fault.
+E59 attention lane probed: dense fp8 projections 6.0x GPU-favorable at S=64 (572 GF/s vs 83).
+     CAUTION: first run said 45x - my CPU baseline was a strawman (scalar e4m3 vs engine's LUT).
+E60 MXFP4 kernel was OCCUPANCY-limited not format-limited: 1D dispatch (2048 thr on 40 cores).
+     2D (O,S) -> 421.6 GF/s at S=64. KERNEL IS NOT THE BOTTLENECK, N IS.
+E61 T-1 CPU grouped MoE SHIPPED behind COLI_V4_MOE_GROUPED: BIT-EXACT (same golden md5),
+     K0 PASS (overhead 9.72% < 16.7%), +4.15% p064 / +2.09% p256 (3/3 pairs each).
+     Gain HALVES with length - same decay as prefetch, same cause: chunk cap pins N=4.10.
+E62 measured N at whole-prompt scope: 4.14 -> 7.99 (1.93x) by decoupling MoE batch from the
+     attention chunk. My coupon-collector model had predicted ~16 - WRONG by 2x. Measured instead.
+     Early layers touch 226/256 experts (NOT concentrated); later ones 126-151.
+E63/E64 B3 attention attribution, residual driven 26.6% -> 0.21%:
+     proj_wo_a 25.66% (WAS HIDDEN - biggest stage) | proj_out 19.23% | proj_wq_b 17.47%
+     sparse_core 17.28% | compressor_indexer 14.06% | wq_a 3.23% | wkv 2.01% | rest <1%
+     ALL FIVE projections = 9.838s = 67.6% of attention = 22.6% of the prefill wall.
+     At E59's 6.0x -> 1.232x full prefill. Even worst shape (3.26x) -> 1.186x. CLEARS 1.12x gate.
+     alloc-churn hypothesis TESTED AND WRONG (2.2ms, 0.02%).
+     Not batchable: sparse_core + compressor = 31.3% of attention / 10.5% of wall.
+
+### PRIORITY CHANGE
+ATTENTION PROJECTIONS (1.23x, resident weights, no SSD/lease/wave machinery) now OUTRANK the
+batched-MoE plan (~1.10-1.15x projected). MoE grouped path already landed and is kept (free,
+bit-exact). Next implementation target = GPU the five fp8 projections.
+
+### ENV KNOBS ADDED THIS SESSION (all default OFF, all measurement-safe)
+  COLI_V4_MOE_GROUPED=1        CPU grouped MoE scheduler (bit-exact, +4.3%)
+  COLI_V4_MOE_GROUPED_STATS=1  moe_group_overhead_ns / moe_chunk_ns / waves / fallbacks / groups
+  COLI_V4_MOE_GROUPED_DUMP=1   per-chunk sorted unique expert ids (offline union analysis)
+  COLI_V4_ATTN_STATS=1         12-slot prefill attention attribution, residual 0.21%
+
+### NEXT
+1. bit-exactness feasibility probe for a Metal fp8 dense matmul vs coli_fp8_matmul_batch_ref
+   (must match the CPU accumulation order exactly; check the portable non-AVX2 reference).
+2. if exact -> seam + host glue for the five projections (no gather/waves/leases needed).
+3. still open: F19 decoupling for MoE (1.48x on expert kernel cost, measured N 7.99).
