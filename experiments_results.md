@@ -2682,3 +2682,71 @@ assumed**; E57 is the standing lesson on multiplying independent-looking deltas)
 2. **`compressor_indexer` = 14.16 % is recurrent** (`:2651` carries `kv_state`/`score_state`) and
    `sparse_core` = 17.27 % is per-item behind a causal KV-ring dependency (`:2694`). Together
    **31.4 % of attention is structurally hard to batch** — that part of E59's worry was justified.
+
+---
+
+## E64. Complete attention attribution (residual 0.21 %) — **`wo_a` was hidden, and the lane is worth 1.23x**
+
+E63 left a **26.6 % residual**, far coarser than the 1.55 % E54 achieved, and I flagged it as too
+coarse to call finished. Closing it changed the conclusion materially.
+
+### Two hypotheses tested, one wrong
+I suspected **allocation churn** — the function `calloc`s ~9 buffers per call including two of
+**8.4 MB** (`q`, `attended`), 86 times. Measured: **`alloc_free` = 2.2 ms = 0.02 %**. **Hypothesis
+wrong.** `qnorm` was likewise negligible at 0.63 %.
+
+The residual was almost entirely **one unmeasured stage**.
+
+### Full attribution — p064, 86 calls, residual **0.21 %**
+
+```
+attn_total_ms = 14553.0     attn_parts_ms = 14522.9     residual = 30.1 ms (0.21%)
+```
+
+| stage | ms | % of attention | batched over tokens? |
+|---|---|---|---|
+| **`proj_wo_a`** | **3734.7** | **25.66 %** | **yes** — was invisible in E63's residual |
+| `proj_out` (wo_b) | 2798.3 | 19.23 % | yes |
+| `proj_wq_b` | 2542.4 | 17.47 % | yes |
+| `sparse_core` | 2514.8 | 17.28 % | no — per item, causal KV ring |
+| `compressor_indexer` | 2046.1 | 14.06 % | **no — recurrent** |
+| `proj_wq_a` | 470.2 | 3.23 % | yes |
+| `proj_wkv` | 292.2 | 2.01 % | yes |
+| `qnorm` | 92.3 | 0.63 % | — |
+| `rope` | 17.8 | 0.12 % | — |
+| `kv_assembly` | 12.0 | 0.08 % | — |
+| `alloc_free` | 2.2 | 0.02 % | — |
+
+`wo_a` is the **per-group** output projection (`:2826`): `coli_fp8_matmul_batch_ref(group_outputs,
+&group_view, group_inputs, batch)` invoked once per output group. It is already batched over tokens
+— it was simply never timed.
+
+### Corrected value of the attention lane
+
+**E63 said projections were 6.085 s / 41.8 %. That was wrong — it missed `wo_a`.**
+All five projections total **9.838 s = 67.6 % of attention = 22.6 % of the prefill wall.**
+
+| GPU speedup (E59 measured range) | saves | **full prefill** |
+|---|---|---|
+| 3.26x (worst single shape) | 6.82 s | **1.186x** |
+| **6.00x (measured aggregate)** | **8.20 s** | **1.232x** |
+| 7.56x (best single shape) | 8.54 s | **1.244x** |
+
+**Even the worst-case shape clears the 1.12x gate.** At the measured aggregate the attention lane is
+worth **1.23x on its own** — roughly *five times* the MoE grouped path's measured 1.043x (E61), and
+it targets a completely different part of the wall.
+
+### What remains structurally hard
+`sparse_core` (17.28 %) is per-item behind the causal KV-ring dependency (`:2694`), and
+`compressor_indexer` (14.06 %) is genuinely recurrent (`:2651` carries `kv_state`/`score_state`).
+**Together 31.3 % of attention / 10.5 % of the wall is not batchable** by this approach. E59's
+concern was justified for that third — but the other two thirds are exactly the shape the GPU wants.
+
+### Priority change
+This **overtakes the batched-MoE plan as the highest-value lane**: 1.23x vs the MoE lane's
+projected ~1.10-1.15x, on weights that are **resident** (no SSD bound, no lease capacity, no
+eviction risk, no wave machinery). The MoE work already landed is kept — it is bit-exact and free —
+but the next implementation effort should target the five attention projections.
+
+Regression: default path re-verified `PASS golden md5=5d04890413ff539e802985ce8c727814` with all
+12 timing slots compiled in.

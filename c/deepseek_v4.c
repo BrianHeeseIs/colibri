@@ -2546,7 +2546,7 @@ extern uint64_t coli_v4_profile_now_ns(void);
  * (:1947-2097); the batched prefill attention below has none. E54 measured attention at 33.18%
  * of the prefill wall and E59 showed the four dense projections are only ~24% of that block,
  * leaving ~11 s unexplained. This attributes it. */
-static uint64_t coli_v4_attn_ns[8];
+static uint64_t coli_v4_attn_ns[12];
 static uint64_t coli_v4_attn_calls;
 static int coli_v4_attn_stats_value = -1;
 static int coli_v4_attn_stats_enabled(void) {
@@ -2559,11 +2559,12 @@ static int coli_v4_attn_stats_enabled(void) {
 void coli_v4_attn_report(void);
 void coli_v4_attn_report(void) {
     if (!coli_v4_attn_stats_enabled()) return;
-    static const char *nm[8] = { "proj_wq_a", "compressor_indexer", "TOTAL_attention", "proj_wq_b",
-                                 "proj_wkv", "rope", "sparse_core", "proj_out" };
+    static const char *nm[12] = { "proj_wq_a", "compressor_indexer", "TOTAL_attention", "proj_wq_b",
+                                  "proj_wkv", "rope", "sparse_core", "proj_out",
+                                  "alloc_free", "qnorm", "kv_assembly", "proj_wo_a" };
     uint64_t tot = __atomic_load_n(&coli_v4_attn_ns[2], __ATOMIC_RELAXED); /* TOTAL */
     uint64_t parts = 0;
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 12; i++)
         if (i != 2) parts += __atomic_load_n(&coli_v4_attn_ns[i], __ATOMIC_RELAXED);
     fprintf(stderr, "attn_calls=%llu attn_total_ms=%.3f attn_parts_ms=%.3f "
             "attn_residual_ms=%.3f residual_pct=%.2f\n",
@@ -2571,7 +2572,7 @@ void coli_v4_attn_report(void) {
             (double)tot / 1e6, (double)parts / 1e6,
             (double)(tot - parts) / 1e6,
             tot ? 100.0 * (double)(tot - parts) / (double)tot : 0.0);
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 12; i++) {
         uint64_t v = __atomic_load_n(&coli_v4_attn_ns[i], __ATOMIC_RELAXED);
         fprintf(stderr, "attn_stage %-20s ms=%10.3f pct=%6.2f\n",
                 nm[i], (double)v / 1e6, tot ? 100.0 * (double)v / (double)tot : 0.0);
@@ -2609,6 +2610,7 @@ int coli_v4_attention_window_batch_ref(
         fp8_view(&wo_b, weights, "attn.wo_b"))
         return set_error(error, error_size, "missing batched attention tensor");
 
+    uint64_t aa0 = ATT0();
     float *qa = calloc((size_t)batch * q_rank, sizeof(*qa));
     float *q = calloc((size_t)batch * q_width, sizeof(*q));
     float *kv = calloc((size_t)batch * head_dim, sizeof(*kv));
@@ -2623,6 +2625,7 @@ int coli_v4_attention_window_batch_ref(
     int end_position = start_position + batch;
     size_t rope_pairs = (size_t)rope_dim / 2;
     float *cosines = malloc((size_t)end_position * rope_pairs * sizeof(*cosines));
+    ATADD(8, aa0);
     float *sines = malloc((size_t)end_position * rope_pairs * sizeof(*sines));
     if (!qa || !q || !kv || !attended || !oa || !norm || !selected_counts ||
         !compressed_counts || !compressed_indices || !cosines || !sines) {
@@ -2681,6 +2684,7 @@ int coli_v4_attention_window_batch_ref(
     if (!result) result = coli_fp8_matmul_batch_ref(q, &wq_b, qa, batch);
     ATADD(3, at0);
     if (!result) coli_bf16_round_array(q, (size_t)batch * q_width);
+    uint64_t qn0 = ATT0();
     for (int item = 0; !result && item < batch; item++)
         for (int head = 0; head < heads; head++) {
             float *values = q + (size_t)item * q_width + (size_t)head * head_dim;
@@ -2691,6 +2695,7 @@ int coli_v4_attention_window_batch_ref(
                 values[i] = coli_bf16_round(values[i] * scale);
         }
 
+    ATADD(9, qn0);   /* q rms-norm, per item per head */
     at0 = ATT0();
     if (!result) result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
     ATADD(4, at0);
@@ -2739,6 +2744,7 @@ int coli_v4_attention_window_batch_ref(
 
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
     ATADD(5, at0);   /* rope precompute + both apply loops */
+    uint64_t kv0 = ATT0();
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
         float *item_kv = kv + (size_t)item * head_dim;
@@ -2778,11 +2784,13 @@ int coli_v4_attention_window_batch_ref(
                     ? compressed_indices[(size_t)item * config->index_topk + i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
+            ATADD(10, kv0);          /* KV ring + index/gather assembly */
             uint64_t ct0 = ATT0();
             result = coli_v4_sparse_attention_ref(
                 item_attended, item_q, values, sinks, indices, heads, head_dim,
                 kv_count, topk, 1.0f / sqrtf((float)head_dim));
             ATADD(6, ct0);
+            kv0 = ATT0();            /* resume KV-assembly timing for the loop tail */
         }
         free(all_kv); free(indices);
         const float *item_cos = cosines + (size_t)position * rope_pairs;
@@ -2794,11 +2802,13 @@ int coli_v4_attention_window_batch_ref(
             coli_bf16_round_array(rope, (size_t)rope_dim);
         }
     }
+    ATADD(10, kv0);   /* KV ring + gather + post-rope tail */
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows = (o_rank + 127) / 128;
+    uint64_t wa0 = ATT0();
     float *group_inputs = malloc((size_t)batch * group_width * sizeof(*group_inputs));
     float *group_outputs = malloc((size_t)batch * o_rank * sizeof(*group_outputs));
     if (!group_inputs || !group_outputs) result = -1;
@@ -2825,12 +2835,15 @@ int coli_v4_attention_window_batch_ref(
                    (size_t)o_rank * sizeof(*oa));
     }
     if (!result) coli_bf16_round_array(oa, (size_t)batch * oa_width);
+    ATADD(11, wa0);   /* per-group wo_a matmul + group gather/scatter */
     at0 = ATT0();
     if (!result) result = coli_fp8_matmul_batch_ref(outputs, &wo_b, oa, batch);
     ATADD(7, at0);
     if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
 
     ATADD(2, atot0);   /* TOTAL attention; residual = TOTAL - sum(other slots) */
+    { uint64_t fr0 = ATT0();
+      (void)fr0; }
     free(group_outputs); free(group_inputs); free(sines); free(cosines);
     free(compressed_indices); free(compressed_counts); free(selected_counts);
     free(norm); free(oa); free(attended); free(kv); free(q); free(qa);
