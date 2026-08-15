@@ -3673,3 +3673,71 @@ The A/B metric is prefill TTFT, and **MoE is 63.9 % of it.** That — not decode
 warm-up, not the QDQ — is where the remaining headroom is. `COLI_V4_PREWARM` targets decode
 warm-up and is therefore **irrelevant to this metric**; it was about to be tested against the wrong
 thing.
+
+---
+
+## E80. Attribution on the **real** benchmark prompts, and the chunk-cap lever killed
+
+E79 corrected the metric but quoted `moe 63.9 %` from a trace of the **20-token golden prompt**.
+The ab.sh metric uses different prompts, so per E79's own rule I re-traced using ab.sh's exact
+invocation (`--max-tokens 1`, both lanes ON) on `.backlog/prefill_prompts/p064.txt` and `p256.txt`.
+
+### Attribution that actually applies to the shipped metric
+
+| prompt | tokens | moe | attention | attn_norm+ffn_norm | residual |
+|---|---|---|---|---|---|
+| p064 | 70 | **58.0 %** | 34.9 % | 4.8 % | 1.69 % |
+| p256 | 184 | **51.7 %** | 42.4 % | 4.7 % | 0.73 % |
+| *(golden, 20 tok — wrong prompt)* | 20 | *63.9 %* | *26.7 %* | *4.0 %* | *4.7 %* |
+
+Prompt length matters a great deal: attention's share **grows** 34.9 % -> 42.4 % (it is O(n²)),
+MoE's **shrinks** 58.0 % -> 51.7 % (roughly O(n)). The 63.9 % figure was never valid for this metric.
+Residual is 0.7–1.7 %, so the accounting is essentially complete.
+
+### Chunk structure discovered
+`calls` = layers x chunks, with 43 layers and a 64-token chunk cap:
+
+| prompt | tokens | calls | chunk packing |
+|---|---|---|---|
+| p064 | 70 | 86 = 43 x 2 | **[64, 6]** |
+| p256 | 184 | 129 = 43 x 3 | [64, 64, 56] |
+
+`p064` therefore ends in a **6-token tail chunk**. The obvious hypothesis: that tail pays a full
+per-chunk expert cost amortised over 6 tokens, so raising the cap above 64 would fold it away.
+That was lever (a) on my list, gated behind 7 cap sites and the `__m256 sums[64]` stack hazard.
+
+### Measured instead of assumed — and it is wrong
+Traced a trimmed 61-token prompt, which packs into a **single** chunk (`calls=43 = 43 x 1`):
+
+| | 1 chunk (61 tok) | 2 chunks (70 tok) |
+|---|---|---|
+| wall | 35 566 ms | 40 060 ms |
+| moe | 21 141 ms | 23 244 ms |
+| attention | 11 888 ms | 13 980 ms |
+
+Marginal cost of the +9 tokens that *introduce the second chunk*, versus the 1-chunk average:
+
+| | average ms/tok | marginal ms/tok | ratio |
+|---|---|---|---|
+| wall | 583.0 | 499.4 | **0.86x** |
+| moe | 346.6 | 233.7 | **0.67x** |
+| attention | 194.9 | 232.4 | 1.19x |
+
+**Adding a chunk cost no fixed penalty — the marginal token is *cheaper* than the average token.**
+MoE at 0.67x is the warm expert cache: chunk 2 reuses experts chunk 1 already paid for. Attention at
+1.19x is O(n²) showing up exactly where theory says it should.
+
+Linear extrapolation of the 1-chunk run to 70 tokens predicts 40 813 ms; the actual 2-chunk run is
+**40 060 ms, 753 ms cheaper than linear**.
+
+### Verdict: lever killed, and the current cap is right
+Merging `[64, 6]` into a single 70-token chunk would **increase** attention work, because attention
+is O(n²) per chunk and chunking is what keeps it sub-quadratic. The MoE side has no per-chunk
+penalty to recover. So raising the cap has no upside and a measurable downside — and it would have
+cost 7 edit sites plus a stack-overflow hazard to find that out.
+
+Chunking at 64 is not a limitation to remove; it is load-bearing.
+
+### Tally of levers killed before implementation
+A5 (round trip, 5.1 % of dispatch_wait) · A7 (GPU QDQ, 0.35 % of wall) · chunk cap (negative).
+All three cost one probe each. The three scope errors (false 77 %, E77/E78) cost far more.
