@@ -5087,6 +5087,16 @@ static int coli_v4_moe_grouped_batch(
 
     qsort(unique_experts, (size_t)n_unique, sizeof(*unique_experts),
           coli_v4_int_ascending);
+    /* Optional: dump the sorted unique expert ids so the union across chunks of one layer can be
+     * computed OFFLINE. This answers "what would N be if the MoE batch were the whole prompt
+     * instead of one 64-token chunk?" without changing any behaviour. Measurement only. */
+    if (getenv("COLI_V4_MOE_GROUPED_DUMP")) {
+        fprintf(stderr, "moe_dump layer=%d batch=%d n_unique=%d ids=",
+                weights->plan.layer, batch, n_unique);
+        for (int gi = 0; gi < n_unique; gi++)
+            fprintf(stderr, "%s%d", gi ? "," : "", unique_experts[gi]);
+        fprintf(stderr, "\n");
+    }
     for (int expert = 0; expert < experts; expert++) expert_to_group[expert] = -1;
     for (int group = 0; group < n_unique; group++)
         expert_to_group[unique_experts[group]] = group;

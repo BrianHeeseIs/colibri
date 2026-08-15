@@ -2560,3 +2560,64 @@ prompt gets **more chunks, not more tokens per expert**: N stays pinned at 4.10 
 **This is the direct experimental confirmation of E60's conclusion: N is the bottleneck, not the
 kernel and not the scheduler.** Grouping at N=4.10 is worth ~4 %; the E60 kernel curve shows the
 real wins at S=32–64. Raising N — not optimising anything currently in the path — is the next move.
+
+---
+
+## E62. Measuring N at whole-prompt scope — **decoupling the MoE batch would nearly double N (4.14 → 7.99)**
+
+E60 concluded N is the bottleneck and E61 confirmed it experimentally (grouping is worth only ~4 %
+at N=4.10). E60 also **flagged my own coupon-collector extrapolation as untrustworthy**. This
+measures it instead.
+
+### Method
+Added `COLI_V4_MOE_GROUPED_DUMP=1` (measurement-only, behind an env, default path verified still
+`PASS golden md5=5d04890413ff539e802985ce8c727814`) which dumps each chunk's **sorted unique expert
+ids**. Ran p256 (184 tokens → 3 chunks × 43 layers = 129 records) and computed, offline, the
+**union across a layer's chunks** — i.e. what the expert set would be if the MoE batch were the
+whole prompt instead of one 64-token chunk.
+
+### Result — 43 layers
+
+| scope | mean unique per layer | **mean N** |
+|---|---|---|
+| chunk (today, 64-token) | sum 541/526/546… | **4.14** |
+| whole-prompt (184-token) | union 226/224/230… | **7.99** |
+| | | **1.93x higher** |
+
+The chunk-scope figure **4.14** independently reproduces the 4.10 measured in E58e from a different
+code path — a good cross-check.
+
+Applying E60's v3 kernel curve (interpolated, not bucketed):
+```
+N=4.14  -> 203.2 us/token
+N=7.99  -> 137.2 us/token
+=> 1.48x better per-token expert cost from the SAME kernel, purely by batching more tokens
+```
+
+### My extrapolation was wrong, and flagging it was the right call
+E60's model predicted **N ≈ 16 at 256 tokens**. Measured: **N = 7.99 at 184 tokens** — the model
+**over-predicted by roughly 2x**. It assumed unique saturates near ~95, whereas the true
+whole-prompt union reaches **226 of 256** on early layers. Had I designed against the model instead
+of measuring, the wave count and capacity budget would both have been badly wrong.
+
+### Structure discovered: concentration varies by depth
+- **layers 0–2**: union **226–230** experts — routing is nearly *uniform*, barely concentrated
+- **layers 3–5**: union **126–151** — substantially concentrated
+
+So the "routing is heavily concentrated" conclusion from E58e is **true on average but false for the
+early layers**. Any capacity or wave planning must use the *per-layer* figure, not the mean.
+
+### Capacity consequence — waves become the norm, not the exception
+```
+whole-prompt union up to 226 ; capacity 164 ; wave size 164-16 = 148
+=> 226/148 = 2 waves on early layers (vs 1 wave for most chunk-scope calls today)
+weights touched per layer = 226 x 13.37 MB = 3.02 GB  (fits the cache comfortably)
+```
+This is exactly the regime the plan's §4.8 wave machinery was designed for, and E61 already proved
+that machinery works (`moe_waves=89, moe_wave_fallbacks=0`).
+
+### Verdict
+Decoupling the MoE batch from the attention chunk (notepad F19) is **worth ~1.48x on expert kernel
+cost and needs no change to any of the seven batch-cap sites** — attention keeps its 64-token chunk,
+its recurrent compressor and its causal KV ring untouched. It is the highest-value next change in
+the MoE lane, and it is now backed by measurement rather than a model.
