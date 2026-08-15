@@ -4905,6 +4905,381 @@ static int moe_token_pipeline(float *output,
     return result;
 }
 
+static pthread_once_t coli_v4_moe_grouped_once = PTHREAD_ONCE_INIT;
+static int coli_v4_moe_grouped_enabled_value;
+static int coli_v4_moe_grouped_stats_enabled_value;
+static int coli_v4_moe_grouped_degenerate_reported;
+static uint64_t coli_v4_moe_group_overhead_ns;
+static uint64_t coli_v4_moe_chunk_ns;
+static uint64_t coli_v4_moe_waves;
+static uint64_t coli_v4_moe_wave_fallbacks;
+static uint64_t coli_v4_moe_groups;
+
+static void coli_v4_moe_grouped_init(void) {
+    const char *grouped = getenv("COLI_V4_MOE_GROUPED");
+    const char *stats = getenv("COLI_V4_MOE_GROUPED_STATS");
+    coli_v4_moe_grouped_enabled_value =
+        grouped && *grouped && atoi(grouped) != 0;
+    coli_v4_moe_grouped_stats_enabled_value =
+        stats && *stats && atoi(stats) != 0;
+}
+
+static int coli_v4_moe_grouped_enabled(void) {
+    pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
+    return coli_v4_moe_grouped_enabled_value;
+}
+
+static int coli_v4_moe_grouped_stats_enabled(void) {
+    pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
+    return coli_v4_moe_grouped_stats_enabled_value;
+}
+
+void coli_v4_moe_grouped_stats_emit(void) {
+    if (!coli_v4_moe_grouped_stats_enabled()) return;
+    fprintf(stderr, "moe_group_overhead_ns=%llu\n",
+            (unsigned long long)__atomic_load_n(
+                &coli_v4_moe_group_overhead_ns, __ATOMIC_RELAXED));
+    fprintf(stderr, "moe_chunk_ns=%llu\n",
+            (unsigned long long)__atomic_load_n(
+                &coli_v4_moe_chunk_ns, __ATOMIC_RELAXED));
+    fprintf(stderr,
+            "moe_waves=%llu moe_wave_fallbacks=%llu moe_groups=%llu\n",
+            (unsigned long long)__atomic_load_n(
+                &coli_v4_moe_waves, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(
+                &coli_v4_moe_wave_fallbacks, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(
+                &coli_v4_moe_groups, __ATOMIC_RELAXED));
+}
+
+static int coli_v4_int_ascending(const void *left, const void *right) {
+    int lhs = *(const int *)left;
+    int rhs = *(const int *)right;
+    return (lhs > rhs) - (lhs < rhs);
+}
+
+static int coli_v4_moe_grouped_scalar_fallback(
+        float *outputs, const ColiDeepSeekV4LayerWeights *weights,
+        const ColiDeepSeekV4Config *config, ColiExpertStore *store,
+        const float *inputs, const int *tokens, int batch) {
+    int dimension = config->hidden_size;
+    ColiV4PrefillRouteCache *route_cache = coli_v4_prefill_route_cache;
+    for (int item = 0; item < batch; item++) {
+        if (route_cache && route_cache->layer == weights->plan.layer &&
+            route_cache->items == batch)
+            route_cache->current_item = item;
+        if (moe_token_pipeline(
+                outputs + (size_t)item * dimension, weights, config, store,
+                inputs + (size_t)item * dimension, tokens[item]))
+            return -1;
+    }
+    return 0;
+}
+
+static int coli_v4_moe_grouped_batch(
+        float *outputs, const ColiDeepSeekV4LayerWeights *weights,
+        const ColiDeepSeekV4Config *config, ColiExpertStore *store,
+        const float *inputs, const int *tokens, int batch) {
+    int dimension = config->hidden_size;
+    int experts = config->n_routed_experts;
+    int topk = config->num_experts_per_tok;
+    size_t routes = (size_t)batch * topk;
+    int stats_enabled = coli_v4_moe_grouped_stats_enabled();
+    uint64_t chunk_began = stats_enabled ? coli_v4_profile_now_ns() : 0;
+    uint64_t compute_ns = 0;
+    uint64_t wait_ns = 0;
+    uint64_t waves = 0;
+    uint64_t fallbacks = 0;
+    int n_unique = 0;
+    int result = -1;
+    int capacity = 0;
+    int wave_size = 0;
+
+    int *indices = malloc(routes * sizeof(*indices));
+    float *route_weights = malloc(routes * sizeof(*route_weights));
+    int *unique_experts = malloc((size_t)experts * sizeof(*unique_experts));
+    unsigned char *seen = calloc((size_t)experts, sizeof(*seen));
+    int *expert_to_group = malloc((size_t)experts * sizeof(*expert_to_group));
+    int *counts = calloc((size_t)experts, sizeof(*counts));
+    int *offsets = malloc((size_t)(experts + 1) * sizeof(*offsets));
+    int *cursors = malloc((size_t)experts * sizeof(*cursors));
+    int *route_slots = malloc(routes * sizeof(*route_slots));
+    float *routed_acc = calloc((size_t)batch * dimension, sizeof(*routed_acc));
+    float *shared_outputs = malloc(
+        (size_t)batch * dimension * sizeof(*shared_outputs));
+    float *expert_output = malloc((size_t)dimension * sizeof(*expert_output));
+    float *decoded_gate = NULL;
+    ColiExpertView *wave_views = NULL;
+    ColiV4PrefillLoadBatch *wave_loader = NULL;
+
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+    const uint16_t *raw_gate = value(weights, "ffn.gate.weight", NULL);
+#else
+    size_t gate_count = (size_t)experts * dimension;
+    decoded_gate = malloc(gate_count * sizeof(*decoded_gate));
+#endif
+    if (!indices || !route_weights || !unique_experts || !seen ||
+        !expert_to_group || !counts || !offsets || !cursors || !route_slots ||
+        !routed_acc || !shared_outputs || !expert_output
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+        || !raw_gate
+#else
+        || !decoded_gate
+#endif
+        ) goto cleanup;
+
+#ifdef COLI_V4_DISABLE_BF16_ROUTE
+    decode_bf16(decoded_gate, value(weights, "ffn.gate.weight", NULL),
+                gate_count);
+#endif
+    const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
+    const float *bias = value(weights, "ffn.gate.bias", NULL);
+    uint64_t router_began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
+    result = 0;
+    for (int item = 0; !result && item < batch; item++) {
+        if (tokens[item] < 0 || tokens[item] >= config->vocab_size) {
+            result = -1;
+            break;
+        }
+        int *item_indices = indices + (size_t)item * topk;
+        float *item_weights = route_weights + (size_t)item * topk;
+        if (weights->plan.uses_hash_router) {
+            if (!table) {
+                result = -1;
+                break;
+            }
+            for (int rank = 0; rank < topk; rank++)
+                item_indices[rank] =
+                    (int)table[(size_t)tokens[item] * topk + rank];
+        }
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+        result = coli_v4_route_bf16(
+            item_weights, item_indices, inputs + (size_t)item * dimension,
+            raw_gate, bias,
+            weights->plan.uses_hash_router ? item_indices : NULL,
+            experts, dimension, topk, config->routed_scaling_factor);
+#else
+        result = coli_v4_route(
+            item_weights, item_indices, inputs + (size_t)item * dimension,
+            decoded_gate, bias,
+            weights->plan.uses_hash_router ? item_indices : NULL,
+            experts, dimension, topk, config->routed_scaling_factor);
+#endif
+#ifdef COLI_M4_TRACE
+        if (!result) coli_m4_record_routing(item_indices, experts, topk);
+#endif
+        for (int rank = 0; !result && rank < topk; rank++) {
+            int expert = item_indices[rank];
+            if (expert < 0 || expert >= experts) {
+                result = -1;
+                break;
+            }
+            if (!seen[expert]) {
+                seen[expert] = 1;
+                unique_experts[n_unique++] = expert;
+            }
+        }
+    }
+    if (coli_v4_profile_on)
+        coli_v4_profile_add(COLI_V4_PROFILE_ROUTER,
+                            coli_v4_profile_now_ns() - router_began);
+    if (result) goto cleanup;
+
+    qsort(unique_experts, (size_t)n_unique, sizeof(*unique_experts),
+          coli_v4_int_ascending);
+    for (int expert = 0; expert < experts; expert++) expert_to_group[expert] = -1;
+    for (int group = 0; group < n_unique; group++)
+        expert_to_group[unique_experts[group]] = group;
+    for (size_t route = 0; route < routes; route++)
+        counts[expert_to_group[indices[route]]]++;
+    offsets[0] = 0;
+    for (int group = 0; group < n_unique; group++)
+        offsets[group + 1] = offsets[group] + counts[group];
+    memcpy(cursors, offsets, (size_t)n_unique * sizeof(*cursors));
+    for (size_t route = 0; route < routes; route++) {
+        int group = expert_to_group[indices[route]];
+        route_slots[cursors[group]++] = (int)route;
+    }
+
+    capacity = coli_v4_prefill_store_capacity(store);
+    if (capacity > 0) {
+        int effective_reserve = capacity - 1 < 16 ? capacity - 1 : 16;
+        wave_size = capacity - effective_reserve;
+    }
+    if (wave_size < 2) {
+        fallbacks++;
+        if (!__atomic_exchange_n(&coli_v4_moe_grouped_degenerate_reported, 1,
+                                 __ATOMIC_RELAXED))
+            fprintf(stderr,
+                    "moe_grouped fallback=degenerate layer=%d capacity=%d "
+                    "compute_wave_size=%d\n",
+                    weights->plan.layer, capacity, wave_size);
+        goto scalar_fallback;
+    }
+    waves = (uint64_t)(n_unique + wave_size - 1) / (uint64_t)wave_size;
+    wave_views = calloc((size_t)wave_size, sizeof(*wave_views));
+    if (!wave_views) {
+        result = -1;
+        goto cleanup;
+    }
+    int first_wave_count = n_unique < wave_size ? n_unique : wave_size;
+    wave_loader = coli_v4_prefill_loader_batch_start(
+        store, weights->plan.layer, unique_experts, first_wave_count);
+
+    ColiTensorView shared_gate, shared_down, shared_up;
+    if (fp8_view(&shared_gate, weights, "ffn.shared_experts.w1") ||
+        fp8_view(&shared_down, weights, "ffn.shared_experts.w2") ||
+        fp8_view(&shared_up, weights, "ffn.shared_experts.w3")) {
+        result = -1;
+        goto cleanup;
+    }
+    for (int item = 0; !result && item < batch; item++) {
+        uint64_t began = stats_enabled || coli_v4_profile_on
+            ? coli_v4_profile_now_ns() : 0;
+        result = coli_v4_shared_expert_forward_ref(
+            shared_outputs + (size_t)item * dimension,
+            &shared_gate, &shared_down, &shared_up,
+            inputs + (size_t)item * dimension, config->swiglu_limit);
+        uint64_t elapsed = stats_enabled || coli_v4_profile_on
+            ? coli_v4_profile_now_ns() - began : 0;
+        if (stats_enabled) compute_ns += elapsed;
+        if (coli_v4_profile_on)
+            coli_v4_profile_add(COLI_V4_PROFILE_SHARED_EXPERT, elapsed);
+    }
+    if (result) goto cleanup;
+
+    for (int wave = 0; wave < (int)waves; wave++) {
+        int first = wave * wave_size;
+        int count = n_unique - first;
+        if (count > wave_size) count = wave_size;
+        if (!wave_loader)
+            wave_loader = coli_v4_prefill_loader_batch_start(
+                store, weights->plan.layer, unique_experts + first, count);
+        int acquired = 0;
+        for (; acquired < count; acquired++) {
+            uint64_t began = stats_enabled || coli_v4_profile_on
+                ? coli_v4_profile_now_ns() : 0;
+            int lookup_result = wave_loader
+                ? coli_v4_prefill_loader_lookup(
+                    wave_loader, unique_experts[first + acquired],
+                    &wave_views[acquired])
+                : 1;
+            if (lookup_result > 0)
+                lookup_result = coli_expert_lookup(
+                    store,
+                    (ColiExpertKey){weights->plan.layer,
+                                    unique_experts[first + acquired]},
+                    &wave_views[acquired]);
+            uint64_t elapsed = stats_enabled || coli_v4_profile_on
+                ? coli_v4_profile_now_ns() - began : 0;
+            if (stats_enabled) wait_ns += elapsed;
+            if (coli_v4_profile_on)
+                coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_WAIT,
+                                    elapsed);
+            if (lookup_result) break;
+        }
+        if (wave_loader) {
+            uint64_t began = stats_enabled || coli_v4_profile_on
+                ? coli_v4_profile_now_ns() : 0;
+            coli_v4_prefill_loader_batch_finish(wave_loader);
+            wave_loader = NULL;
+            uint64_t elapsed = stats_enabled || coli_v4_profile_on
+                ? coli_v4_profile_now_ns() - began : 0;
+            if (stats_enabled) wait_ns += elapsed;
+            if (coli_v4_profile_on)
+                coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_WAIT, elapsed);
+        }
+        if (acquired != count) {
+            for (int held = 0; held < acquired; held++)
+                coli_expert_release(store, &wave_views[held]);
+            fallbacks++;
+            goto scalar_fallback;
+        }
+        if (wave + 1 < (int)waves) {
+            int next_first = first + count;
+            int next_count = n_unique - next_first;
+            if (next_count > wave_size) next_count = wave_size;
+            wave_loader = coli_v4_prefill_loader_batch_start(
+                store, weights->plan.layer,
+                unique_experts + next_first, next_count);
+        }
+        for (int current = 0; !result && current < count; current++) {
+            int group = first + current;
+            for (int offset = offsets[group]; !result &&
+                 offset < offsets[group + 1]; offset++) {
+                int route = route_slots[offset];
+                int item = route / topk;
+                uint64_t began = stats_enabled || coli_v4_profile_on
+                    ? coli_v4_profile_now_ns() : 0;
+                result = coli_v4_prefill_trace_expert_forward(
+                    expert_output, &wave_views[current],
+                    inputs + (size_t)item * dimension, route_weights[route],
+                    config->swiglu_limit);
+                uint64_t elapsed = stats_enabled || coli_v4_profile_on
+                    ? coli_v4_profile_now_ns() - began : 0;
+                if (stats_enabled) compute_ns += elapsed;
+                if (coli_v4_profile_on)
+                    coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_FORWARD,
+                                        elapsed);
+                if (!result)
+                    for (int index = 0; index < dimension; index++)
+                        routed_acc[(size_t)item * dimension + index] +=
+                            expert_output[index];
+            }
+        }
+        for (int held = 0; held < count; held++)
+            coli_expert_release(store, &wave_views[held]);
+        if (result) goto cleanup;
+    }
+
+    for (int item = 0; item < batch; item++)
+        for (int index = 0; index < dimension; index++)
+            outputs[(size_t)item * dimension + index] = coli_bf16_round(
+                routed_acc[(size_t)item * dimension + index] +
+                shared_outputs[(size_t)item * dimension + index]);
+    result = 0;
+    goto cleanup;
+
+scalar_fallback: {
+        uint64_t began = stats_enabled ? coli_v4_profile_now_ns() : 0;
+        result = coli_v4_moe_grouped_scalar_fallback(
+            outputs, weights, config, store, inputs, tokens, batch);
+        if (stats_enabled) compute_ns += coli_v4_profile_now_ns() - began;
+    }
+
+cleanup:
+    if (wave_loader) coli_v4_prefill_loader_batch_finish(wave_loader);
+    if (stats_enabled) {
+        uint64_t chunk_ns = coli_v4_profile_now_ns() - chunk_began;
+        uint64_t excluded_ns = compute_ns + wait_ns;
+        uint64_t overhead_ns = chunk_ns > excluded_ns
+            ? chunk_ns - excluded_ns : 0;
+        __atomic_fetch_add(&coli_v4_moe_group_overhead_ns, overhead_ns,
+                           __ATOMIC_RELAXED);
+        __atomic_fetch_add(&coli_v4_moe_chunk_ns, chunk_ns, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&coli_v4_moe_waves, waves, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&coli_v4_moe_wave_fallbacks, fallbacks,
+                           __ATOMIC_RELAXED);
+        __atomic_fetch_add(&coli_v4_moe_groups, (uint64_t)n_unique,
+                           __ATOMIC_RELAXED);
+    }
+    free(wave_views);
+    free(decoded_gate);
+    free(expert_output);
+    free(shared_outputs);
+    free(routed_acc);
+    free(route_slots);
+    free(cursors);
+    free(offsets);
+    free(counts);
+    free(expert_to_group);
+    free(seen);
+    free(unique_experts);
+    free(route_weights);
+    free(indices);
+    return result;
+}
+
 static int block_token_pipeline(float *output_hc,
                                 ColiDeepSeekV4WindowAttentionState *attention,
                                 const ColiDeepSeekV4LayerWeights *weights,
@@ -4996,6 +5371,7 @@ int coli_v4_block_window_batch_ref(
     if (!outputs_hc || !attention || !weights || !config || !experts ||
         !inputs_hc || !tokens || batch < 1 || batch > 64) return -1;
     int d = config->hidden_size, hc = config->hc_mult;
+    int grouped_moe = coli_v4_moe_grouped_enabled();
     size_t hd = (size_t)hc * d;
     float *states = malloc((size_t)batch * hd * sizeof(*states));
     float *normalized = malloc((size_t)batch * d * sizeof(*normalized));
@@ -5007,8 +5383,20 @@ int coli_v4_block_window_batch_ref(
     float *ffn_branch = malloc((size_t)d * sizeof(*ffn_branch));
     float *ffn_post = malloc((size_t)hc * sizeof(*ffn_post));
     float *ffn_comb = malloc((size_t)hc * hc * sizeof(*ffn_comb));
+    float *ffn_normalized_batch = grouped_moe
+        ? malloc((size_t)batch * d * sizeof(*ffn_normalized_batch)) : NULL;
+    float *ffn_branch_batch = grouped_moe
+        ? malloc((size_t)batch * d * sizeof(*ffn_branch_batch)) : NULL;
+    float *ffn_post_batch = grouped_moe
+        ? malloc((size_t)batch * hc * sizeof(*ffn_post_batch)) : NULL;
+    float *ffn_comb_batch = grouped_moe
+        ? malloc((size_t)batch * hc * hc * sizeof(*ffn_comb_batch)) : NULL;
     if (!states || !normalized || !branches || !posts || !combs || !reduced ||
-        !ffn_normalized || !ffn_branch || !ffn_post || !ffn_comb) {
+        !ffn_normalized || !ffn_branch || !ffn_post || !ffn_comb ||
+        (grouped_moe && (!ffn_normalized_batch || !ffn_branch_batch ||
+                         !ffn_post_batch || !ffn_comb_batch))) {
+        free(ffn_comb_batch); free(ffn_post_batch); free(ffn_branch_batch);
+        free(ffn_normalized_batch);
         free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
         free(reduced); free(combs); free(posts); free(branches);
         free(normalized); free(states); return -1;
@@ -5107,7 +5495,7 @@ int coli_v4_block_window_batch_ref(
 #endif
     }
     if (!result) phase = "attention post / FFN hyper-connection";
-    for (int item = 0; !result && item < batch; item++) {
+    if (!grouped_moe) for (int item = 0; !result && item < batch; item++) {
         if (route_cache_active) route_cache->current_item = item;
         float *state = states + (size_t)item * hd;
 #ifdef COLI_V4_PREFILL_TRACE
@@ -5160,6 +5548,71 @@ int coli_v4_block_window_batch_ref(
                 coli_v4_prefill_trace_now_ns() - trace_began);
 #endif
     }
+    if (!result && grouped_moe) {
+        for (int item = 0; !result && item < batch; item++) {
+            float *state = states + (size_t)item * hd;
+#ifdef COLI_V4_PREFILL_TRACE
+            trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
+            result = coli_v4_hc_post(
+                state, branches + (size_t)item * d,
+                inputs_hc + (size_t)item * hd,
+                posts + (size_t)item * hc,
+                combs + (size_t)item * hc * hc, hc, d);
+            if (!result) coli_bf16_round_array(state, hd);
+#ifdef COLI_V4_PREFILL_TRACE
+            if (trace_prefill)
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_ATTN_POST,
+                    coli_v4_prefill_trace_now_ns() - trace_began);
+            trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
+            if (!result) phase = "FFN hyper-connection";
+            if (!result) result = normalized_hc_pre(
+                reduced, ffn_post_batch + (size_t)item * hc,
+                ffn_comb_batch + (size_t)item * hc * hc,
+                ffn_normalized_batch + (size_t)item * d, state,
+                weights, config, "ffn", "ffn_norm.weight");
+#ifdef COLI_V4_PREFILL_TRACE
+            if (trace_prefill)
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_FFN_NORM,
+                    coli_v4_prefill_trace_now_ns() - trace_began);
+#endif
+        }
+        if (!result) phase = "grouped MoE";
+#ifdef COLI_V4_PREFILL_TRACE
+        trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
+        if (!result) result = coli_v4_moe_grouped_batch(
+            ffn_branch_batch, weights, config, experts,
+            ffn_normalized_batch, tokens, batch);
+#ifdef COLI_V4_PREFILL_TRACE
+        if (trace_prefill)
+            coli_v4_prefill_trace_add(
+                COLI_V4_PREFILL_TRACE_MOE,
+                coli_v4_prefill_trace_now_ns() - trace_began);
+#endif
+        for (int item = 0; !result && item < batch; item++) {
+#ifdef COLI_V4_PREFILL_TRACE
+            trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
+#endif
+            result = coli_v4_hc_post(
+                outputs_hc + (size_t)item * hd,
+                ffn_branch_batch + (size_t)item * d,
+                states + (size_t)item * hd,
+                ffn_post_batch + (size_t)item * hc,
+                ffn_comb_batch + (size_t)item * hc * hc, hc, d);
+            if (!result)
+                coli_bf16_round_array(outputs_hc + (size_t)item * hd, hd);
+#ifdef COLI_V4_PREFILL_TRACE
+            if (trace_prefill)
+                coli_v4_prefill_trace_add(
+                    COLI_V4_PREFILL_TRACE_FFN_POST,
+                    coli_v4_prefill_trace_now_ns() - trace_began);
+#endif
+        }
+    }
     if (route_cache && route_cache->loader) {
 #ifdef COLI_V4_PREFILL_TRACE
         trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
@@ -5182,6 +5635,8 @@ int coli_v4_block_window_batch_ref(
     free(m4_trace.counts);
 #endif
     coli_v4_prefill_route_cache_destroy(route_cache);
+    free(ffn_comb_batch); free(ffn_post_batch); free(ffn_branch_batch);
+    free(ffn_normalized_batch);
     free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
     free(reduced); free(combs); free(posts); free(branches);
     free(normalized); free(states);
@@ -10062,6 +10517,8 @@ static int spec_print(Tok *tokenizer, int token, float logit,
     return stop_sentence && spec_sentence_end(piece, length);
 }
 
+extern void coli_v4_moe_grouped_stats_emit(void);
+
 static void v4_metal_stats_emit(void) {
 #ifdef COLI_V4_METAL_SEAM
     const char *enabled = getenv("COLI_V4_METAL_STATS");
@@ -10070,6 +10527,7 @@ static void v4_metal_stats_emit(void) {
     const char *profile = getenv("COLI_V4_METAL_PROFILE");
     if (profile && !strcmp(profile, "1")) coli_v4_metal_profile_report();
 #endif
+    coli_v4_moe_grouped_stats_emit();
 }
 
 static void v4_generate_cleanup(

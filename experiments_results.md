@@ -2499,3 +2499,64 @@ exactly the kind this project has repeatedly punished (E48/E52/E53/E54, and the 
 in E57). **T9 must measure N at each chunk value directly from the engine's own `unique=` log
 before any performance claim is attached to it.** Recorded here as a hypothesis with a named
 measurement, not as a result.
+
+---
+
+## E61. T-1 CPU-only grouped MoE — **K0 PASSES, bit-exact, +4.3 % — and the gain decays with length**
+
+The plan's Wave-0 kill test, implemented behind `COLI_V4_MOE_GROUPED=1` (+422 lines,
+`c/deepseek_v4.c`). No GPU, no new kernel: the MoE loop is reordered **expert-outer / token-inner**,
+with the unique expert list **sorted ascending**, capacity preflight, wave sizing with the
+`effective_reserve` clamp, and rollback. Default OFF is untouched.
+
+### Correctness — the gate that actually matters
+
+| run | result |
+|---|---|
+| grouped **OFF** (default path) | `PASS golden md5=5d04890413ff539e802985ce8c727814` |
+| grouped **ON** | `PASS golden md5=5d04890413ff539e802985ce8c727814` |
+
+**Identical md5 — bit-exact.** Confirming it was not a silent fallback (the failure mode that once
+made a non-running Metal seam look successful, §12e):
+
+```
+moe_groups         5,073     grouped path genuinely executed
+moe_waves             89
+moe_wave_fallbacks     0     no degenerate or rollback fallbacks
+```
+
+Every number cross-checks against independent measurements:
+- **5073 / 86 chunk-calls = 59 groups per chunk**, exactly the mean of the measured `n_unique`
+  (93.7 at chunk=64, 24.3 at chunk=6 → 59).
+- capacity 164 − reserve 16 = **wave size 148**, so only chunks with `n_unique > 148` need a second
+  wave — and `89 − 86 = 3` extra waves is exactly the count of chunks above that line (max 188).
+
+### K0 gate
+
+```
+moe_group_overhead_ns / moe_chunk_ns = 2,323,935,774 / 23,902,732,376 = 0.0972  (9.72%)
+K0 threshold                          = 0.167  (= 1 - 1/1.20)
+```
+**PASS.** The scheduler costs 9.72 % of the MoE phase, well inside the available headroom, so it
+cannot eat the GPU win. **Metal work is authorised.**
+
+### E13 — interleaved A/B, n=3, sign-correct
+
+`bench/ab.sh` prints `100*(on-off)/off`, so **faster is negative**:
+
+| prompt | off | on | delta | speedup | pairs won |
+|---|---|---|---|---|---|
+| p064 | 42.399 s | 40.639 s | **−4.15 %** | **1.043x** | 3/3 |
+| p256 | 110.125 s | 107.826 s | **−2.09 %** | **1.021x** | 3/3 |
+
+**A free, bit-exact +4.3 % on CPU with no GPU involved** — pure scheduling and locality.
+
+### The decay is the finding
+The gain **halves** from p064 to p256 (4.15 % → 2.09 %) — the *same* pattern as the prefill-prefetch
+feature (E55: 6.20 % → 2.70 %), and for the same reason. Chunking is capped at 64, so a longer
+prompt gets **more chunks, not more tokens per expert**: N stays pinned at 4.10 while attention
+(O(n²)) grows and dilutes the MoE share.
+
+**This is the direct experimental confirmation of E60's conclusion: N is the bottleneck, not the
+kernel and not the scheduler.** Grouping at N=4.10 is worth ~4 %; the E60 kernel curve shows the
+real wins at S=32–64. Raising N — not optimising anything currently in the path — is the next move.
