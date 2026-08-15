@@ -3227,3 +3227,47 @@ Projections now run 1.97x against a kernel measured at 3.09x (A2). `dispatch_wai
 the 3625 ms Metal path (98.9 %) across 1031 calls, and memory traffic is negligible (39 ms, upload
 1.1 MB — resident weights are 16 KB-aligned and serve zero-copy). So the next lever is still
 **amortising the per-call blocking round trip**, now over 1031 calls rather than 511.
+
+---
+
+## E72. Both shipped lanes together — **1.163x / 1.169x, bit-exact, and composition VERIFIED**
+
+E70 and E71 both projected that the two lanes should compose to ~1.23x but explicitly refused to
+claim it, because **E57 is the standing lesson**: a composed "+80.7 %" from two separately-measured
+deltas turned out to be **−5.4 %** when finally measured end-to-end. So this measures it.
+
+### Correctness first
+`COLI_V4_MOE_GROUPED=1 COLI_V4_METAL_ATTN=1` together:
+`PASS golden md5=5d04890413ff539e802985ce8c727814` — **bit-exact with both lanes active**.
+
+### Result — interleaved, n=3, sign-correct
+
+| prompt | off | on | delta | **measured** | attn only | MoE only | naive product |
+|---|---|---|---|---|---|---|---|
+| p064 | 42.303 s | 36.367 s | **−14.03 %** | **1.163x** | 1.107x | 1.043x | 1.155x |
+| p256 | 109.483 s | 93.671 s | **−14.44 %** | **1.169x** | 1.135x | 1.021x | 1.159x |
+
+**Composition holds** — the measured result captures **106 %** of the naive product at both lengths
+(the small excess is within run-to-run noise). That is the expected outcome *here* because the two
+lanes touch genuinely disjoint parts of the wall: grouped MoE reorders expert scheduling, the
+attention lane replaces dense projection matmuls. Unlike E57 — where `--ram` and speculation were
+measured on **different workloads** and one arm already had the other enabled — there is no shared
+term to double-count.
+
+**Both clear the plan's 1.12x gate** (which requires `delta <= -10.71%`), with margin.
+
+### Where the wall went
+
+| | baseline | both lanes | change |
+|---|---|---|---|
+| p064 TTFT | 42.303 s | **36.367 s** | −5.94 s |
+| p256 TTFT | 109.483 s | **93.671 s** | −15.81 s |
+
+### Standing caveats
+- n=3 per arm, one host, one model. Directional and interleaved, but not a large sample.
+- The gain still **grows with prompt length** (14.03 % → 14.44 %), driven by the attention lane
+  being the O(n²) term rather than being diluted by it.
+- Headroom remains: projections run **1.97x** against a kernel measured at **3.09x** (A2), with
+  `dispatch_wait` at 98.9 % of the Metal path across 1031 calls. Amortising that per-call blocking
+  round trip is the next lever, and `wo_a` alone accounts for **8 of every 12 dispatches**
+  (one per output group) — batching those into a single dispatch is the concrete target.
