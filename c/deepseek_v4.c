@@ -10611,6 +10611,11 @@ static void v4_metal_stats_emit(void) {
     const char *enabled = getenv("COLI_V4_METAL_STATS");
     if (enabled && !strcmp(enabled, "1"))
         fprintf(stderr, "metal_dispatches=%lu\n", coli_v4_metal_dispatches());
+        { extern unsigned long coli_v4_metal_fp8_dispatches(void);
+          extern unsigned long coli_v4_metal_fp8_upload_bytes(void);
+          fprintf(stderr, "metal_fp8_dispatches=%lu metal_fp8_upload_mb=%.1f\n",
+                  coli_v4_metal_fp8_dispatches(),
+                  (double)coli_v4_metal_fp8_upload_bytes() / 1e6); }
     { extern void coli_v4_attn_report(void); coli_v4_attn_report(); }
     const char *profile = getenv("COLI_V4_METAL_PROFILE");
     if (profile && !strcmp(profile, "1")) coli_v4_metal_profile_report();
@@ -12925,6 +12930,27 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                                  (size_t)tile * 8, sums[item]);
         }
         free(activation_scales); free(activations); return 0;
+    }
+#endif
+#ifdef COLI_V4_METAL_SEAM
+    /* Attention projections on the GPU, bit-exact (E68: 0 ULP over 2,457,600 outputs).
+     * Only the MATMUL moves; the per-token fp8 QDQ above stays on the CPU untouched, so the
+     * GPU receives `activations` (already quantised), never the raw inputs. Registering the
+     * LUT from the engine's own table means the shader can never drift from E4M3_LUT.
+     * Any non-zero return falls through to the CPU path below. */
+    extern int  coli_v4_metal_fp8_enabled(void);
+    extern void coli_v4_metal_fp8_register_lut(const float *lut256);
+    extern int  coli_v4_metal_fp8_matmul_batch(float *outputs, const void *weight_data,
+                                               const float *weight_scales,
+                                               const float *inputs,
+                                               int batch, int rows, int columns);
+    if (coli_v4_metal_fp8_enabled()) {
+        coli_v4_metal_fp8_register_lut(E4M3_LUT);
+        if (coli_v4_metal_fp8_matmul_batch(outputs, weight->data, weight->scales,
+                                           activations, batch, (int)rows,
+                                           (int)columns) == 0) {
+            free(activation_scales); free(activations); return 0;
+        }
     }
 #endif
     matmul_fp8(outputs, activations, weight->data, weight->scales,

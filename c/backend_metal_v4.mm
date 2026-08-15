@@ -412,6 +412,144 @@ coli_v4_metal_dispatches(void) {
                                 memory_order_relaxed);
 }
 
+
+/* ==========================================================================================
+ * Bit-exact batched fp8 matmul for the attention projections (E68/E69).
+ *
+ * Attention dense weights are RESIDENT and IMMUTABLE for the life of the engine, so each
+ * weight matrix is uploaded to the GPU AT MOST ONCE and cached by host pointer. wq_b alone is
+ * 33.5 MB and is used on every layer-chunk call, so a per-call upload would erase the win.
+ * Zero-copy (newBufferWithBytesNoCopy) is attempted first and only falls back to one memcpy.
+ * ========================================================================================== */
+static id<MTLComputePipelineState> coli_v4_fp8_pipeline;
+static id<MTLBuffer> coli_v4_fp8_lut_buffer;
+static id<MTLBuffer> coli_v4_fp8_in_scratch;
+static id<MTLBuffer> coli_v4_fp8_out_scratch;
+static int coli_v4_fp8_enabled_value = -1;
+static _Atomic unsigned long coli_v4_fp8_dispatch_count;
+static _Atomic unsigned long coli_v4_fp8_upload_bytes;
+
+#define COLI_V4_FP8_CACHE 512
+typedef struct { const void *key; id<MTLBuffer> buf; size_t bytes; int nocopy; } ColiV4Fp8Entry;
+static ColiV4Fp8Entry coli_v4_fp8_cache[COLI_V4_FP8_CACHE];
+static int coli_v4_fp8_cache_count;
+
+COLI_V4_METAL_EXTERN int coli_v4_metal_fp8_enabled(void) {
+    if (coli_v4_fp8_enabled_value < 0) {
+        const char *v = getenv("COLI_V4_METAL_ATTN");
+        coli_v4_fp8_enabled_value = (v && *v && atoi(v) != 0) ? 1 : 0;
+    }
+    return coli_v4_fp8_enabled_value;
+}
+
+COLI_V4_METAL_EXTERN void coli_v4_metal_fp8_register_lut(const float *lut256) {
+    if (!lut256 || !coli_v4_device || coli_v4_fp8_lut_buffer) return;
+    coli_v4_fp8_lut_buffer = [coli_v4_device newBufferWithBytes:lut256
+                                                         length:256 * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+}
+
+/* Immutable weight -> MTLBuffer, uploaded at most once. */
+static id<MTLBuffer> coli_v4_fp8_resident(const void *ptr, size_t bytes) {
+    if (!ptr || !bytes || !coli_v4_device) return nil;
+    for (int i = 0; i < coli_v4_fp8_cache_count; i++)
+        if (coli_v4_fp8_cache[i].key == ptr && coli_v4_fp8_cache[i].bytes == bytes)
+            return coli_v4_fp8_cache[i].buf;
+    if (coli_v4_fp8_cache_count >= COLI_V4_FP8_CACHE) return nil;   /* refuse, fall back to CPU */
+    id<MTLBuffer> buf = nil;
+    int nocopy = 0;
+    if (((uintptr_t)ptr % 16384u) == 0 && (bytes % 16384u) == 0) {
+        buf = [coli_v4_device newBufferWithBytesNoCopy:(void *)ptr
+                                                length:bytes
+                                               options:MTLResourceStorageModeShared
+                                           deallocator:nil];
+        nocopy = buf ? 1 : 0;
+    }
+    if (!buf) {
+        buf = [coli_v4_device newBufferWithBytes:ptr length:bytes
+                                         options:MTLResourceStorageModeShared];
+        if (buf) atomic_fetch_add_explicit(&coli_v4_fp8_upload_bytes,
+                                          (unsigned long)bytes, memory_order_relaxed);
+    }
+    if (!buf) return nil;
+    coli_v4_fp8_cache[coli_v4_fp8_cache_count].key    = ptr;
+    coli_v4_fp8_cache[coli_v4_fp8_cache_count].buf    = buf;
+    coli_v4_fp8_cache[coli_v4_fp8_cache_count].bytes  = bytes;
+    coli_v4_fp8_cache[coli_v4_fp8_cache_count].nocopy = nocopy;
+    coli_v4_fp8_cache_count++;
+    return buf;
+}
+
+static id<MTLBuffer> coli_v4_fp8_grow(__strong id<MTLBuffer> *slot, size_t bytes) {
+    if (*slot && (*slot).length >= bytes) return *slot;
+    if (!coli_v4_device) return nil;
+    *slot = [coli_v4_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    return *slot;
+}
+
+COLI_V4_METAL_EXTERN int coli_v4_metal_fp8_matmul_batch(
+        float *outputs, const void *weight_data, const float *weight_scales,
+        const float *inputs, int batch, int rows, int columns) {
+    if (!outputs || !weight_data || !weight_scales || !inputs) return -1;
+    if (batch < 1 || rows < 1 || columns < 1 || (columns % 128) != 0) return -1;
+    if (!coli_v4_metal_fp8_enabled()) return -1;
+    /* Metal init is otherwise only triggered lazily by the MoE expert path, which is gated on
+     * COLI_V4_METAL=1. Without this, setting COLI_V4_METAL_ATTN alone would leave the device nil,
+     * make every call return -1, and produce a VACUOUS "bit-exact" pass from a path that never
+     * ran (the failure mode recorded in RESULTS.md S12e). */
+    if (!coli_v4_metal_available() && !coli_v4_metal_init(NULL)) return -1;
+    if (!coli_v4_device || !coli_v4_queue) return -1;
+    if (!coli_v4_fp8_lut_buffer) return -1;          /* LUT must be registered by the engine */
+
+    if (!coli_v4_fp8_pipeline) {
+        coli_v4_fp8_pipeline = coli_v4_get_named_pipeline("coli_v4_fp8_matmul_batch");
+        if (!coli_v4_fp8_pipeline) return -1;
+    }
+    size_t O = (size_t)rows, I = (size_t)columns, S = (size_t)batch;
+    size_t nblkI = (I + 127) / 128;
+    size_t wbytes = O * I;
+    size_t sbytes = ((O + 127) / 128) * nblkI * sizeof(float);
+
+    id<MTLBuffer> W  = coli_v4_fp8_resident(weight_data, wbytes);
+    id<MTLBuffer> SC = coli_v4_fp8_resident(weight_scales, sbytes);
+    if (!W || !SC) return -1;
+    id<MTLBuffer> X = coli_v4_fp8_grow(&coli_v4_fp8_in_scratch,  S * I * sizeof(float));
+    id<MTLBuffer> Y = coli_v4_fp8_grow(&coli_v4_fp8_out_scratch, S * O * sizeof(float));
+    if (!X || !Y) return -1;
+    memcpy(X.contents, inputs, S * I * sizeof(float));
+
+    struct { unsigned int O, I, S, nblkI; } dims = {
+        (unsigned int)O, (unsigned int)I, (unsigned int)S, (unsigned int)nblkI };
+
+    id<MTLCommandBuffer> cb = [coli_v4_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+    if (!enc) return -1;
+    [enc setComputePipelineState:coli_v4_fp8_pipeline];
+    [enc setBuffer:W  offset:0 atIndex:0];
+    [enc setBuffer:SC offset:0 atIndex:1];
+    [enc setBuffer:X  offset:0 atIndex:2];
+    [enc setBuffer:Y  offset:0 atIndex:3];
+    [enc setBuffer:coli_v4_fp8_lut_buffer offset:0 atIndex:4];
+    [enc setBytes:&dims length:sizeof(dims) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(O, S, 1)
+   threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) return -1;
+
+    memcpy(outputs, Y.contents, S * O * sizeof(float));
+    atomic_fetch_add_explicit(&coli_v4_fp8_dispatch_count, 1, memory_order_relaxed);
+    return 0;
+}
+
+COLI_V4_METAL_EXTERN unsigned long coli_v4_metal_fp8_dispatches(void) {
+    return atomic_load_explicit(&coli_v4_fp8_dispatch_count, memory_order_relaxed);
+}
+COLI_V4_METAL_EXTERN unsigned long coli_v4_metal_fp8_upload_bytes(void) {
+    return atomic_load_explicit(&coli_v4_fp8_upload_bytes, memory_order_relaxed);
+}
+
 COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
     float *out, const ColiExpertView *expert, const float *input,
     float route_weight, float swiglu_limit) {

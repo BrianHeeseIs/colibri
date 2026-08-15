@@ -18,6 +18,23 @@ int coli_v4_metal_expert_forward(float *out, const ColiExpertView *expert,
                                  const float *input, float route_weight,
                                  float swiglu_limit);
 
+/* ---- Bit-exact batched fp8 matmul (attention projections) ----------------------------
+ * Mirrors quant.h matmul_fp8 exactly: float accumulation within each 128-column block,
+ * double accumulation across blocks (emulated with double-float on the GPU, which has no
+ * fp64). Proven 0 ULP over 2,457,600 outputs on the four real attention shapes (E68).
+ * REQUIRES the metallib to be built with -fno-fast-math (see Makefile METALCFLAGS).
+ *
+ * The 256-entry E4M3 decode table is registered from the engine's own e4m3_decode() so the
+ * shader can never drift from the C table. Registration is idempotent and cheap.
+ * Returns 0 when outputs were produced; any non-zero result requires CPU fallback. */
+void coli_v4_metal_fp8_register_lut(const float *lut256);
+int  coli_v4_metal_fp8_enabled(void);
+int  coli_v4_metal_fp8_matmul_batch(float *outputs,
+                                    const void *weight_data,
+                                    const float *weight_scales,
+                                    const float *inputs,
+                                    int batch, int rows, int columns);
+
 #ifdef __cplusplus
 }
 #endif
