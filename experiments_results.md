@@ -3864,3 +3864,94 @@ This is the last identified lever with positive expected value, and it is real �
 
 Stopping here deliberately, at a clean and fully pushed checkpoint, rather than starting a large
 build at the end of a long session.
+
+---
+
+## E84. A8: batched MoE expert dispatch — **1.121x / 1.133x incremental**, bit-exact, ~1.33x total
+
+E82 left one lever: wire the grouped MoE scheduler to dispatch batched expert matmuls through the
+Metal seam. Built it. It is the largest single win of this branch.
+
+### Gate 1 — is the payoff real in situ? (`validation/probes/mxfp4_s_scaling.m`, E83)
+CPU (live rows16 NEON) vs GPU (`ordered_xcache`), one process, same buffers, production dims.
+ratio = CPU/GPU, >1 means GPU faster:
+
+| shape | S=1 | S=2 | S=4 | S=8 | S=16 |
+|---|---|---|---|---|---|
+| gate/up O=2048 I=4096 | 0.398 | 0.834 | **1.680** | 3.216 | 4.379 |
+| down O=4096 I=2048 | 0.385 | 0.732 | **2.413** | 1.933 | 4.432 |
+
+**GPU LOSES below S=4.** The probe independently reproduces the known S=1 defect (0.40x matches the
+shipped 1.118x-slower scalar path), which is what makes the rest of the table trustworthy.
+
+### Gate 2 — is the existing Metal expert path still bit-exact?
+`EXTRA_ENV="COLI_V4_METAL=1" ./bench/golden.sh` -> `PASS md5=5d04890413ff539e802985ce8c727814`.
+
+### The bit-exactness argument (no new probe needed)
+`view->block_rows = 1` by default; 16 only for packed hot-pinned slots (16/layer), so **cold rows1
+experts dominate prefill**. The scalar Metal seam accepts ONLY `block_rows==1` and delegates to the
+same batched entry at S=1 — and that configuration passes golden. Combined with the measured
+batch(S=N) == batch(S=1) at 0 ULP (S=1,2,6,16), this gives **batch(S=N) == CPU for block_rows==1
+transitively**. rows16 has no such proof, so it keeps the CPU path.
+
+### Implementation
+`COLI_V4_MOE_BATCHED=1` (default OFF), `COLI_V4_MOE_BATCHED_MIN_N` (default 4, env-overridable).
+Gate: flag on AND `N = offsets[group+1]-offsets[group] >= MIN_N` AND gate/up/down all
+`block_rows == 1`. Gather the group's rows into staging allocated once per call, one
+`coli_v4_metal_expert_forward_batch`, scatter-accumulate in the same ascending route order. A
+nonzero seam return falls through to the per-row loop, so a rejection can never drop a contribution.
+
+### Result — isolated increment (N=5, baseline exported in the PARENT shell)
+OFF = grouped+attn, ON = grouped+attn+batched:
+
+| prompt | off | on | delta | **incremental** |
+|---|---|---|---|---|
+| p064 | 35.842 s | 31.975 s | **-10.79 %** | **1.121x** |
+| p256 | 94.251 s | 83.221 s | **-11.70 %** | **1.133x** |
+
+Stacked on the shipped lanes: **42.528 -> 31.975 s on p064, ~1.33x total.**
+
+This BEAT the pre-build projection (~1.06x) by roughly 2x. The S=4 probe **under**-predicted, the
+opposite of this host's usual 2.15-3.58x dilution. **Unexplained — recorded as an open question, not
+a new law.** Do not assume probes under-predict from now on.
+
+### Proof the path actually executed (golden alone would NOT have proved this)
+`bench/golden.sh` uses a ~20-token prompt and decodes at batch=1, so a feature gated on group size
+can simply never fire and golden passes trivially. Measured on the real p064 prompt instead:
+
+| | metal_dispatches | metal_fp8_dispatches | ttft |
+|---|---|---|---|
+| `COLI_V4_MOE_BATCHED=0` | **0** | 429 | 35.908 s |
+| `COLI_V4_MOE_BATCHED=1` | **1009** | 429 | **32.258 s** |
+
+`metal_fp8_dispatches` identical in both — the attention lane is untouched.
+
+### Correctness gates
+- golden flag **OFF**: `PASS md5=5d04890413ff539e802985ce8c727814` (default path undisturbed)
+- golden flag **ON**: `PASS md5=5d04890413ff539e802985ce8c727814`
+
+### M2 adjacent-surface regression (N=5, batched code compiled in, flag OFF)
+| flag | prompt | delta | now | was | verdict |
+|---|---|---|---|---|---|
+| `COLI_V4_MOE_GROUPED` | p064 | -4.43 % | 1.046x | 1.043x | PASS |
+| `COLI_V4_MOE_GROUPED` | p256 | -3.58 % | 1.037x | 1.021x | PASS (faster) |
+| `COLI_V4_METAL_ATTN` | p064 | -11.51 % | 1.130x | 1.133x | PASS |
+| `COLI_V4_METAL_ATTN` | p256 | -13.04 % | 1.150x | 1.142x | PASS |
+
+Every lane at or above its historical figure. The GROUPED p256 drift (-1.48pp) is in the FASTER
+direction and its 1.021x baseline came from E61 on a pre-A6 binary, so it is not like-for-like.
+
+### A build trap that silently deletes the feature
+`METAL ?= 0` (`c/Makefile.deepseek-v4:97`). **Plain `make deepseek-v4` builds WITHOUT the Metal
+seam** — `COLI_V4_METAL_SEAM` undefined, the whole feature compiled out, zero errors, zero warnings,
+and every Metal env flag becomes a silent no-op. Correct build:
+`make -C c -f Makefile.deepseek-v4 METAL=1 deepseek-v4 -j8`, verified with
+`nm c/deepseek_v4 | grep -c coli_v4_metal_expert_forward_batch`.
+
+### Review
+Oracle read-only review: no blocking correctness bugs — scatter order- and value-identical to the
+per-row path, seam-failure fallback cannot double-add (the seam writes only scratch), bounds sound,
+no data race (call path is serial, buffers per-call). One finding **declined with reason**: it asked
+to AND-in `coli_v4_metal_enabled()`, but the shipped attention lane already gates on its OWN flag
+(`coli_v4_metal_fp8_enabled()` reads `COLI_V4_METAL_ATTN`), so per-feature gating is the established
+precedent, and adopting the change would disable the feature in the exact configuration measured.

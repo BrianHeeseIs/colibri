@@ -5040,6 +5040,8 @@ static int moe_token_pipeline(float *output,
 static pthread_once_t coli_v4_moe_grouped_once = PTHREAD_ONCE_INIT;
 static int coli_v4_moe_grouped_enabled_value;
 static int coli_v4_moe_grouped_stats_enabled_value;
+static int coli_v4_moe_batched_enabled_value;
+static int coli_v4_moe_batched_min_n_value;
 static int coli_v4_moe_grouped_degenerate_reported;
 static uint64_t coli_v4_moe_group_overhead_ns;
 static uint64_t coli_v4_moe_chunk_ns;
@@ -5054,12 +5056,40 @@ static void coli_v4_moe_grouped_init(void) {
         grouped && *grouped && atoi(grouped) != 0;
     coli_v4_moe_grouped_stats_enabled_value =
         stats && *stats && atoi(stats) != 0;
+    /* A8: batch a group's N routed rows into ONE Metal expert dispatch.
+     * Default OFF.  MIN_N exists because the GPU LOSES below S=4 at production
+     * dims (measured CPU/GPU: S=1 0.40x, S=2 0.73x, S=4 1.68x-2.41x), and real
+     * routing produces many N=1..2 groups; batching those would regress. */
+    const char *batched = getenv("COLI_V4_MOE_BATCHED");
+    const char *min_n = getenv("COLI_V4_MOE_BATCHED_MIN_N");
+    coli_v4_moe_batched_enabled_value =
+        batched && *batched && atoi(batched) != 0;
+    coli_v4_moe_batched_min_n_value = 4;
+    if (min_n && *min_n) {
+        int parsed = atoi(min_n);
+        if (parsed > 0) coli_v4_moe_batched_min_n_value = parsed;
+    }
 }
 
 static int coli_v4_moe_grouped_enabled(void) {
     pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
     return coli_v4_moe_grouped_enabled_value;
 }
+
+#ifdef COLI_V4_METAL_SEAM
+/* Only the batched Metal path consults these; without the seam they would be
+ * unused statics.  The repo build disables -Wunused-function, but stricter
+ * external builds do not. */
+static int coli_v4_moe_batched_enabled(void) {
+    pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
+    return coli_v4_moe_batched_enabled_value;
+}
+
+static int coli_v4_moe_batched_min_n(void) {
+    pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
+    return coli_v4_moe_batched_min_n_value;
+}
+#endif
 
 static int coli_v4_moe_grouped_stats_enabled(void) {
     pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
@@ -5141,6 +5171,24 @@ static int coli_v4_moe_grouped_batch(
         (size_t)batch * dimension * sizeof(*shared_outputs));
     float *expert_output = malloc((size_t)dimension * sizeof(*expert_output));
     float *decoded_gate = NULL;
+    /* A8 staging: gathered rows / per-row weights / outputs for ONE batched
+     * expert dispatch.  Allocated once per call and reused across every group,
+     * never per group.  Only when the flag is on, so the default path keeps its
+     * exact previous allocation profile. */
+#ifdef COLI_V4_METAL_SEAM
+    int batched_enabled = coli_v4_moe_batched_enabled();
+    int batched_min_n = coli_v4_moe_batched_min_n();
+    float *batch_inputs = NULL;
+    float *batch_outputs = NULL;
+    float *batch_weights = NULL;
+    if (batched_enabled) {
+        batch_inputs = malloc(routes * (size_t)dimension * sizeof(*batch_inputs));
+        batch_outputs = malloc(routes * (size_t)dimension * sizeof(*batch_outputs));
+        batch_weights = malloc(routes * sizeof(*batch_weights));
+        if (!batch_inputs || !batch_outputs || !batch_weights)
+            batched_enabled = 0;   /* degrade to the per-row path, never fail */
+    }
+#endif
     ColiExpertView *wave_views = NULL;
     ColiV4PrefillLoadBatch *wave_loader = NULL;
 
@@ -5347,6 +5395,62 @@ static int coli_v4_moe_grouped_batch(
         }
         for (int current = 0; !result && current < count; current++) {
             int group = first + current;
+            int batched_done = 0;
+#ifdef COLI_V4_METAL_SEAM
+            /* A8: collapse this group's N routed rows into ONE Metal dispatch.
+             * Gated on N because the GPU LOSES below S=4 at production dims
+             * (measured CPU/GPU: S=1 0.40x, S=2 0.73x, S=4 1.68x-2.41x) and real
+             * routing yields many N=1..2 groups.
+             * Gated on block_rows==1 because that is the layout the Metal chain
+             * is PROVEN bit-exact on: COLI_V4_METAL=1 golden PASS routes through
+             * the scalar seam, which accepts only block_rows==1 and delegates to
+             * this same batched entry at S=1.  rows16 (pinned hot slots) has no
+             * such proof, so it keeps the CPU path. */
+            int group_n = offsets[group + 1] - offsets[group];
+            if (batched_enabled && group_n >= batched_min_n &&
+                wave_views[current].gate.block_rows == 1 &&
+                wave_views[current].up.block_rows == 1 &&
+                wave_views[current].down.block_rows == 1) {
+                extern int coli_v4_metal_expert_forward_batch(
+                    float *outs, const ColiExpertView *expert,
+                    const float *inputs_gathered, const float *weights_in,
+                    int batch_rows, float swiglu_limit);
+                for (int k = 0; k < group_n; k++) {
+                    int gathered_route = route_slots[offsets[group] + k];
+                    int gathered_item = gathered_route / topk;
+                    memcpy(batch_inputs + (size_t)k * dimension,
+                           inputs + (size_t)gathered_item * dimension,
+                           (size_t)dimension * sizeof(*batch_inputs));
+                    batch_weights[k] = route_weights[gathered_route];
+                }
+                uint64_t batch_began = stats_enabled || coli_v4_profile_on
+                    ? coli_v4_profile_now_ns() : 0;
+                int batch_result = coli_v4_metal_expert_forward_batch(
+                    batch_outputs, &wave_views[current], batch_inputs,
+                    batch_weights, group_n, config->swiglu_limit);
+                uint64_t batch_elapsed = stats_enabled || coli_v4_profile_on
+                    ? coli_v4_profile_now_ns() - batch_began : 0;
+                if (stats_enabled) compute_ns += batch_elapsed;
+                if (coli_v4_profile_on)
+                    coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_FORWARD,
+                                        batch_elapsed);
+                if (!batch_result) {
+                    for (int k = 0; k < group_n; k++) {
+                        int gathered_route = route_slots[offsets[group] + k];
+                        int gathered_item = gathered_route / topk;
+                        const float *row =
+                            batch_outputs + (size_t)k * dimension;
+                        for (int index = 0; index < dimension; index++)
+                            routed_acc[(size_t)gathered_item * dimension +
+                                       index] += row[index];
+                    }
+                    batched_done = 1;
+                }
+                /* nonzero return => fall through to the per-row path, so a seam
+                 * rejection can never drop or corrupt a group's contribution */
+            }
+#endif
+            if (batched_done) continue;
             for (int offset = offsets[group]; !result &&
                  offset < offsets[group + 1]; offset++) {
                 int route = route_slots[offset];
@@ -5407,6 +5511,11 @@ cleanup:
     }
     free(wave_views);
     free(decoded_gate);
+#ifdef COLI_V4_METAL_SEAM
+    free(batch_weights);
+    free(batch_outputs);
+    free(batch_inputs);
+#endif
     free(expert_output);
     free(shared_outputs);
     free(routed_acc);
