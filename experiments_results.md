@@ -3471,3 +3471,69 @@ is the O(n²) term) still favours longer prompts, and the earlier, larger-margin
 | **both together** | | **1.189x** | **1.179x** |
 
 Every combination verified at `golden md5=5d04890413ff539e802985ce8c727814`.
+
+---
+
+## E77. A7 (GPU fp8 QDQ) **killed before implementation** — and I nearly repeated the false-77% error
+
+### The idea
+Move `coli_fp8_activation_qdq_ref` to the GPU. A bit-exact GPU kernel already exists
+(`coli_v4_fp8_qdq` in `c/metal/coli_v4_fp8qdq.metal`) and its probe still passes today under
+`MTLMathModeSafe` (matches the production `-fno-fast-math` from E69).
+
+### Step 1 — kernel throughput (`validation/probes/qdq_throughput.m`)
+CPU and GPU timed **in the same process on the same buffer**, deliberately avoiding the
+cross-run subtraction that produced the false 77 % claim.
+
+```
+exactness at scale : scales BIT-EXACT (0 bad), outputs BIT-EXACT (0/16777216 bad)
+CPU qdq  :   138.23 ms  ->     121 Melem/s
+GPU qdq  :     1.81 ms  ->    9281 Melem/s
+speedup  : 76.47x
+```
+
+76x, bit-exact over 16.7 M outputs. Looked like an easy win.
+
+### Step 2 — the check that killed it
+I was about to project that 76x against `fp8_qdq_ms=1273.5 / 151.0 Melems`. But that counter was
+captured in a **different configuration**. Re-measured it in the configuration A7 would actually
+improve (both lanes ON):
+
+```
+fp8_qdq_ms=125.2 fp8_qdq_melems=15.0
+```
+
+**10x smaller.** The rate cross-validates exactly — 15.0 Melems / 125.2 ms = 119.8 Melem/s versus
+the probe's 121 Melem/s — so my *rate* was right and my *volume* was borrowed from the wrong
+configuration.
+
+| | ms | % of 35.782 s wall | ceiling |
+|---|---|---|---|
+| qdq, on-lane (real) | 125.2 | **0.35 %** | **1.0035x** |
+| qdq, figure I nearly used | 1273.5 | 3.56 % | 1.0369x |
+
+A/B noise floor is ~1 pp (E76). **A7's ceiling is 1.0035x — below the noise floor.** It cannot even
+be measured reliably, let alone be worth the extra dispatch and device buffer. Killed, like A5.
+
+### Why this matters more than the result
+This is the **same error class as the false 77 % claim**: taking a number measured in one
+configuration and applying it to another. It survived my own feasibility arithmetic in the previous
+step, which confidently printed "~718 ms saved, ~1.02x". The projection was internally consistent
+and completely wrong. **Only re-measuring in the target configuration caught it.**
+
+Standing rule, now applied three times (A5, A7, and the 77 % retraction):
+> Never project a saving from a counter captured in a different configuration.
+> Re-measure the cost in the exact configuration you intend to improve, first.
+
+### Bonus finding — the attention lane is at its floor
+On-lane Metal breakdown, p064:
+
+| component | ms | % of metal total | % of wall |
+|---|---|---|---|
+| dispatch_wait (real GPU matmul) | 1261.9 | 99.4 % | 3.53 % |
+| memcpy_in | 2.7 | 0.2 % | 0.01 % |
+| memcpy_out | 4.9 | 0.4 % | 0.01 % |
+
+Transfer overhead is **0.02 % of wall**. Essentially all Metal time is productive matmul. There is
+nothing left to shave in this lane — further gains must come from the CPU-side MoE work, not from
+the attention lane.
