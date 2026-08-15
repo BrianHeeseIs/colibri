@@ -351,3 +351,57 @@ fork and it is the OLD-engine backend already merged upstream as PR #72.
 M3 Max 128GB 0.35-0.45 (#47) | M4 Pro Metal 0.30 (#107) | M3 Ultra 1.45 @82% hit (#180) |
 M5 Max Metal 1.83 (#87) | M5 Max 2.06 (#103).
 **Our M3 Max measured 1.52-1.56 tok/s decode** via the REPL — competitive with M5 Max numbers.
+
+# ============================================================
+# HALT — host going to standby. RESUME FROM HERE.
+# ============================================================
+
+## Branches
+- `ft-metal-new-arch` @ 633024a — shipped work + dashboard telemetry. GOLDEN PASS verified.
+    633024a lab: serve Brain and Profiling from live engine telemetry
+    e9deae0 feat(v4): emit dashboard telemetry (TIERS/EMAP/HITS/HWINFO/PROF)  [ports 7b50437 + b78431f]
+    242ad58 fix(omp): skip spin-wait tuning on macOS (#707)                   [cherry-pick -x a20c7aa]
+- `ft-opensourceftw1` — upstream adoption branch (CURRENT).
+    <1684e89 pick> deepseek_v4: size the OpenMP team around the expert loaders [cherry-pick -x]
+    4edd865 lab: drop the bridge's client-side max_tokens clamp
+    c4f056c v4: max_tokens is a ceiling — clamp to context (#975)             [cherry-pick -x 8c40fbd]
+
+## Gates PASSED (evidence captured)
+- golden @ 099e7ce baseline .................. PASS 5d04890413ff539e802985ce8c727814
+- golden after telemetry port ................ PASS (same md5)
+- golden after 8c40fbd ....................... PASS (same md5)
+- golden after 1684e89 ....................... PASS (same md5)  <- highest bit-exactness risk, survived
+- a20c7aa binary-identity (F1) ............... IDENTICAL (same-dir test)
+- 8c40fbd GREEN .............................. "[V4] max_tokens 5000 clamped to 511 (context 512 - prompt 1)" + ACCEPT
+- 8c40fbd EDGE ............................... "CONTEXT_EXCEEDED prompt_tokens=80 requested=1 capacity=64" (still rejects, clamp not over-permissive)
+- [OMP] banner ............................... "13 compute threads (16 logical CPUs minus 3 expert-loader workers)"
+
+## THE ONE OPEN ITEM: W3.3 A/B gate for 1684e89 — DID NOT RUN
+`.backlog/lab/gate_20260815-154737.log` stops after both WARMUP lines; no RUN/AB lines, exit was
+silent. **Two bugs to fix before retrying:**
+1. MY runner `.backlog/lab/run_gate.sh` pipes ab.sh through `grep -E '^(RUN|AB) '`, which HIDES any
+   error ab.sh prints. Remove or widen that filter first — the failure is currently invisible.
+2. Root cause of the early exit is UNDIAGNOSED. Reproduce with ab.sh run directly and unfiltered:
+     export COLI_V4_MOE_GROUPED=1 COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED=1
+     N=3 ./bench/ab.sh "COLI_NO_OMP_TUNE=1" ./c/deepseek_v4     # unfiltered, watch the output
+   Suspect ab.sh's ON_ENV validation or its own engine/precondition check.
+
+### What that gate decides
+OFF = tuning ACTIVE (13 threads, the pick).  ON = COLI_NO_OMP_TUNE=1 (16 threads, old behaviour).
+delta = 100*(on-off)/off, FASTER IS NEGATIVE.
+**delta <= -1.5% on either prompt => the old behaviour is faster => REVERT 1684e89.**
+Prediction (F3, confirmed): `COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER` has **9 guards in
+deepseek_v4.c but 0 occurrences in the build config**, so this commit reserves 3 of 16 CPUs for a
+loader pool that is NOT compiled into our binary, on a prefill-dominated metric. A regression is the
+expected outcome. 1684e89 is isolated as its own commit precisely so `git revert` is surgical.
+
+## Still pending after that
+W0.6 TTFT baseline N=5 | W4.1 adjacent regression (GROUPED/METAL_ATTN/BATCHED within +/-1.5pp)
+W5 #900 PACK_SHARE measurement (scratch COLI_V4_PREFILL_TRACE build; divide by TTFT_MS, NOT pct_wall)
+W6 port #983 only if PACK_SHARE >= 5.0% | CLOSE relaunch bridge
+
+## Host facts (corrected)
+RAM is **137.4 GB** (an earlier plan claimed 128 — wrong). Swap was 95% used with the bridge live,
+eased to 9341M used / 3970M free after stopping it. Rebuild ALWAYS with
+`make -C c -f Makefile.deepseek-v4 METAL=1 deepseek-v4 -j8`; verify with
+`nm c/deepseek_v4 | grep -c coli_v4_metal_expert_forward_batch` > 0.
