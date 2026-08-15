@@ -63,3 +63,49 @@ kernel void coli_v4_fp8_matmul_batch(
     }
     outputs[(ulong)s * O + o] = a.hi + a.lo;
 }
+
+/* A6: fused GROUPED fp8 matmul - one dispatch covering all output groups.
+ *
+ * wo_a is invoked once per output group (o_groups=8), each a separate small matmul. E74 measured
+ * 8 separate dispatches vs 1 fused: 2.36x at S=64, 5.58x at S=6, 7.93x at S=1 - the win is real
+ * at every batch size and largest where occupancy is worst.
+ *
+ * BIT-EXACTNESS: each (group, o, s) output is an INDEPENDENT accumulation. Fusing changes only
+ * WHICH THREAD computes a given output, never the order of additions within it, so the per-output
+ * arithmetic is identical to the per-group kernel above. Proven at 0 ULP, not assumed.
+ *
+ * Layout (all groups contiguous, matching the engine's wo_a slicing at deepseek_v4.c:2830-2833):
+ *   weights[group] at  group * O * I          bytes
+ *   scales [group] at  group * ceil(O/128) * nblkI  floats
+ *   inputs [group] at  group * S * I          floats
+ *   outputs[group] at  group * S * O          floats
+ */
+kernel void coli_v4_fp8_matmul_grouped(
+        device const uchar         *weights [[buffer(0)]],
+        device const float         *scales  [[buffer(1)]],
+        device const float         *inputs  [[buffer(2)]],
+        device float               *outputs [[buffer(3)]],
+        device const float         *lut     [[buffer(4)]],
+        constant ColiV4Fp8Dims     &dims    [[buffer(5)]],
+        constant uint              &ngroups [[buffer(6)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    uint O = dims.O, I = dims.I, S = dims.S, NB = dims.nblkI;
+    uint o = gid.x, s = gid.y, g = gid.z;
+    if (o >= O || s >= S || g >= ngroups) return;
+
+    uint scale_rows = (O + 127u) / 128u;
+    device const uchar *w   = weights + (ulong)g * O * I + (ulong)o * I;
+    device const float *x   = inputs  + (ulong)g * S * I + (ulong)s * I;
+    device const float *scl = scales  + (ulong)g * scale_rows * NB + (ulong)(o / 128u) * NB;
+
+    coli_df a = coli_df{ 0.0f, 0.0f };
+    for (uint bi = 0; bi < NB; ++bi) {
+        uint base = bi * 128u;
+        uint blen = (base + 128u > I) ? (I - base) : 128u;
+        float acc = 0.0f;
+        for (uint i = 0; i < blen; ++i)
+            acc += lut[w[base + i]] * x[base + i];
+        a = coli_df_add_prod(a, acc, scl[bi]);
+    }
+    outputs[((ulong)g * S + s) * O + o] = a.hi + a.lo;
+}

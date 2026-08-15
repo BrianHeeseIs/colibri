@@ -3368,3 +3368,62 @@ Worth implementing. Bit-exactness is preserved by construction: each `(group, o,
 independent accumulation, so fusing changes only *which thread* computes it, never the order of any
 single output's additions — the same structural argument as E62/E68, and it must still be proven at
 0 ULP rather than asserted.
+
+---
+
+## E75. A6 implemented — fused `wo_a` lifts the attention lane to **1.133x / 1.142x**, both now clearing the gate
+
+E74 measured the fused grouped dispatch at 2.36x–7.93x and projected the lane would reach ~1.145x.
+Implemented and measured.
+
+### What changed
+A second kernel `coli_v4_fp8_matmul_grouped` (3-D dispatch over `(O, S, groups)`) plus a grouped
+seam entry, and the `wo_a` loop at `:2818` now gathers all groups, QDQs each **exactly as
+`coli_fp8_matmul_batch_ref` does** (per item, 128-column blocks), issues **one** dispatch, and
+scatters. The per-group loop is retained verbatim as fallback and runs whenever the grouped call
+returns non-zero.
+
+### Fusion proven, not assumed
+The predicted signature landed exactly — 12 dispatches per layer-chunk become 5:
+
+```
+metal_fp8_dispatches   1031 -> 429        (predicted ~430)
+proj_wo_a            2223.6 -> 1614.99 ms  (1.38x)
+attn_total_ms         9629.8 -> 9088.8 ms
+metal_fp8_ms total    3625.3 -> 3010.9 ms
+metal_fp8_cache_full_events = 0
+```
+
+Bit-exact both ways: `PASS golden md5=5d04890413ff539e802985ce8c727814` with the lane ON **and**
+with everything OFF.
+
+### A/B — interleaved, n=3, sign-correct
+
+| prompt | off | on | delta | speedup | before A6 |
+|---|---|---|---|---|---|
+| p064 | 42.526 s | 37.529 s | **−11.75 %** | **1.133x** | 1.107x (+2.6 pp) |
+| p256 | 109.599 s | 95.954 s | **−12.45 %** | **1.142x** | 1.135x (+0.7 pp) |
+
+**Both prompts now clear the plan's 1.12x gate** (`delta <= -10.71%`); p064 previously sat just
+under at −9.70 %.
+
+### The probe over-predicted, and the reason is the recurring one
+E74 measured the *dispatch* at 2.36x (S=64), but `proj_wo_a` improved only **1.38x**, because the
+stage also contains the CPU gather, the per-item QDQ, and the scatter — none of which the probe
+timed. This is the **third** instance of the same dilution in this project:
+
+| | probe / microbenchmark | in situ |
+|---|---|---|
+| attention projections (E59 → E68) | 6.0x | 3.09x bit-exact |
+| projections in-engine (A2 → E71) | 3.09x | 1.97x |
+| **fused `wo_a` (E74 → E75)** | **2.36x** | **1.38x** |
+
+Each time the isolated kernel measurement was optimistic by roughly 1.5–2x once surrounded by the
+real CPU work it does not replace. **Recorded as a standing correction factor**: treat any kernel
+microbenchmark here as an upper bound roughly 1.5–2x above what the enclosing stage will show.
+
+### Remaining headroom, unchanged in character
+`dispatch_wait` is still 2966.9 ms of the 3010.9 ms Metal path. With round trips now only 429 x
+0.176 ms = 75 ms (2.5 %), essentially all of it is real kernel execution — so the next levers stay
+those named in E73: raise the chunk cap so more work runs at large S, and move the fp8 QDQ
+(1273.5 ms, 17 % of projections) onto the GPU.

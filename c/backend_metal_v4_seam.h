@@ -35,6 +35,17 @@ int  coli_v4_metal_fp8_matmul_batch(float *outputs,
                                     const float *inputs,
                                     int batch, int rows, int columns);
 
+/* A6: fused grouped variant - one dispatch over all output groups instead of one per group.
+ * Layout is fully contiguous per group: weights g*rows*columns bytes, scales
+ * g*ceil(rows/128)*nblkI floats, inputs g*batch*columns floats, outputs g*batch*rows floats.
+ * Per-output arithmetic is identical to the ungrouped kernel, so results are bit-exact.
+ * Returns 0 on success; any non-zero result requires the caller's CPU fallback. */
+int  coli_v4_metal_fp8_matmul_grouped(float *outputs,
+                                      const void *weight_data,
+                                      const float *weight_scales,
+                                      const float *inputs,
+                                      int batch, int rows, int columns, int groups);
+
 #ifdef __cplusplus
 }
 #endif

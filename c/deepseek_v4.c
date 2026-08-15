@@ -2819,7 +2819,60 @@ int coli_v4_attention_window_batch_ref(
     float *group_inputs = malloc((size_t)batch * group_width * sizeof(*group_inputs));
     float *group_outputs = malloc((size_t)batch * o_rank * sizeof(*group_outputs));
     if (!group_inputs || !group_outputs) result = -1;
-    for (int group = 0; !result && group < groups; group++) {
+    int wo_a_fused = 0;
+#ifdef COLI_V4_METAL_SEAM
+    /* A6: fuse all output groups into ONE dispatch. E74 measured 2.36x at S=64 rising to 7.93x
+     * at S=1 versus the per-group loop below, for identical arithmetic.
+     * The QDQ is reproduced EXACTLY as coli_fp8_matmul_batch_ref does it (per item, 128-column
+     * blocks) so each output's accumulation is unchanged; fusing only changes which GPU thread
+     * computes it. Any failure falls through to the per-group loop with nothing consumed. */
+    if (!result) {
+        extern int coli_v4_metal_fp8_enabled(void);
+        extern int coli_v4_metal_fp8_matmul_grouped(float *outputs, const void *weight_data,
+                                                    const float *weight_scales,
+                                                    const float *inputs,
+                                                    int batch, int rows, int columns, int groups);
+        extern int coli_fp8_activation_qdq_ref(float *output, uint8_t *scales,
+                                               const float *input, size_t length,
+                                               size_t block_size);
+        if (coli_v4_metal_fp8_enabled()) {
+            size_t act_n = (size_t)groups * batch * group_width;
+            size_t out_n = (size_t)groups * batch * o_rank;
+            size_t sc_n  = (size_t)batch * ((size_t)group_width / 128);
+            float   *all_act = malloc(act_n * sizeof(*all_act));
+            float   *all_out = malloc(out_n * sizeof(*all_out));
+            uint8_t *tmp_sc  = malloc(sc_n ? sc_n : 1);
+            if (all_act && all_out && tmp_sc) {
+                int ok = 1;
+                /* The E4M3 LUT is registered by coli_fp8_matmul_batch_ref on the first wq_a call
+                 * of layer 0, which always precedes wo_a. If it were ever absent the grouped call
+                 * returns -1 and we fall through to the per-group loop - safe, never wrong. */
+                for (int group = 0; ok && group < groups; group++)
+                    for (int item = 0; ok && item < batch; item++) {
+                        const float *src = attended + (size_t)item * q_width +
+                                           (size_t)group * group_width;
+                        float *dst = all_act +
+                            ((size_t)group * batch + (size_t)item) * group_width;
+                        if (coli_fp8_activation_qdq_ref(
+                                dst, tmp_sc + (size_t)item * (group_width / 128),
+                                src, (size_t)group_width, 128) != 0) ok = 0;
+                    }
+                if (ok && coli_v4_metal_fp8_matmul_grouped(
+                        all_out, wo_a.data, (const float *)wo_a.scales, all_act,
+                        batch, o_rank, group_width, groups) == 0) {
+                    for (int group = 0; group < groups; group++)
+                        for (int item = 0; item < batch; item++)
+                            memcpy(oa + (size_t)item * oa_width + (size_t)group * o_rank,
+                                   all_out + ((size_t)group * batch + (size_t)item) * o_rank,
+                                   (size_t)o_rank * sizeof(*oa));
+                    wo_a_fused = 1;
+                }
+            }
+            free(tmp_sc); free(all_out); free(all_act);
+        }
+    }
+#endif
+    for (int group = 0; !result && !wo_a_fused && group < groups; group++) {
         for (int item = 0; item < batch; item++)
             memcpy(group_inputs + (size_t)item * group_width,
                    attended + (size_t)item * q_width + (size_t)group * group_width,

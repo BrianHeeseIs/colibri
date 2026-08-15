@@ -570,6 +570,72 @@ COLI_V4_METAL_EXTERN int coli_v4_metal_fp8_matmul_batch(
     return 0;
 }
 
+
+static id<MTLComputePipelineState> coli_v4_fp8_grouped_pipeline;
+
+COLI_V4_METAL_EXTERN int coli_v4_metal_fp8_matmul_grouped(
+        float *outputs, const void *weight_data, const float *weight_scales,
+        const float *inputs, int batch, int rows, int columns, int groups) {
+    if (!outputs || !weight_data || !weight_scales || !inputs) return -1;
+    if (batch < 1 || rows < 1 || columns < 1 || groups < 1 || (columns % 128) != 0) return -1;
+    if (!coli_v4_metal_fp8_enabled()) return -1;
+    if (!coli_v4_metal_available() && !coli_v4_metal_init(NULL)) return -1;
+    if (!coli_v4_device || !coli_v4_queue) return -1;
+    if (!coli_v4_fp8_lut_buffer) return -1;
+    if (!coli_v4_fp8_grouped_pipeline) {
+        coli_v4_fp8_grouped_pipeline =
+            coli_v4_get_named_pipeline("coli_v4_fp8_matmul_grouped");
+        if (!coli_v4_fp8_grouped_pipeline) return -1;
+    }
+    size_t O = (size_t)rows, I = (size_t)columns, S = (size_t)batch, G = (size_t)groups;
+    size_t nblkI = (I + 127) / 128;
+    size_t wbytes = G * O * I;
+    size_t sbytes = G * ((O + 127) / 128) * nblkI * sizeof(float);
+
+    id<MTLBuffer> W  = coli_v4_fp8_resident(weight_data, wbytes);
+    id<MTLBuffer> SC = coli_v4_fp8_resident(weight_scales, sbytes);
+    if (!W || !SC) return -1;
+    id<MTLBuffer> X = coli_v4_fp8_grow(&coli_v4_fp8_in_scratch,  G * S * I * sizeof(float));
+    id<MTLBuffer> Y = coli_v4_fp8_grow(&coli_v4_fp8_out_scratch, G * S * O * sizeof(float));
+    if (!X || !Y) return -1;
+
+    unsigned long t_all0 = coli_v4_fp8_now();
+    unsigned long t0 = coli_v4_fp8_now();
+    memcpy(X.contents, inputs, G * S * I * sizeof(float));
+    atomic_fetch_add_explicit(&coli_v4_fp8_ns_memcpy_in, coli_v4_fp8_now()-t0, memory_order_relaxed);
+
+    struct { unsigned int O, I, S, nblkI; } dims = {
+        (unsigned int)O, (unsigned int)I, (unsigned int)S, (unsigned int)nblkI };
+    unsigned int ng = (unsigned int)G;
+
+    unsigned long t_d0 = coli_v4_fp8_now();
+    id<MTLCommandBuffer> cb = [coli_v4_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+    if (!enc) return -1;
+    [enc setComputePipelineState:coli_v4_fp8_grouped_pipeline];
+    [enc setBuffer:W  offset:0 atIndex:0];
+    [enc setBuffer:SC offset:0 atIndex:1];
+    [enc setBuffer:X  offset:0 atIndex:2];
+    [enc setBuffer:Y  offset:0 atIndex:3];
+    [enc setBuffer:coli_v4_fp8_lut_buffer offset:0 atIndex:4];
+    [enc setBytes:&dims length:sizeof(dims) atIndex:5];
+    [enc setBytes:&ng   length:sizeof(ng)   atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(O, S, G)
+   threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    atomic_fetch_add_explicit(&coli_v4_fp8_ns_dispatch, coli_v4_fp8_now()-t_d0, memory_order_relaxed);
+    if (cb.status != MTLCommandBufferStatusCompleted) return -1;
+
+    unsigned long t_o0 = coli_v4_fp8_now();
+    memcpy(outputs, Y.contents, G * S * O * sizeof(float));
+    atomic_fetch_add_explicit(&coli_v4_fp8_ns_memcpy_out, coli_v4_fp8_now()-t_o0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&coli_v4_fp8_ns_total, coli_v4_fp8_now()-t_all0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&coli_v4_fp8_dispatch_count, 1, memory_order_relaxed);
+    return 0;
+}
+
 COLI_V4_METAL_EXTERN unsigned long coli_v4_metal_fp8_dispatches(void) {
     return atomic_load_explicit(&coli_v4_fp8_dispatch_count, memory_order_relaxed);
 }
