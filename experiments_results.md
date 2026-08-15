@@ -2820,3 +2820,58 @@ reproduce it exactly, and E60 already showed the kernel reaching 421.6 GFLOP/s. 
 now conditional:
 - if double-float proves exact -> **attention lane (1.23x) leads**
 - if not -> **MoE lane leads** by default, since it has no such obstacle
+
+---
+
+## E66. Double-float **is** bit-exact for this computation — except when the product underflows
+
+E65 identified that Metal has no fp64 while `matmul_fp8` accumulates in `double`, and proposed
+double-float (hi/lo float pair) emulation. This tests it instead of assuming.
+
+`validation/probes/df_vs_double.c` — Dekker `TwoProduct`/`TwoSum` (exact via `fmaf` on ARM),
+compared against the real `double` accumulation, both cast to `float` at the end, bits compared.
+
+### Random testing gave a FALSE GREEN
+| mode | trials | differing |
+|---|---|---|
+| benign magnitudes | 300 000 | **0** |
+| wide dynamic range (2^-60..2^60) | 300 000 | **0** |
+| near-cancellation (±1e7 alternating) | 300 000 | **0** |
+| **denormal-ish inputs** | 300 000 | **149 825 (49.94 %)** |
+
+Three seeds on wide-range: 0 differing each. Had I stopped at benign random data — the obvious
+thing to do — I would have concluded "exact" and been wrong.
+
+### The exact threshold, and why it is not where I expected
+Exponent sweep (`df_threshold.c`, 32 blocks = real I=4096):
+
+| input magnitude | differing |
+|---|---|
+| 8.67e-19 (2^-60) and above | **0 %** |
+| 8.47e-22 (2^-70) | 61.2 % |
+| 8.27e-25 (2^-80) and below | ~50–62 % |
+
+Failures start around **8.5e-22**, which is **far above** float's min-normal 1.18e-38. The cause is
+not denormal *inputs* — it is the **product** underflowing:
+
+```
+two_prod(a,b) stores the rounding error of a*b via fma(a,b,-p).
+If a*b itself falls below float min-normal 2^-126, that error term is unrepresentable.
+inputs ~2^-70  ->  product ~2^-140  ->  UNDERFLOW  ->  double-float breaks
+inputs ~2^-60  ->  product ~2^-120  ->  safe
+```
+
+### Verdict and the remaining check
+**Double-float reproduces the CPU's `double` accumulation bit-exactly for every realistic magnitude
+tested, including wide dynamic range and near-cancellation.** The single failure mode is
+`|acc x scl| < ~2^-126`.
+
+So a **bit-exact Metal attention kernel is possible**, with one obligation: prove the real model
+never produces such a product. `acc` is a 128-term float block sum of `e4m3(w)*x`; `scl` is an F32
+weight block scale. Both would have to be around 1e-22 simultaneously. That is implausible — the
+fp8 activation QDQ floors its scale at `1e-4` (`:11990`) — **but implausible is not measured**, and
+this project has been burned by exactly that gap. The required check is to dump the real
+`(acc, scl)` pairs from a prefill run and report `min |acc x scl|`; if the margin is many orders
+above 2^-126, the lane is clear, and if not, those blocks fall back to CPU.
+
+**Recorded as: blocker E65 is resolved in principle, conditional on one measurement.**
