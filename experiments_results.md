@@ -3087,3 +3087,70 @@ binary md5 unchanged (`2e8dbbb5`) since only the metallib moved.
 Incidental observation for later: that run showed `ok=550` against `layout=740` rejects — i.e. only
 **42.6 %** of expert forwards reached the GPU, consistent with the rows16 layout rejection recorded
 as P1 in §12. Not addressed here.
+
+---
+
+## E70. A4 — the attention lane ships **+5–6 %**, and my first A/B was confounded by my own flag choice
+
+### The false negative
+The first A/B reported the lane **20 % SLOWER** (p064 `delta=+19.97%`, p256 `+17.12%`, 3/3 pairs
+each — consistent, not noise). Against a predicted 1.18x that was a 42 % miss, so it demanded a
+measured cause rather than a story.
+
+**The cause was my own experiment design.** I ran
+`ab.sh "COLI_V4_METAL=1 COLI_V4_METAL_ATTN=1"`, which also enabled the **MoE expert Metal path**
+that §12 had already measured at **1.118x slower**. The diagnostic settles it:
+
+```
+metal_dispatches      = 10760      <- the known-bad MoE expert path
+metal_fp8_dispatches  =   511      <- my attention path
+```
+
+The result was dominated by 10 760 dispatches of a path known to lose, and I had attributed it to
+my 511. Enabling a known-bad feature alongside the one under test is exactly the confound this
+project keeps re-learning (E57's `--ram`/speculation pairing, E13's stale-baseline inflation).
+
+The lazy Metal init added in A3 is what makes isolation possible — with **only**
+`COLI_V4_METAL_ATTN=1`: `metal_dispatches=0`, `metal_fp8_dispatches=256`.
+
+### Corrected result — interleaved, n=3, `COLI_V4_METAL_ATTN=1` alone
+
+| prompt | off | on | delta | speedup | pairs |
+|---|---|---|---|---|---|
+| p064 | 42.565 s | 40.466 s | **−4.93 %** | **1.052x** | 3/3 |
+| p256 | 109.489 s | 103.141 s | **−5.80 %** | **1.062x** | 3/3 |
+
+Bit-exact throughout (`PASS golden md5=5d04890413ff539e802985ce8c727814` with the lane ON and OFF).
+
+**The gain GROWS with prompt length** (4.93 % → 5.80 %) — the opposite of every other feature
+measured here (prefill prefetch decayed 6.20 → 2.70 %, grouped MoE decayed 4.15 → 2.09 %). Both of
+those decayed because O(n²) attention dilutes them; this lane *is* attention, so length works in
+its favour. That makes it the first optimisation in this project that improves on long prompts.
+
+### Why 1.05x and not the projected 1.18x — measured, not guessed
+
+| stage | E64 CPU baseline | with lane ON | speedup |
+|---|---|---|---|
+| attention total | 14 553.0 ms | **11 610.3 ms** | 1.25x |
+| five projections | 9 837.8 ms | **6 942.1 ms** | **1.42x** |
+
+The projections sped up **1.42x**, not the **3.09x** the A2 microbenchmark measured. The per-call
+breakdown shows exactly where it went:
+
+```
+metal_fp8_ms total=1561.4  memcpy_in=4.6  dispatch_wait=1540.7  memcpy_out=16.1
+511 dispatches -> 3.0 ms average, of which dispatch_wait is 98.7%
+```
+
+Memory traffic is negligible (21 ms of 1561 ms) and weight upload was only **0.6 MB** — the
+resident weights are 16 KB-aligned so the pointer-keyed cache serves them **zero-copy**. The cost
+is **one command buffer plus one blocking `waitUntilCompleted` per call**. That is the same
+structural failure as the original S=1 MoE seam: the kernel wins, the per-call round trip gives it
+back.
+
+### Next lever, identified by this measurement
+Amortise the dispatch. The five projections in a layer are issued as five separate blocking round
+trips; they could share one command buffer, and the two `wq_*` projections have a genuine
+dependency chain but `wkv` does not. Cutting 511 round trips toward ~86 would recover most of the
+gap between the measured 1.42x and the kernel's 3.09x. **Projected, therefore to be measured, not
+assumed.**

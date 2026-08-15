@@ -428,6 +428,16 @@ static id<MTLBuffer> coli_v4_fp8_out_scratch;
 static int coli_v4_fp8_enabled_value = -1;
 static _Atomic unsigned long coli_v4_fp8_dispatch_count;
 static _Atomic unsigned long coli_v4_fp8_upload_bytes;
+/* A4 diagnosis: split the per-call cost so the 42% miss can be attributed, not guessed. */
+static _Atomic unsigned long coli_v4_fp8_ns_memcpy_in;
+static _Atomic unsigned long coli_v4_fp8_ns_dispatch;
+static _Atomic unsigned long coli_v4_fp8_ns_memcpy_out;
+static _Atomic unsigned long coli_v4_fp8_ns_total;
+static _Atomic unsigned long coli_v4_fp8_rows_x_s;
+static inline unsigned long coli_v4_fp8_now(void){
+    static mach_timebase_info_data_t tb; if(!tb.denom) mach_timebase_info(&tb);
+    return (unsigned long)((double)mach_absolute_time()*tb.numer/tb.denom);
+}
 
 #define COLI_V4_FP8_CACHE 512
 typedef struct { const void *key; id<MTLBuffer> buf; size_t bytes; int nocopy; } ColiV4Fp8Entry;
@@ -516,11 +526,15 @@ COLI_V4_METAL_EXTERN int coli_v4_metal_fp8_matmul_batch(
     id<MTLBuffer> X = coli_v4_fp8_grow(&coli_v4_fp8_in_scratch,  S * I * sizeof(float));
     id<MTLBuffer> Y = coli_v4_fp8_grow(&coli_v4_fp8_out_scratch, S * O * sizeof(float));
     if (!X || !Y) return -1;
+    unsigned long t_all0 = coli_v4_fp8_now();
+    unsigned long t0 = coli_v4_fp8_now();
     memcpy(X.contents, inputs, S * I * sizeof(float));
+    atomic_fetch_add_explicit(&coli_v4_fp8_ns_memcpy_in, coli_v4_fp8_now()-t0, memory_order_relaxed);
 
     struct { unsigned int O, I, S, nblkI; } dims = {
         (unsigned int)O, (unsigned int)I, (unsigned int)S, (unsigned int)nblkI };
 
+    unsigned long t_d0 = coli_v4_fp8_now();
     id<MTLCommandBuffer> cb = [coli_v4_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
     if (!enc) return -1;
@@ -536,15 +550,29 @@ COLI_V4_METAL_EXTERN int coli_v4_metal_fp8_matmul_batch(
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    atomic_fetch_add_explicit(&coli_v4_fp8_ns_dispatch, coli_v4_fp8_now()-t_d0, memory_order_relaxed);
     if (cb.status != MTLCommandBufferStatusCompleted) return -1;
 
+    unsigned long t_o0 = coli_v4_fp8_now();
     memcpy(outputs, Y.contents, S * O * sizeof(float));
+    atomic_fetch_add_explicit(&coli_v4_fp8_ns_memcpy_out, coli_v4_fp8_now()-t_o0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&coli_v4_fp8_ns_total, coli_v4_fp8_now()-t_all0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&coli_v4_fp8_rows_x_s, (unsigned long)(O*S), memory_order_relaxed);
     atomic_fetch_add_explicit(&coli_v4_fp8_dispatch_count, 1, memory_order_relaxed);
     return 0;
 }
 
 COLI_V4_METAL_EXTERN unsigned long coli_v4_metal_fp8_dispatches(void) {
     return atomic_load_explicit(&coli_v4_fp8_dispatch_count, memory_order_relaxed);
+}
+COLI_V4_METAL_EXTERN void coli_v4_metal_fp8_timing(unsigned long *in_ns, unsigned long *disp_ns,
+                                                   unsigned long *out_ns, unsigned long *tot_ns,
+                                                   unsigned long *rows_x_s) {
+    if(in_ns)  *in_ns  = atomic_load_explicit(&coli_v4_fp8_ns_memcpy_in, memory_order_relaxed);
+    if(disp_ns)*disp_ns= atomic_load_explicit(&coli_v4_fp8_ns_dispatch, memory_order_relaxed);
+    if(out_ns) *out_ns = atomic_load_explicit(&coli_v4_fp8_ns_memcpy_out, memory_order_relaxed);
+    if(tot_ns) *tot_ns = atomic_load_explicit(&coli_v4_fp8_ns_total, memory_order_relaxed);
+    if(rows_x_s)*rows_x_s=atomic_load_explicit(&coli_v4_fp8_rows_x_s, memory_order_relaxed);
 }
 COLI_V4_METAL_EXTERN unsigned long coli_v4_metal_fp8_upload_bytes(void) {
     return atomic_load_explicit(&coli_v4_fp8_upload_bytes, memory_order_relaxed);

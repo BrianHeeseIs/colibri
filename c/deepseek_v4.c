@@ -10613,9 +10613,15 @@ static void v4_metal_stats_emit(void) {
         fprintf(stderr, "metal_dispatches=%lu\n", coli_v4_metal_dispatches());
         { extern unsigned long coli_v4_metal_fp8_dispatches(void);
           extern unsigned long coli_v4_metal_fp8_upload_bytes(void);
+          extern void coli_v4_metal_fp8_timing(unsigned long*,unsigned long*,unsigned long*,
+                                               unsigned long*,unsigned long*);
+          unsigned long ci=0,cd=0,co=0,ct=0,rs=0;
+          coli_v4_metal_fp8_timing(&ci,&cd,&co,&ct,&rs);
           fprintf(stderr, "metal_fp8_dispatches=%lu metal_fp8_upload_mb=%.1f\n",
                   coli_v4_metal_fp8_dispatches(),
-                  (double)coli_v4_metal_fp8_upload_bytes() / 1e6); }
+                  (double)coli_v4_metal_fp8_upload_bytes() / 1e6);
+          fprintf(stderr, "metal_fp8_ms total=%.1f memcpy_in=%.1f dispatch_wait=%.1f memcpy_out=%.1f\n",
+                  ct/1e6, ci/1e6, cd/1e6, co/1e6); }
     { extern void coli_v4_attn_report(void); coli_v4_attn_report(); }
     const char *profile = getenv("COLI_V4_METAL_PROFILE");
     if (profile && !strcmp(profile, "1")) coli_v4_metal_profile_report();

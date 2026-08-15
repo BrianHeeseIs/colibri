@@ -288,3 +288,29 @@ bit-exact). Next implementation target = GPU the five fp8 projections.
    (must match the CPU accumulation order exactly; check the portable non-AVX2 reference).
 2. if exact -> seam + host glue for the five projections (no gather/waves/leases needed).
 3. still open: F19 decoupling for MoE (1.48x on expert kernel cost, measured N 7.99).
+
+### F20. A4 NEGATIVE - attention lane is SLOWER end-to-end (recorded before diagnosis)
+N=3 interleaved, binary 653e2992, ab.sh sign (positive = SLOWER):
+  p064 off=42.396 on=50.863 delta=+19.97%  -> 0.834x  (3/3 pairs slower)
+  p256 off=109.341 on=128.058 delta=+17.12% -> 0.854x  (3/3 pairs slower)
+PREDICTED 1.180x (E68). MEASURED 0.834x. Miss of 42%.
+Kernel itself IS faster (A2: 3.09x bit-exact, 65.85ms CPU vs 21.28ms GPU per layer at S=64).
+So the loss is in the SEAM, not the kernel - same shape as the original S=1 MoE failure.
+Arithmetic: lost 8.467s on p064 over ~430 calls = ~19.7ms added per call, while the kernel
+should SAVE ~44ms/layer. Something in the per-call path costs far more than the kernel.
+Candidates to MEASURE (do not guess): per-call command buffer + blocking waitUntilCompleted;
+memcpy in/out per call (wq_b Y is 8.4MB at S=64); GPU idles the 12 OpenMP cores during the wait;
+second chunk is S=6 where the GPU is known to lose (E59: 0.16-0.89x at S=1).
+
+### F21. A4 NEGATIVE WAS MY OWN CONFOUND - corrected
+The A/B ran "COLI_V4_METAL=1 COLI_V4_METAL_ATTN=1", which ALSO enabled the MoE expert Metal path
+that RESULTS.md S12 already measured at 1.118x SLOWER. Proof from the diag run:
+  metal_dispatches=10760      <- the known-bad MoE expert path
+  metal_fp8_dispatches=511    <- my attention path
+So +19.97% was dominated by 10,760 dispatches of a known-bad path, not by my 511.
+MY LANE ACTUALLY WORKS: attn_total_ms 14553.0 (E64 baseline) -> 11610.3, i.e. -2.94s.
+  projections 9837.8ms -> 6942.1ms  (1.42x, not the 3.09x microbenchmark, because of per-call
+  dispatch_wait averaging 3.0ms over 511 calls)
+Isolation verified: with ONLY COLI_V4_METAL_ATTN=1 -> metal_dispatches=0, metal_fp8_dispatches=256.
+The lazy init added in A3 is what makes the clean experiment possible.
+EXPECTATION for the clean A/B: ~2.94s saved on a 42.4s wall = ~1.075x, NOT the 1.18x projected.
