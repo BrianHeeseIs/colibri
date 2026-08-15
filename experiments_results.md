@@ -3537,3 +3537,71 @@ On-lane Metal breakdown, p064:
 Transfer overhead is **0.02 % of wall**. Essentially all Metal time is productive matmul. There is
 nothing left to shave in this lane — further gains must come from the CPU-side MoE work, not from
 the attention lane.
+
+---
+
+## E78. Scope correction: the benchmark is **decode-dominated**, and my instruments were prefill-scoped
+
+E77 ended by claiming 65 % of the wall was unaccounted and that expert streaming was the prime
+suspect. **That claim was wrong, and wrong in the same way as A7.**
+
+### What I did
+`COLI_V4_PREFILL_TRACE` is a compile-time whole-prefill trace already present in the source but not
+compiled into the shipped binary. Built it in a **scratch copy** (`/tmp/tracebuild_c`) so the tree
+binary was never touched — verified before/after, `md5 b6d102b538157f202ea9b0edc3992ee0` unchanged.
+
+### Result — prefill accounts almost perfectly
+
+```
+v4_prefill_trace config prefetch=0 prompt_tokens=20 fresh_tokens=20 omp_max_threads=16 wall_ms=13561.564
+```
+
+| stage | ms | % of prefill |
+|---|---|---|
+| moe | 8664.9 | **63.9 %** |
+| attention | 3623.8 | 26.7 % |
+| attention_norm | 277.7 | 2.0 % |
+| ffn_norm | 273.2 | 2.0 % |
+| head | 36.7 | 0.3 % |
+| **residual** | 632.99 | **4.7 %** |
+
+Residual is 4.7 %, not 65 %. **There is no missing time in prefill.** (Instrumented wall is inflated;
+these are shares, not timings.)
+
+### The actual mistake
+`prompt_tokens=20`. The prompt is 20 tokens and fixed. **`p064` and `p256` are `--max-tokens`, i.e.
+GENERATED token counts — not prompt lengths.** I had been comparing prefill-scoped counters against
+a whole-run wall that is mostly decode.
+
+Measured with the real binary:
+
+| run | wall | note |
+|---|---|---|
+| `--max-tokens 1` | 12.98 s | load + prefill + 1 token |
+| `--max-tokens 64` | 53.68 s | |
+| marginal decode, first 64 tokens | **0.646 s/token** | |
+| marginal decode, tokens 65..256 (from the A/B pair) | **0.297 s/token** | |
+
+Per-token cost falls **2.17x** as the expert cache warms — which is why p256 is not 4x p064.
+
+At 64 generated tokens: prefill ~12 s versus decode ~41 s. **The metric I have been optimising
+against is decode-dominated**, and prefill — where all my stage instrumentation lives — is the
+minority of it.
+
+### Third instance of one error class
+1. the false 77 % claim — subtracted figures across runs
+2. A7 — applied an off-lane counter to an on-lane wall
+3. this — applied prefill-scoped counters to a decode-dominated wall
+
+All three are the same failure: **a number measured in one scope applied to another.** The rule is
+now stronger than "re-measure in the target configuration": *state the scope of every counter
+before dividing it by anything.*
+
+### What this does and does not change
+- **Does not invalidate the shipped result.** 1.189x / 1.179x are end-to-end A/B numbers on the real
+  binary; they were measured correctly and remain correct.
+- **Explains why the lanes work at all.** MoE grouping and the Metal attention projections run on
+  every forward pass, so they help decode too — that is where most of their winnings came from.
+- **Redirects the next lever.** Optimising prefill further is capped at roughly a quarter of the
+  wall at p064 and far less at p256. Future work must be attributed against *decode*, and the
+  2.17x warm-up effect says expert-cache behaviour during early decode is the richest target.
