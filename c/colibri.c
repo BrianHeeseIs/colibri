@@ -430,6 +430,8 @@ typedef struct {
 } Model;
 
 #include "quant.h"
+float coli_fp8_minprod = 3.4e38f;
+int coli_fp8_minprod_enabled = 0;
 static int g_no_fused_pair=0;
 static int g_spec_pin=1;
 static int g_spec_live=0;

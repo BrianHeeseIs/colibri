@@ -80,6 +80,8 @@
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
+float coli_fp8_minprod = 3.4e38f;
+int coli_fp8_minprod_enabled = 0;
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                    /* KV prefix reuse (shared) */

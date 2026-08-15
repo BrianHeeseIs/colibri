@@ -488,6 +488,17 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * is the GPU one; a vectorized CPU kernel is future work if measured needed).
  * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
  * convention so cross-block cancellation doesn't cost precision unfairly. */
+/* E66 measurement (default OFF): the smallest |acc*scl| the real model ever produces.
+ * A Metal kernel must emulate this function's `double` accumulation with double-float, which is
+ * bit-exact ONLY while |acc*scl| stays above float min-normal 2^-126. This measures the margin. */
+extern float coli_fp8_minprod;            /* defined in the engine TU */
+extern int   coli_fp8_minprod_enabled;
+static inline void coli_fp8_track(float acc, float scl){
+    if (!coli_fp8_minprod_enabled) return;
+    float m = acc * scl; if (m < 0) m = -m;
+    if (m > 0.0f && m < coli_fp8_minprod) coli_fp8_minprod = m;
+}
+
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
@@ -513,6 +524,8 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
                     acc2 += e4m3_decode(w2[i])*xv;
                     acc3 += e4m3_decode(w3[i])*xv;
                 }
+                coli_fp8_track(acc0, scl0[bi]); coli_fp8_track(acc1, scl1[bi]);
+                coli_fp8_track(acc2, scl2[bi]); coli_fp8_track(acc3, scl3[bi]);
                 a0 += (double)acc0*scl0[bi];
                 a1 += (double)acc1*scl1[bi];
                 a2 += (double)acc2*scl2[bi];

@@ -2540,6 +2540,8 @@ int coli_v4_attention_window_token_ref(
 #undef coli_v4_attention_token_ref
 #undef coli_v4_attention_window_token_ref
 
+float coli_fp8_minprod = 3.4e38f;
+int   coli_fp8_minprod_enabled = 0;
 extern uint64_t coli_v4_profile_now_ns(void);
 /* ---- B3: PREFILL attention attribution (measurement only, COLI_V4_ATTN_STATS=1) ----
  * The existing COLI_V4_PROFILE attn_* stages instrument only the SINGLE-TOKEN decode path
@@ -2553,6 +2555,7 @@ static int coli_v4_attn_stats_enabled(void) {
     if (coli_v4_attn_stats_value < 0) {
         const char *v = getenv("COLI_V4_ATTN_STATS");
         coli_v4_attn_stats_value = (v && *v && atoi(v) != 0) ? 1 : 0;
+        coli_fp8_minprod_enabled = coli_v4_attn_stats_value;
     }
     return coli_v4_attn_stats_value;
 }
@@ -2566,6 +2569,8 @@ void coli_v4_attn_report(void) {
     uint64_t parts = 0;
     for (int i = 0; i < 12; i++)
         if (i != 2) parts += __atomic_load_n(&coli_v4_attn_ns[i], __ATOMIC_RELAXED);
+    fprintf(stderr, "fp8_min_abs_acc_x_scl=%.6e  float_min_normal=1.175494e-38  margin=%.3gx\n",
+            (double)coli_fp8_minprod, (double)(coli_fp8_minprod / 1.175494e-38f));
     fprintf(stderr, "attn_calls=%llu attn_total_ms=%.3f attn_parts_ms=%.3f "
             "attn_residual_ms=%.3f residual_pct=%.2f\n",
             (unsigned long long)__atomic_load_n(&coli_v4_attn_calls, __ATOMIC_RELAXED),

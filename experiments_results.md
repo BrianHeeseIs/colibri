@@ -2875,3 +2875,34 @@ this project has been burned by exactly that gap. The required check is to dump 
 above 2^-126, the lane is clear, and if not, those blocks fall back to CPU.
 
 **Recorded as: blocker E65 is resolved in principle, conditional on one measurement.**
+
+### E66d. The remaining gate, measured — **margin is 7.9e28x. Blocker fully resolved.**
+
+E66 left one obligation: prove the real model never produces `|acc x scl| < 2^-126`. Instrumented
+`matmul_fp8` (`quant.h`, tracker default OFF behind `coli_fp8_minprod_enabled`) and measured it
+during a real p064 prefill:
+
+```
+fp8_min_abs_acc_x_scl = 9.313226e-10
+float_min_normal      = 1.175494e-38
+margin                = 7.92e+28x
+```
+
+**Nearly 29 orders of magnitude of headroom.** The underflow regime that breaks double-float
+(products below ~1e-38) is not remotely approached by this model — the smallest product observed is
+~1e-9. The `1e-4` floor in the fp8 activation QDQ (`:11990`) plus realistic weight-block scales keep
+it far away.
+
+**Conclusion: E65's blocker is fully resolved. A bit-exact Metal attention kernel is possible**,
+using double-float emulation for the block accumulation at an estimated 2.4–7.3 % kernel overhead
+(E65) on a path measured 6.0x faster than CPU (E59). Default path re-verified
+`PASS golden md5=5d04890413ff539e802985ce8c727814`.
+
+The chain of reasoning that got here is worth noting, because three of the four steps would have
+produced a wrong answer if stopped early:
+1. E64 said the attention lane is worth 1.23x -> looked like a clear go.
+2. E65 found Metal has no fp64 and the fp8 path accumulates in `double` -> looked fatal.
+3. E66 random testing said double-float is exact -> **false green**, adversarial testing found a
+   49.94 % failure mode.
+4. E66c located the true threshold (product underflow at ~1e-22 inputs, not denormal inputs).
+5. E66d measured the real margin as 7.9e28x -> **actually fine**.
