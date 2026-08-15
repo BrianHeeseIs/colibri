@@ -3033,3 +3033,57 @@ Applying 3.09x to E64's measured 9.838 s of projections in a 43.569 s wall:
 survives full bit-exactness. It should also compose with the shipped MoE grouped path (1.043x,
 a different part of the wall) for an upper bound of ~1.23x — **to be measured, not assumed**, per
 the standing E57 lesson.
+
+---
+
+## E69. A3 step 1 — `-fno-fast-math` on the Metal build (prerequisite, and a latent fragility fixed)
+
+E68 proved a bit-exact Metal fp8 matmul is possible, but **only** with
+`MTLCompileOptions.fastMathEnabled = NO`. Integrating that kernel requires the engine's own Metal
+build to honour the same flag, so this lands first as a separately-verifiable step.
+
+### What the engine was doing
+Both Metal compile paths ran with fast math **enabled**:
+- `c/backend_metal_v4.mm:737` — `newLibraryWithSource:source options:nil` (nil = defaults = fast math ON)
+- `c/Makefile.deepseek-v4:142` — `$(METALC) -c $< -o $@`, no flag
+
+Production loads the offline metallib (`v4_metal_library kind=metallib`), so the Makefile path is
+the one that matters.
+
+### Why this is a fragility, not just a blocker for the new kernel
+The existing kernels are the **`ordered`** variants, whose entire purpose is a *deterministic*
+two-level accumulation order — that is why they can be bit-exact where a `simd_sum` reduction
+cannot. Compiling them with fast math **permits the compiler to reassociate**, which contradicts
+their design intent. Their bit-exactness was therefore *incidental* rather than guaranteed, and a
+toolchain update could have silently broken it.
+
+### Change
+```make
+# -fno-fast-math is REQUIRED, not cosmetic: fast math algebraically simplifies Dekker
+# two_sum's error term (a-(s-bb))+(b-bb) to zero, which silently destroys any
+# double-float accumulation. It also lets the compiler reassociate, which contradicts
+# the whole point of the `ordered` kernels' deterministic accumulation order.
+METALCFLAGS ?= -fno-fast-math
+...
+	$(METALC) $(METALCFLAGS) -c $< -o $@
+```
+Verified the flag is accepted by `xcrun metal` and **materially changes codegen** (the emitted
+`.air` differs by md5), so it is not a no-op.
+
+### Verification — on the real production surface
+`probe_fused_moe.m` compiles from `.metal` **source** at runtime with its own options, so it does
+**not** exercise the metallib production loads. The decisive test is the engine itself:
+
+| check | result |
+|---|---|
+| engine loads the rebuilt library | `v4_metal_library kind=metallib` |
+| Metal genuinely ran (not silently falling back) | `metal_dispatches=550`, `ok=550` |
+| **golden, Metal ON** | `PASS golden md5=5d04890413ff539e802985ce8c727814` |
+| **golden, Metal OFF** (default path) | `PASS golden md5=5d04890413ff539e802985ce8c727814` |
+
+**Disabling fast math did not change any existing kernel's output.** All 6 shaders rebuilt; engine
+binary md5 unchanged (`2e8dbbb5`) since only the metallib moved.
+
+Incidental observation for later: that run showed `ok=550` against `layout=740` rejects — i.e. only
+**42.6 %** of expert forwards reached the GPU, consistent with the rows16 layout rejection recorded
+as P1 in §12. Not addressed here.

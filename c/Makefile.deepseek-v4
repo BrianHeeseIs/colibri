@@ -106,6 +106,11 @@ V4_METAL_LIB_PATH := $(abspath $(V4_METAL_LIB_FILE))
 V4_METAL_SOURCE_HEADER := $(V4_METAL_BUILD_DIR)/deepseek_v4_source.h
 METALXX ?= clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 METALC ?= xcrun -sdk macosx metal
+# -fno-fast-math is REQUIRED, not cosmetic: fast math algebraically simplifies Dekker
+# two_sum's error term (a-(s-bb))+(b-bb) to zero, which silently destroys any
+# double-float accumulation. It also lets the compiler reassociate, which contradicts
+# the whole point of the `ordered` kernels' deterministic accumulation order.
+METALCFLAGS ?= -fno-fast-math
 METALLIB ?= xcrun -sdk macosx metallib
 ifeq ($(METAL),1)
 ifeq ($(IS_DARWIN),)
@@ -139,7 +144,7 @@ $(V4_METAL_BUILD_DIR):
 	mkdir -p $@
 
 $(V4_METAL_BUILD_DIR)/%.air: metal/%.metal | $(V4_METAL_BUILD_DIR)
-	$(METALC) -c $< -o $@
+	$(METALC) $(METALCFLAGS) -c $< -o $@
 
 $(V4_METAL_LIB_FILE): $(V4_METAL_AIR)
 	$(METALLIB) $^ -o $@
