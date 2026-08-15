@@ -3317,3 +3317,54 @@ that strengthens with length.
 2. **Fold the 8 `wo_a` groups into one large matmul** — valuable for *shape* (one big GEMM instead
    of 8 small ones), **not** for the round-trip saving, which this experiment just showed is 3 %.
 3. Move the fp8 QDQ (1273.5 ms, 17 % of projections) onto the GPU.
+
+---
+
+## E74. A6 feasibility — **fusing `wo_a`'s 8 group dispatches is worth 2.4x–7.9x**, and refines E73
+
+E73 killed "amortise the per-call round trip" as a *global* lever (fixed overhead is 5.1 % of all
+`dispatch_wait`). But it also identified `wo_a` — 8 of every 12 dispatches, one per output group —
+as worth fusing for **shape**, not for round trips. Measured before implementing.
+
+`validation/probes/wo_a_fuse.m`, real shape (o_rank=1024, group_width=4096, o_groups=8),
+double-float kernel, fast-math off, 8 separate dispatches vs 1 fused 3-D dispatch over
+`(O, S, groups)` — **identical total arithmetic**:
+
+| S | 8 separate | 1 fused | speedup | threads/dispatch (separate) |
+|---|---|---|---|---|
+| 64 | 7.531 ms | 3.186 ms | **2.36x** | 65 536 |
+| 32 | 2.897 ms | 1.485 ms | 1.95x | 32 768 |
+| 16 | 2.566 ms | 0.933 ms | 2.75x | 16 384 |
+| 6 | 2.635 ms | 0.472 ms | **5.58x** | 6 144 |
+| 1 | 2.686 ms | 0.339 ms | **7.93x** | 1 024 |
+
+### A prediction I got half right
+I predicted the win would concentrate at small S — **correct**, 5.58x at S=6 and 7.93x at S=1. But
+I also argued 65 536 threads at S=64 was "decent occupancy for 40 cores" so the win there would be
+small. **Wrong: it is still 2.36x.**
+
+### E73 and E74 are both true, and the reconciliation matters
+The "8 separate" column is nearly flat from S=1 to S=32 (2.686 → 2.897 ms). That floor is **8 round
+trips**, worth ~1.4 ms at the 0.176 ms each E73 measured — i.e. most of the cost at small S.
+
+- **E73 (global):** fixed round-trip cost is 181 ms of 3586 ms `dispatch_wait` = 5.1 %. Removing
+  round trips *everywhere* is not worth a restructure. **Still true.**
+- **E74 (local):** `wo_a` is **8 of every 12 dispatches but a minority of the arithmetic**, so its
+  round trips dominate *its own* cost, especially at small S. **Also true.**
+
+The apparent contradiction dissolves once dispatch count and arithmetic share are separated — a
+distinction I did not make when first proposing A5.
+
+### Projected value — to be measured, not assumed
+`wo_a` currently costs **2223.6 ms** of the 38.305 s lane-on wall:
+
+| fuse speedup | saves | attention lane |
+|---|---|---|
+| 2.36x (S=64 only) | 1281 ms | 1.107x → **1.145x** |
+| 2.5x (blended est.) | 1334 ms | 1.107x → **1.147x** |
+| 3.0x (optimistic) | 1482 ms | 1.107x → **1.152x** |
+
+Worth implementing. Bit-exactness is preserved by construction: each `(group, o, s)` output is an
+independent accumulation, so fusing changes only *which thread* computes it, never the order of any
+single output's additions — the same structural argument as E62/E68, and it must still be proven at
+0 ULP rather than asserted.
