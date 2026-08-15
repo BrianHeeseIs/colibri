@@ -3605,3 +3605,71 @@ before dividing it by anything.*
 - **Redirects the next lever.** Optimising prefill further is capped at roughly a quarter of the
   wall at p064 and far less at p256. Future work must be attributed against *decode*, and the
   2.17x warm-up effect says expert-cache behaviour during early decode is the richest target.
+
+---
+
+## E79. **Retraction of E78.** The A/B metric is TTFT (prefill), not decode. Fourth scope error.
+
+E78 concluded "the benchmark is decode-dominated". **That is false.** I am retracting it.
+
+### The harness, read rather than assumed (now pinned)
+`bench/ab.sh`:
+- invokes `"$BINARY" "$MODEL" "$prompt" --max-tokens 1 --memory-gb 96` — **one token generated**
+- `parse_ttft()` greps `timing time_to_first_token=` and takes **only that value**
+- `p064` / `p256` are **prompt files** — `.backlog/prefill_prompts/p064.txt` (61 words) and
+  `p256.txt` (165 words). They are prompt lengths, **not** `--max-tokens` values.
+
+The engine prints both halves on one line:
+
+```
+timing time_to_first_token=12.968s after_first=41.266s
+```
+
+**ab.sh consumes the first number and discards the second.** The A/B metric is TTFT = load +
+prefill. Decode is excluded by construction.
+
+### Where E78 went wrong
+`bench/golden.sh` *does* use `--max-tokens "$max_tokens"`, and the trace printed `prompt_tokens=20`.
+From those two facts I concluded that `p064`/`p256` were generated-token counts — **without ever
+reading ab.sh's invocation.** My `--max-tokens 1` vs `64` experiment was measured correctly
+(12.98 s / 53.68 s, matching `ttft` + `after_first` almost exactly) but it measured *decode on the
+golden prompt*, a quantity the A/B metric does not contain.
+
+### What survives
+- **The shipped numbers are unaffected.** 1.189x / 1.179x are ab.sh TTFT ratios, measured correctly
+  throughout.
+- **The prefill trace attribution is not just valid, it is precisely the right table** — because
+  the A/B metric *is* prefill. For the metric I actually optimise:
+
+  | stage | % of prefill |
+  |---|---|
+  | **moe** | **63.9 %** |
+  | attention | 26.7 % |
+  | attention_norm + ffn_norm | 4.0 % |
+  | residual | 4.7 % |
+
+- E77's "65 % unaccounted" was the same class of error: counters from a `--max-tokens 64` run
+  (decode included) divided by 35.782 s (an ab.sh TTFT, decode excluded). Both E77's mystery and
+  E78's explanation were artefacts of mismatched scope.
+
+### Fourth instance — and the actual root cause
+1. false 77 % — subtracted figures across runs
+2. A7 — off-lane counter applied to an on-lane wall
+3. E78 — prefill counters applied to a wall I believed was decode
+4. this — a metric definition I *assumed* instead of reading
+
+The first three I diagnosed as "measure in the target configuration". That framing was incomplete.
+The real root cause is simpler and more embarrassing: **I kept reasoning about what the benchmark
+measures instead of opening the script that defines it.** Three of the four would have been caught
+by one `sed -n` on the harness.
+
+Rule, replacing the earlier one:
+> Before dividing any counter by any wall, open the harness and read the exact invocation and the
+> exact field it parses. Pin those facts in writing. Never infer a metric's definition from a
+> sibling script.
+
+### Corrected direction
+The A/B metric is prefill TTFT, and **MoE is 63.9 % of it.** That — not decode, not expert prefetch
+warm-up, not the QDQ — is where the remaining headroom is. `COLI_V4_PREWARM` targets decode
+warm-up and is therefore **irrelevant to this metric**; it was about to be tested against the wrong
+thing.
