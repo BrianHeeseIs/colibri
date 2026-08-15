@@ -267,6 +267,30 @@ If, after batching, Metal is still not **>= 1.15x faster** end-to-end, close the
 permanently and record it. Three architectural fixes have already moved it 2.30x -> 1.17x -> 1.118x
 slower; diminishing returns are established, so the batching change is the last honest attempt.
 
+### RESOLVED — implemented and measured (E84, commit `9224329`). Kill criterion CLEARED.
+The prerequisite implementation described above was built as `COLI_V4_MOE_BATCHED` (default OFF,
+with `COLI_V4_MOE_BATCHED_MIN_N` default 4). It does exactly what this section asked for: gather all
+rows routed to expert E within a layer-chunk and issue ONE S=N dispatch.
+
+Measured against the criterion **as written** (Metal {off, on} end-to-end, ab.sh TTFT):
+**42.528 -> 31.975 s on p064 = 1.330x**, and 109.575 -> 83.221 s on p256 = 1.317x. **>= 1.15x, so the
+GPU lane stays open.**
+
+Do not confuse that with the *incremental* of batching alone on top of the already-Metal attention
+lane, which is **1.121x / 1.133x** (p064 / p256). Both numbers are real; they answer different
+questions, and this file's criterion asks the first one.
+
+Corrections to this section's premises, now that it has been measured:
+- "unified memory gives the GPU no bandwidth edge on a bandwidth-bound workload" — the workload is
+  NOT bandwidth-bound at the MoE matmul: E81 showed cache size is irrelevant (96 -> 64 GB moved
+  nothing) and MoE runs at 2.28 GB/s against a 6.83 GB/s disk, i.e. compute-bound.
+- "isolated matmuls hit 7.26x at batch-8 ... unreachable through this seam" — reachable after all,
+  but the realised in-situ figure is far lower. Measured CPU/GPU at production dims: S=1 **0.40x**,
+  S=2 **0.73x**, S=4 **1.68-2.41x**, S=16 **4.4x**. The GPU LOSES below S=4, which is why the
+  implementation gates on a minimum group size.
+- Independent confirmation: upstream PR #763 lifted a Metal attention `S<=4` cap for prefill on the
+  older engine and reported prefill attention 35.9s -> 9.0s. Same lesson, arrived at separately.
+
 ---
 
 ## 8. Deferred, with reasons
@@ -278,6 +302,9 @@ slower; diminishing returns are established, so the batching change is the last 
 | **`COLI_V4_EXPERT_PREFETCH` (decode)** | conclusively **null**: −0.6 % cold / +0.2 % warm over 16 rows, 0 gate failures. Settled. |
 | **Deep-queue / QD expert reads** | **GATE A: STOP.** QD8/QD1 = **1.34x** against a >= 2x bar; the device saturates at QD4 (7.028 GB/s). No design survives that. |
 | **`--ram 110+`** | ~120 GB total on a 137 GB host; guaranteed compression per §0.3. |
+| **Upstream PR #1024 (FUSED3 expert matmul)** | #1024 (FUSED3, "40% less matmul time") is the tempting one — but it's `#if defined(__AVX2__)` with no NEON variant. x86 only. |
+| **Upstream PR #934 (ARM NEON matmul_e8)** | #934 is ARM NEON but only `fmt=6 E8/IQ3`, not our MXFP4. |
+| **Upstream PR #1017 (`coli_v4_route_bf16` in `moe_token`)** | #1017 helps `moe_token` — the single-token decode path, which our TTFT metric excludes by construction. |
 
 ---
 

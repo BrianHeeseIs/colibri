@@ -302,3 +302,52 @@ Wrap the two new static getters in `#ifdef COLI_V4_METAL_SEAM` (they are unused 
 repo disables -Wunused-function so it does not warn today, but strict builds would).
 DEFERRED: **must not rebuild while M2 is running** — swapping c/deepseek_v4 mid-run would corrupt the
 in-flight measurement. Apply after M2 completes, then re-verify golden.
+
+## UPSTREAM/FORK SURVEY — RANKED ADOPTION PLAN
+
+### CORRECTION to an earlier claim in this notepad
+I wrote "upstream has NEVER touched Metal". **Wrong.** Upstream has `c/backend_metal.mm` (no _v4)
+for the OLDER colibri/inkling engines — PRs #72 (Metal backend), #763, #757. What IS unique to us is
+`c/backend_metal_v4.mm`, the **V4-specific** Metal backend. Upstream has no Metal for deepseek_v4.
+
+### TIER 1 — adopt now (cherry-picks CLEAN, verified locally)
+| commit | gain | note |
+|---|---|---|
+| `8c40fbd` max_tokens is a ceiling, clamp to context | fixes CONTEXT_EXCEEDED **in the engine** | supersedes the client-side clamp I put in the web bridge; engine knows the exact prompt count |
+| `a20c7aa` skip OMP spin-wait tuning on macOS (=PR #957, issue #707) | issue #707 reports a **2.2x decode regression** on macOS from this | our exact platform |
+| `1684e89` size the OpenMP team around the expert loaders | thread/loader balance | pairs with the loader pool |
+
+### TIER 2 — high value, needs manual port (cherry-pick CONFLICTS)
+| item | evidence | why |
+|---|---|---|
+| **issue #900** hot rows16 pack under `state->mutex` | #900: **6.87 s extra TTFT, 5.70 s of it lock-held**, +~1.2 s from the block_rows=16 path | **WE CARRY THIS BUG** — verified: `hot_pack_slot_locked` :7793 (comment: "state->mutex is held"), called :7911/:8084; `hot_pack_matrix` does pack_rows16 + 2 full memcpys x gate/down/up (~12.6 MB) under the global mutex. 0 matches for the fix. AUTOPIN is on by default so it fires. **Highest-value single item found.** |
+| PR **#983** (preferred) vs **#1023** | #983 adds per-slot pack mutexes, defers in-place rows16 conversion to an exclusive lease, ships a regression test; #1023 is a smaller prepare/commit split | librarian verdict: #983 more correct, #1023 smaller surface |
+| `48db957` expert-loader pool, runtime-tunable depth | disk N+lanes overlaps CPU expert N | conflicts in deepseek_v4.c |
+| `7b50437` + `b78431f` dashboard telemetry (EMAP/HITS/TIERS/PROF/HWINFO + `matmul_sec`) | issue #890 was "100% other" because matmul was never timed | the real contract for the web UI I hand-rolled |
+
+### TIER 3 — technique transfer only (different engine or arch)
+- PR **#763** lifts the Metal attention `S<=4` cap for prefill (`COLI_METAL_PREFILL=1`):
+  prefill attention **35.9s -> 9.0s**, prefill wall **96.4s -> 67.3s**. OLD engine, but the S-cap
+  lesson is exactly our S>=4 batching finding, independently confirmed.
+- PR **#757** overlap shared experts with the GPU round: decode 1.75 -> 2.46 tok/s, prefill 10.3 -> 6.4 s.
+- Issue **#428** Metal fused-decode `r_top8` first: +6.7%, identical output.
+- Issue **#250** proposes Apple **AMX** for dynamic expert matmul (closed, unimplemented).
+
+### NOT APPLICABLE
+- PR **#1024** FUSED3 AVX2 expert matmul (40% less matmul time, 2.08->2.38 tok/s): guarded
+  `#if defined(__AVX2__)`, **no ARM/NEON variant**. x86 only.
+- PR **#934** ARM NEON `matmul_e8` — arm64 but `fmt=6 E8/IQ3` only, no MXFP4/e2m1.
+- PR **#1017** `coli_v4_route_bf16` in `moe_token` — single-token path only; our metric excludes decode.
+- CUDA PRs (#935/#936/#1031), #964 backend registry (architectural, not perf).
+
+### FORKS — mostly mirrors
+Sampled newest 1000 forks. Only 5 have real divergence: `simsim314` (GGUF+scheduler, +12),
+`gohlerdev/BetterColibri` (+48, io_uring, TC_INT4), `slimedragonair` (Vulkan expert cache, +34),
+`oncoapop` (Vulkan staged upload, +6), `cloudQuant` (+2, V4 serving).
+**No substantive Apple-GPU fork.** `codearranger/colibri:metal-backend` is the only verified Metal
+fork and it is the OLD-engine backend already merged upstream as PR #72.
+
+### Apple Silicon datapoints for context (decode tok/s)
+M3 Max 128GB 0.35-0.45 (#47) | M4 Pro Metal 0.30 (#107) | M3 Ultra 1.45 @82% hit (#180) |
+M5 Max Metal 1.83 (#87) | M5 Max 2.06 (#103).
+**Our M3 Max measured 1.52-1.56 tok/s decode** via the REPL — competitive with M5 Max numbers.
