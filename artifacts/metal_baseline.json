@@ -1,0 +1,10 @@
+{
+  "binary_md5": "2e8dbbb521d9954af5bc970ff8f9d2d3",
+  "commit": "38711e79be0772fc7da00a2100b8e473278a183e",
+  "p064_median_s": 43.617,
+  "p256_median_s": 111.683,
+  "golden_md5": "5d04890413ff539e802985ce8c727814",
+  "nonengine_gb": 15.636,
+  "compressor_gb": 0.218,
+  "date": "2026-08-15T01:38:59Z"
+}

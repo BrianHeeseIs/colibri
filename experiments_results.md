@@ -2906,3 +2906,48 @@ produced a wrong answer if stopped early:
    49.94 % failure mode.
 4. E66c located the true threshold (product underflow at ~1e-22 inputs, not denormal inputs).
 5. E66d measured the real margin as 7.9e28x -> **actually fine**.
+
+---
+
+## E67. T0 baseline re-pinned against the current binary (skeptical re-verification pass)
+
+The todo list was challenged for completion, so every T-1 claim was re-verified **against the
+current binary rather than trusting earlier runs** — the binary had changed four times since E61
+(grouped MoE, `MOE_GROUPED_DUMP`, `ATTN_STATS` x2, the fp8 min-product tracker), which made every
+prior verification stale.
+
+### Re-verification vs binary `2e8dbbb5`
+
+| check | result |
+|---|---|
+| branch `ft-metal-new-arch` @ `38711e7`, tracking `fork/` | ok |
+| `validation/moe/test_group.c` (4 subtests, mutation-verified) | **4/4 PASS** |
+| golden, grouped **OFF** | `PASS golden md5=5d04890413ff539e802985ce8c727814` |
+| golden, grouped **ON** | **same md5 — still bit-exact** |
+| K0 gate | overhead **9.70 %** < 16.7 %, `moe_groups=5073`, `moe_wave_fallbacks=0` — **PASS** |
+
+The grouped-MoE result survives every binary change: still bit-exact, still inside the K0 gate,
+still executing 5073 real expert groups (not silently falling back).
+
+### T0 — the one task genuinely outstanding
+`artifacts/metal_baseline.json` had never been written. Pinned now against the **current** binary
+(the todo's `f93118b1` was itself stale):
+
+```json
+{ "binary_md5": "2e8dbbb521d9954af5bc970ff8f9d2d3",
+  "commit": "38711e79be0772fc7da00a2100b8e473278a183e",
+  "p064_median_s": 43.617, "p256_median_s": 111.683,
+  "golden_md5": "5d04890413ff539e802985ce8c727814",
+  "nonengine_gb": 15.636, "compressor_gb": 0.218 }
+```
+p064 43.617 s (sd 0.257, n=3), p256 111.683 s (sd 1.073, n=3), golden gated before timing.
+
+### Two notes worth carrying
+1. **The new pin differs from the old one** (p064 43.554 -> 43.617, **p256 113.735 -> 111.683,
+   -1.80 %**). Different binary, different session — **not** a regression. E57 measured a **29.5 %**
+   swing from ambient load alone on identical config, and E56 showed that diffing against a
+   stale pin inflated a result **1.73x**. This baseline is for provenance, **never** for computing
+   a delta: every A/B must stay interleaved.
+2. `pin_baseline.sh` logs `WROTE artifacts/baseline.md` but its preserve/restore logic leaves the
+   tracked file unchanged. Defensively correct (no clobbering of a tracked artifact) but the log
+   line is misleading; the fresh numbers live in `metal_baseline.json` only.
