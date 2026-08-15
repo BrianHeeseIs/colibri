@@ -2621,3 +2621,64 @@ Decoupling the MoE batch from the attention chunk (notepad F19) is **worth ~1.48
 cost and needs no change to any of the seven batch-cap sites** — attention keeps its 64-token chunk,
 its recurrent compressor and its causal KV ring untouched. It is the highest-value next change in
 the MoE lane, and it is now backed by measurement rather than a model.
+
+---
+
+## E63. B3 prefill-attention attribution — **the dense projections are 41.8 % of attention, and the lane clears the gate**
+
+E59 measured the four dense attention projections at **6.0x GPU-favorable** but estimated them at
+only 24 % of the attention block, giving 1.07x — below the gate. It flagged the other ~11 s as the
+decisive unknown. This measures it.
+
+### First: the existing profiler could not answer this
+`COLI_V4_PROFILE` already defines `attn_qkv / attn_sparse / attn_kv_assembly / attn_out /
+compressor / indexer / rope`. Running it returned **all zeros with `calls=0`** — those
+`profile_add` sites are at `:1947-2097`, inside the **single-token decode** path. The **batched
+prefill attention** function has none. So B3 required new instrumentation
+(`COLI_V4_ATTN_STATS=1`, measurement-only, default path re-verified at
+`PASS golden md5=5d04890413ff539e802985ce8c727814`).
+
+### Result — p064, 86 attention calls
+
+```
+attn_total_ms   = 14545.1     <- E54 independently measured 14.4 s. CROSS-VALIDATED.
+attn_parts_ms   = 10674.2
+attn_residual   =  3870.9  (26.61 %)
+```
+
+| stage | ms | % of attention | batchable? |
+|---|---|---|---|
+| `proj_out` (wo_b) | 2683.9 | 18.45 % | **yes** (E59: 7.56x) |
+| `proj_wq_b` | 2626.3 | 18.06 % | **yes** (E59: 6.90x) |
+| `sparse_core` | 2512.4 | 17.27 % | no — per item |
+| `compressor_indexer` | 2060.2 | 14.16 % | **no — recurrent** |
+| `proj_wq_a` | 476.4 | 3.28 % | **yes** (E59: 3.26x) |
+| `proj_wkv` | 298.0 | 2.05 % | **yes** (E59: 4.42x) |
+| `rope` | 17.0 | 0.12 % | — |
+| **residual** | **3870.9** | **26.61 %** | unattributed |
+
+**Dense projections total 6.085 s = 41.8 % of attention = 13.4 % of the prefill wall** — not the
+24 % / 7.8 % E59 estimated. E59's probe under-counted because `coli_fp8_matmul_batch_ref` performs
+**per-token fp8 QDQ inside itself** (`:12336-12342`), which the standalone probe omitted.
+
+### What the lane is worth
+
+| GPU speedup on projections | saves | full-prefill |
+|---|---|---|
+| 3.26x (worst single shape) | 4.22 s | 1.102x |
+| **6.00x (E59 measured aggregate)** | **5.07 s** | **1.126x** |
+| 7.56x (best single shape) | 5.28 s | 1.132x |
+
+**At the measured 6.0x the projections alone give 1.126x, which clears the plan's 1.12x gate** —
+without touching `sparse_core` at all. And this is a *different* part of the wall from the MoE lane
+already shipping 1.043x (E61), so they should compose (upper bound ~1.17x — **to be measured, not
+assumed**; E57 is the standing lesson on multiplying independent-looking deltas).
+
+### Two honest limitations
+1. **Residual is 26.61 %.** E54 closed its attribution to a **1.55 %** residual; 26.6 % is too
+   coarse to call finished. Unmeasured inside it: qnorm, KV assembly, the second RoPE apply, the
+   per-group `wo_a` matmul, and allocation churn (the function `calloc`s ~9 buffers per call, 86
+   times). Some of that residual may itself be cheap to remove.
+2. **`compressor_indexer` = 14.16 % is recurrent** (`:2651` carries `kv_state`/`score_state`) and
+   `sparse_core` = 17.27 % is per-item behind a causal KV-ring dependency (`:2694`). Together
+   **31.4 % of attention is structurally hard to batch** — that part of E59's worry was justified.

@@ -2540,6 +2540,48 @@ int coli_v4_attention_window_token_ref(
 #undef coli_v4_attention_token_ref
 #undef coli_v4_attention_window_token_ref
 
+extern uint64_t coli_v4_profile_now_ns(void);
+/* ---- B3: PREFILL attention attribution (measurement only, COLI_V4_ATTN_STATS=1) ----
+ * The existing COLI_V4_PROFILE attn_* stages instrument only the SINGLE-TOKEN decode path
+ * (:1947-2097); the batched prefill attention below has none. E54 measured attention at 33.18%
+ * of the prefill wall and E59 showed the four dense projections are only ~24% of that block,
+ * leaving ~11 s unexplained. This attributes it. */
+static uint64_t coli_v4_attn_ns[8];
+static uint64_t coli_v4_attn_calls;
+static int coli_v4_attn_stats_value = -1;
+static int coli_v4_attn_stats_enabled(void) {
+    if (coli_v4_attn_stats_value < 0) {
+        const char *v = getenv("COLI_V4_ATTN_STATS");
+        coli_v4_attn_stats_value = (v && *v && atoi(v) != 0) ? 1 : 0;
+    }
+    return coli_v4_attn_stats_value;
+}
+void coli_v4_attn_report(void);
+void coli_v4_attn_report(void) {
+    if (!coli_v4_attn_stats_enabled()) return;
+    static const char *nm[8] = { "proj_wq_a", "compressor_indexer", "TOTAL_attention", "proj_wq_b",
+                                 "proj_wkv", "rope", "sparse_core", "proj_out" };
+    uint64_t tot = __atomic_load_n(&coli_v4_attn_ns[2], __ATOMIC_RELAXED); /* TOTAL */
+    uint64_t parts = 0;
+    for (int i = 0; i < 8; i++)
+        if (i != 2) parts += __atomic_load_n(&coli_v4_attn_ns[i], __ATOMIC_RELAXED);
+    fprintf(stderr, "attn_calls=%llu attn_total_ms=%.3f attn_parts_ms=%.3f "
+            "attn_residual_ms=%.3f residual_pct=%.2f\n",
+            (unsigned long long)__atomic_load_n(&coli_v4_attn_calls, __ATOMIC_RELAXED),
+            (double)tot / 1e6, (double)parts / 1e6,
+            (double)(tot - parts) / 1e6,
+            tot ? 100.0 * (double)(tot - parts) / (double)tot : 0.0);
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = __atomic_load_n(&coli_v4_attn_ns[i], __ATOMIC_RELAXED);
+        fprintf(stderr, "attn_stage %-20s ms=%10.3f pct=%6.2f\n",
+                nm[i], (double)v / 1e6, tot ? 100.0 * (double)v / (double)tot : 0.0);
+    }
+}
+#define ATT0() (coli_v4_attn_stats_enabled() ? coli_v4_profile_now_ns() : 0)
+#define ATADD(slot, t0) do { if (coli_v4_attn_stats_enabled()) \
+    __atomic_fetch_add(&coli_v4_attn_ns[(slot)], coli_v4_profile_now_ns() - (t0), \
+                       __ATOMIC_RELAXED); } while (0)
+
 #include "deepseek_v4_internal.h"
 #include "native_quant_batch.h"
 
@@ -2551,6 +2593,7 @@ int coli_v4_attention_window_batch_ref(
     if (!outputs || !state || !weights || !config || !inputs ||
         start_position < 0 || batch < 1 || batch > 64)
         return set_error(error, error_size, "invalid batched attention arguments");
+    uint64_t atot0 = ATT0();
     int hidden = config->hidden_size, heads = config->num_attention_heads;
     int head_dim = config->head_dim, rope_dim = config->qk_rope_head_dim;
     int q_rank = config->q_lora_rank, groups = config->o_groups;
@@ -2589,7 +2632,10 @@ int coli_v4_attention_window_batch_ref(
         return set_error(error, error_size, "out of memory in batched attention");
     }
 
+    uint64_t at0 = ATT0();
     int result = coli_fp8_matmul_batch_ref(qa, &wq_a, inputs, batch);
+    ATADD(0, at0);
+    __atomic_fetch_add(&coli_v4_attn_calls, 1, __ATOMIC_RELAXED);
     if (!result) coli_bf16_round_array(qa, (size_t)batch * q_rank);
     const void *raw_q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!raw_q_norm || decode_bf16(norm, raw_q_norm, q_rank))) result = -1;
@@ -2600,6 +2646,7 @@ int coli_v4_attention_window_batch_ref(
         if (!result) coli_bf16_round_array(item_qa, (size_t)q_rank);
     }
 
+    uint64_t ac0 = ATT0();
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
         if (weights->plan.compression_ratio) {
@@ -2628,8 +2675,11 @@ int coli_v4_attention_window_batch_ref(
             }
         }
     }
+    ATADD(1, ac0);   /* compressor + indexer, per item */
 
+    at0 = ATT0();
     if (!result) result = coli_fp8_matmul_batch_ref(q, &wq_b, qa, batch);
+    ATADD(3, at0);
     if (!result) coli_bf16_round_array(q, (size_t)batch * q_width);
     for (int item = 0; !result && item < batch; item++)
         for (int head = 0; head < heads; head++) {
@@ -2641,7 +2691,9 @@ int coli_v4_attention_window_batch_ref(
                 values[i] = coli_bf16_round(values[i] * scale);
         }
 
+    at0 = ATT0();
     if (!result) result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
+    ATADD(4, at0);
     if (!result) coli_bf16_round_array(kv, (size_t)batch * head_dim);
     const void *raw_kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!raw_kv_norm || decode_bf16(norm, raw_kv_norm, head_dim))) result = -1;
@@ -2653,6 +2705,7 @@ int coli_v4_attention_window_batch_ref(
     }
 
     int compressed = weights->plan.compression_ratio != 0;
+    at0 = ATT0();
     if (!result) result = coli_v4_rope_precompute(
         cosines, sines, rope_dim, end_position,
         compressed ? config->original_max_position_embeddings : 0,
@@ -2685,6 +2738,7 @@ int coli_v4_attention_window_batch_ref(
     }
 
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
+    ATADD(5, at0);   /* rope precompute + both apply loops */
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
         float *item_kv = kv + (size_t)item * head_dim;
@@ -2724,9 +2778,11 @@ int coli_v4_attention_window_batch_ref(
                     ? compressed_indices[(size_t)item * config->index_topk + i] : i;
                 indices[state->window_size + i] = state->window_size + ordinal;
             }
+            uint64_t ct0 = ATT0();
             result = coli_v4_sparse_attention_ref(
                 item_attended, item_q, values, sinks, indices, heads, head_dim,
                 kv_count, topk, 1.0f / sqrtf((float)head_dim));
+            ATADD(6, ct0);
         }
         free(all_kv); free(indices);
         const float *item_cos = cosines + (size_t)position * rope_pairs;
@@ -2769,9 +2825,12 @@ int coli_v4_attention_window_batch_ref(
                    (size_t)o_rank * sizeof(*oa));
     }
     if (!result) coli_bf16_round_array(oa, (size_t)batch * oa_width);
+    at0 = ATT0();
     if (!result) result = coli_fp8_matmul_batch_ref(outputs, &wo_b, oa, batch);
+    ATADD(7, at0);
     if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
 
+    ATADD(2, atot0);   /* TOTAL attention; residual = TOTAL - sum(other slots) */
     free(group_outputs); free(group_inputs); free(sines); free(cosines);
     free(compressed_indices); free(compressed_counts); free(selected_counts);
     free(norm); free(oa); free(attended); free(kv); free(q); free(qa);
@@ -10534,6 +10593,7 @@ static void v4_metal_stats_emit(void) {
     const char *enabled = getenv("COLI_V4_METAL_STATS");
     if (enabled && !strcmp(enabled, "1"))
         fprintf(stderr, "metal_dispatches=%lu\n", coli_v4_metal_dispatches());
+    { extern void coli_v4_attn_report(void); coli_v4_attn_report(); }
     const char *profile = getenv("COLI_V4_METAL_PROFILE");
     if (profile && !strcmp(profile, "1")) coli_v4_metal_profile_report();
 #endif
