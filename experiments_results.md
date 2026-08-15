@@ -3271,3 +3271,49 @@ term to double-count.
   `dispatch_wait` at 98.9 % of the Metal path across 1031 calls. Amortising that per-call blocking
   round trip is the next lever, and `wo_a` alone accounts for **8 of every 12 dispatches**
   (one per output group) — batching those into a single dispatch is the concrete target.
+
+---
+
+## E73. A5 killed before implementation — **the per-call round trip is only 3 % of the cost**
+
+E70/E71 both closed by naming "amortise the per-call blocking round trip" as the next lever, since
+`dispatch_wait` is 98.9 % of the Metal path across 1031 calls. Before restructuring anything I
+measured the fixed cost of a round trip, per the rule this project earned the hard way — *attribute
+before proposing a mechanism* (E48/E52/E53/E54 each died for skipping it).
+
+```
+empty dispatch + blocking wait = 0.176 ms   (n=2000, warmed, fast-math off)
+```
+
+### The arithmetic kills the plan
+
+| | ms | share of `dispatch_wait` |
+|---|---|---|
+| total `dispatch_wait` | 3586 | 100 % |
+| fixed round-trip cost (1031 x 0.176) | **181** | **5.1 %** |
+| **real kernel execution** | **3405** | **94.9 %** |
+
+The specific A5 proposal — batching `wo_a`'s 8 per-group dispatches into 1 — would eliminate
+`7 x 43 x 2 = 602` round trips, worth **106 ms, i.e. 3.0 %** of `dispatch_wait` and ~0.3 % of the
+prefill wall. **Not worth a restructure.** Hypothesis discarded on evidence, at the cost of one
+30-second probe rather than a day of work.
+
+### So why do the projections run 1.97x when the kernel measures 3.09x?
+Not overhead — **shape and batch mix**:
+- A2 measured 3.09x at **S=64 only**. p064 runs two chunks: **S=64 and S=6**.
+- The GPU is much weaker at small S (A2 worst shape 2.11x even at S=64; E59 showed the GPU
+  *losing* outright at S=1).
+- `wo_a` compounds this: 8 separate **small** matmuls per layer-chunk instead of one large one.
+
+**Testable prediction, already consistent with observation:** longer prompts contain
+proportionally more full-size chunks, so the lane should perform *better* on them — measured
+**p064 1.107x < p256 1.135x**. The same mechanism explains why this is the only optimisation here
+that strengthens with length.
+
+### Revised next levers (in value order, none yet measured)
+1. **Raise the attention chunk cap above 64** so more work runs at large S. This is the same
+   `N`-is-the-bottleneck conclusion E60 reached for MoE, arriving independently from the attention
+   side — but it must respect the seven cap sites and the `__m256 sums[64]` stack hazard (`:12355`).
+2. **Fold the 8 `wo_a` groups into one large matmul** — valuable for *shape* (one big GEMM instead
+   of 8 small ones), **not** for the round-trip saving, which this experiment just showed is 3 %.
+3. Move the fp8 QDQ (1273.5 ms, 17 % of projections) onto the GPU.
