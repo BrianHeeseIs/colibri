@@ -17,6 +17,11 @@ void coli_v4_metal_unregister_slab(void *base);
 int coli_v4_metal_expert_forward(float *out, const ColiExpertView *expert,
                                  const float *input, float route_weight,
                                  float swiglu_limit);
+int coli_v4_metal_expert_forward_batch(float *outs,
+                                       const ColiExpertView *expert,
+                                       const float *inputs_gathered,
+                                       const float *route_weights, int batch,
+                                       float swiglu_limit);
 
 /* ---- Bit-exact batched fp8 matmul (attention projections) ----------------------------
  * Mirrors quant.h matmul_fp8 exactly: float accumulation within each 128-column block,

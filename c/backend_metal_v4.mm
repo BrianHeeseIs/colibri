@@ -28,6 +28,7 @@ static id<MTLLibrary> coli_v4_library;
 static id<MTLComputePipelineState> coli_v4_probe_pipeline;
 static id<MTLComputePipelineState> coli_v4_qdq_pipeline;
 static id<MTLComputePipelineState> coli_v4_matmul_pipeline;
+static id<MTLComputePipelineState> coli_v4_matmul_hot_pipeline;
 static id<MTLComputePipelineState> coli_v4_bf16_pipeline;
 static id<MTLComputePipelineState> coli_v4_swiglu_pipeline;
 static id<MTLComputePipelineState> coli_v4_weighted_pipeline;
@@ -284,14 +285,14 @@ static id<MTLBuffer> coli_v4_ensure_scratch(id<MTLBuffer> buffer,
     return replacement;
 }
 
-static int coli_v4_ordered_cold_tensor_valid(const ColiTensorView *tensor,
-                                             int rows, int columns,
-                                             size_t row_bytes,
-                                             size_t groups) {
+static int coli_v4_ordered_tensor_valid(const ColiTensorView *tensor,
+                                        int rows, int columns,
+                                        size_t row_bytes, size_t groups,
+                                        uint32_t block_rows) {
     return tensor && tensor->format == COLI_TENSOR_FP4_NATIVE_BLOCK &&
            tensor->scale_format == COLI_SCALE_UE8M0 && tensor->data &&
            tensor->scales && tensor->rows == rows &&
-           tensor->columns == columns && tensor->block_rows == 1 &&
+           tensor->columns == columns && tensor->block_rows == block_rows &&
            tensor->block_columns == 32 &&
            tensor->data_bytes == (size_t)rows * row_bytes &&
            tensor->scale_bytes == (size_t)rows * groups;
@@ -299,9 +300,9 @@ static int coli_v4_ordered_cold_tensor_valid(const ColiTensorView *tensor,
 
 static void coli_v4_record_layout_mismatches(
     const ColiTensorView *tensor, int rows, int columns, size_t row_bytes,
-    size_t groups, ColiV4MetalTensor tensor_kind) {
-    if (coli_v4_ordered_cold_tensor_valid(tensor, rows, columns,
-                                          row_bytes, groups)) return;
+    size_t groups, uint32_t block_rows, ColiV4MetalTensor tensor_kind) {
+    if (coli_v4_ordered_tensor_valid(tensor, rows, columns, row_bytes, groups,
+                                     block_rows)) return;
     atomic_fetch_add_explicit(&coli_v4_metal_layout_tensors[tensor_kind], 1,
                               memory_order_relaxed);
     if (!tensor) {
@@ -330,7 +331,7 @@ static void coli_v4_record_layout_mismatches(
     COLI_V4_LAYOUT_MISMATCH(COLI_V4_METAL_LAYOUT_GROUPS,
                             tensor->scale_bytes != (size_t)rows * groups);
     COLI_V4_LAYOUT_MISMATCH(COLI_V4_METAL_LAYOUT_BLOCK_DIMS,
-                            tensor->block_rows != 1 ||
+                            tensor->block_rows != block_rows ||
                             tensor->block_columns != 32);
 #undef COLI_V4_LAYOUT_MISMATCH
 }
@@ -364,16 +365,21 @@ static id<MTLComputePipelineState> coli_v4_get_named_pipeline(const char *name) 
                     : nil;
 }
 
-static int coli_v4_get_chain_pipelines(void) {
+static int coli_v4_get_chain_pipelines(uint32_t block_rows,
+                                       id<MTLComputePipelineState> *matmul) {
     if (!coli_v4_qdq_pipeline) coli_v4_qdq_pipeline = coli_v4_get_named_pipeline("coli_v4_fp8_qdq");
-    if (!coli_v4_matmul_pipeline) coli_v4_matmul_pipeline = coli_v4_get_named_pipeline("coli_v4_matmul_mxfp4_ordered_xcache");
+    if (block_rows == 1 && !coli_v4_matmul_pipeline)
+        coli_v4_matmul_pipeline = coli_v4_get_named_pipeline("coli_v4_matmul_mxfp4_ordered_xcache");
+    if (block_rows == 16 && !coli_v4_matmul_hot_pipeline)
+        coli_v4_matmul_hot_pipeline = coli_v4_get_named_pipeline("coli_v4_matmul_mxfp4_ordered_hot_xcache");
     if (!coli_v4_bf16_pipeline) coli_v4_bf16_pipeline = coli_v4_get_named_pipeline("coli_v4_bf16_round_array");
     if (!coli_v4_swiglu_pipeline) coli_v4_swiglu_pipeline = coli_v4_get_named_pipeline("coli_v4_swiglu");
     if (!coli_v4_weighted_pipeline) coli_v4_weighted_pipeline = coli_v4_get_named_pipeline("coli_v4_weighted_bf16");
-    return coli_v4_qdq_pipeline && coli_v4_matmul_pipeline && coli_v4_bf16_pipeline &&
+    *matmul = block_rows == 16 ? coli_v4_matmul_hot_pipeline : coli_v4_matmul_pipeline;
+    return coli_v4_qdq_pipeline && *matmul && coli_v4_bf16_pipeline &&
            coli_v4_swiglu_pipeline && coli_v4_weighted_pipeline &&
-           coli_v4_matmul_pipeline.maxTotalThreadsPerThreadgroup >= COLI_V4_MOE_THREADS &&
-           coli_v4_matmul_pipeline.staticThreadgroupMemoryLength <= coli_v4_device.maxThreadgroupMemoryLength;
+           (*matmul).maxTotalThreadsPerThreadgroup >= COLI_V4_MOE_THREADS &&
+           (*matmul).staticThreadgroupMemoryLength <= coli_v4_device.maxThreadgroupMemoryLength;
 }
 
 __attribute__((constructor)) static void coli_v4_metal_read_environment(void) {
@@ -655,10 +661,11 @@ COLI_V4_METAL_EXTERN unsigned long coli_v4_metal_fp8_upload_bytes(void) {
     return atomic_load_explicit(&coli_v4_fp8_upload_bytes, memory_order_relaxed);
 }
 
-COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
-    float *out, const ColiExpertView *expert, const float *input,
-    float route_weight, float swiglu_limit) {
-    if (!out || !expert || !input || swiglu_limit < 0.0f ||
+COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward_batch(
+    float *outs, const ColiExpertView *expert, const float *inputs_gathered,
+    const float *route_weights, int batch, float swiglu_limit) {
+    if (!outs || !expert || !inputs_gathered || !route_weights || batch < 1 ||
+        swiglu_limit < 0.0f ||
         coli_v4_metal_variant() != 0) {
         coli_v4_metal_reject(COLI_V4_METAL_REJECT_VARIANT);
         return -1;
@@ -691,49 +698,52 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
     const size_t gate_groups = ((size_t)hidden + 31) / 32;
     const size_t down_row_bytes = ((size_t)intermediate + 1) / 2;
     const size_t down_groups = ((size_t)intermediate + 31) / 32;
-    if (!coli_v4_ordered_cold_tensor_valid(&expert->gate, intermediate,
-                                           hidden, gate_row_bytes,
-                                           gate_groups) ||
-        !coli_v4_ordered_cold_tensor_valid(&expert->up, intermediate,
-                                           hidden, gate_row_bytes,
-                                           gate_groups) ||
-        !coli_v4_ordered_cold_tensor_valid(&expert->down, hidden,
-                                           intermediate, down_row_bytes,
-                                           down_groups)) {
+    const uint32_t block_rows = expert->gate.block_rows;
+    if ((block_rows != 1 && block_rows != 16) ||
+        !coli_v4_ordered_tensor_valid(&expert->gate, intermediate, hidden,
+                                      gate_row_bytes, gate_groups, block_rows) ||
+        !coli_v4_ordered_tensor_valid(&expert->up, intermediate, hidden,
+                                      gate_row_bytes, gate_groups, block_rows) ||
+        !coli_v4_ordered_tensor_valid(&expert->down, hidden, intermediate,
+                                      down_row_bytes, down_groups, block_rows)) {
         if (coli_v4_metal_stats_enabled_value) {
             coli_v4_record_layout_mismatches(
                 &expert->gate, intermediate, hidden, gate_row_bytes,
-                gate_groups, COLI_V4_METAL_TENSOR_GATE);
+                gate_groups, block_rows, COLI_V4_METAL_TENSOR_GATE);
             coli_v4_record_layout_mismatches(
                 &expert->up, intermediate, hidden, gate_row_bytes,
-                gate_groups, COLI_V4_METAL_TENSOR_UP);
+                gate_groups, block_rows, COLI_V4_METAL_TENSOR_UP);
             coli_v4_record_layout_mismatches(
                 &expert->down, hidden, intermediate, down_row_bytes,
-                down_groups, COLI_V4_METAL_TENSOR_DOWN);
+                down_groups, block_rows, COLI_V4_METAL_TENSOR_DOWN);
         }
         coli_v4_metal_reject(COLI_V4_METAL_REJECT_LAYOUT);
         return -1;
     }
 
-    if (!coli_v4_get_chain_pipelines()) {
+    id<MTLComputePipelineState> matmul_pipeline = nil;
+    if (!coli_v4_get_chain_pipelines(block_rows, &matmul_pipeline)) {
         coli_v4_metal_reject(COLI_V4_METAL_REJECT_PIPELINES);
         return -1;
     }
 
     @autoreleasepool {
-        const size_t input_bytes = (size_t)hidden * sizeof(*input);
-        const size_t output_bytes = (size_t)hidden * sizeof(*out);
+        const size_t input_bytes = (size_t)batch * hidden * sizeof(*inputs_gathered);
+        const size_t output_bytes = (size_t)batch * hidden * sizeof(*outs);
         const size_t gate_q4_bytes = expert->gate.data_bytes;
         const size_t gate_scales_bytes = expert->gate.scale_bytes;
         const size_t up_q4_bytes = expert->up.data_bytes;
         const size_t up_scales_bytes = expert->up.scale_bytes;
         const size_t down_q4_bytes = expert->down.data_bytes;
         const size_t down_scales_bytes = expert->down.scale_bytes;
-        const size_t intermediate_bytes = (size_t)intermediate * sizeof(float);
+        const size_t intermediate_bytes =
+            (size_t)batch * intermediate * sizeof(float);
         const size_t input_scale_bytes =
-            ((size_t)hidden + COLI_V4_MOE_FP8_BLOCK - 1) / COLI_V4_MOE_FP8_BLOCK;
+            (size_t)batch * (((size_t)hidden + COLI_V4_MOE_FP8_BLOCK - 1) /
+                             COLI_V4_MOE_FP8_BLOCK);
         const size_t down_input_scale_bytes =
-            ((size_t)intermediate + COLI_V4_MOE_FP8_BLOCK - 1) / COLI_V4_MOE_FP8_BLOCK;
+            (size_t)batch * (((size_t)intermediate + COLI_V4_MOE_FP8_BLOCK - 1) /
+                             COLI_V4_MOE_FP8_BLOCK);
 
         coli_v4_input_scratch = coli_v4_ensure_scratch(
             coli_v4_input_scratch, &coli_v4_input_scratch_capacity,
@@ -792,7 +802,7 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
             !coli_v4_up_scales_scratch.contents ||
             !coli_v4_down_q4_scratch.contents ||
             !coli_v4_down_scales_scratch.contents || !coli_v4_output_scratch.contents) return -1;
-        memcpy(coli_v4_input_scratch.contents, input, input_bytes);
+        memcpy(coli_v4_input_scratch.contents, inputs_gathered, input_bytes);
         double copy_began = coli_v4_profile_now();
         size_t gate_q4_offset = 0, gate_scales_offset = 0;
         size_t up_q4_offset = 0, up_scales_offset = 0;
@@ -819,16 +829,15 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         id<MTLComputeCommandEncoder> encoder = command_buffer
             ? [command_buffer computeCommandEncoder] : nil;
         if (!encoder) return -1;
-        const ColiV4QdqParams input_qdq_params = { hidden, COLI_V4_MOE_FP8_BLOCK };
-        const ColiV4QdqParams down_qdq_params = { intermediate, COLI_V4_MOE_FP8_BLOCK };
-        const ColiV4MatmulDims gate_dims = { 1, hidden, intermediate,
+        const ColiV4QdqParams input_qdq_params = { batch * hidden, COLI_V4_MOE_FP8_BLOCK };
+        const ColiV4QdqParams down_qdq_params = { batch * intermediate, COLI_V4_MOE_FP8_BLOCK };
+        const ColiV4MatmulDims gate_dims = { batch, hidden, intermediate,
                                               (int)gate_row_bytes, (int)gate_groups };
-        const ColiV4MatmulDims down_dims = { 1, intermediate, hidden,
+        const ColiV4MatmulDims down_dims = { batch, intermediate, hidden,
                                               (int)down_row_bytes, (int)down_groups };
-        const ColiV4SwigluParams swiglu_params = { intermediate, swiglu_limit };
-        const ColiV4WeightedBf16Params weighted_params = { intermediate, route_weight };
-        const uint32_t intermediate_count = (uint32_t)intermediate;
-        const uint32_t hidden_count = (uint32_t)hidden;
+        const ColiV4SwigluParams swiglu_params = { batch * intermediate, swiglu_limit };
+        const uint32_t intermediate_count = (uint32_t)(batch * intermediate);
+        const uint32_t hidden_count = (uint32_t)(batch * hidden);
         const MTLSize qdq_threads = MTLSizeMake(COLI_V4_MOE_FP8_BLOCK, 1, 1);
         const MTLSize element_threads = MTLSizeMake(COLI_V4_MOE_THREADS, 1, 1);
         const MTLSize matmul_threads = MTLSizeMake(COLI_V4_MOE_THREADS, 1, 1);
@@ -858,7 +867,7 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_FP8_QDQ_INPUT);
 
-        [encoder setComputePipelineState:coli_v4_matmul_pipeline];
+        [encoder setComputePipelineState:matmul_pipeline];
         [encoder setBuffer:coli_v4_qdq_scratch offset:0 atIndex:0];
         [encoder setBuffer:gate_q4_buffer offset:gate_q4_offset atIndex:1];
         [encoder setBuffer:gate_scales_buffer offset:gate_scales_offset atIndex:2];
@@ -866,26 +875,26 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         [encoder setBytes:&gate_dims length:sizeof(gate_dims) atIndex:4];
         [encoder dispatchThreadgroups:MTLSizeMake(
             ((NSUInteger)intermediate + COLI_V4_MOE_THREADS - 1) / COLI_V4_MOE_THREADS,
-            1, 1) threadsPerThreadgroup:matmul_threads];
+            (NSUInteger)batch, 1) threadsPerThreadgroup:matmul_threads];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_MATMUL_GATE);
-        [encoder setComputePipelineState:coli_v4_matmul_pipeline];
+        [encoder setComputePipelineState:matmul_pipeline];
         [encoder setBuffer:coli_v4_qdq_scratch offset:0 atIndex:0];
         [encoder setBuffer:up_q4_buffer offset:up_q4_offset atIndex:1];
         [encoder setBuffer:up_scales_buffer offset:up_scales_offset atIndex:2];
         [encoder setBuffer:coli_v4_up_scratch offset:0 atIndex:3];
         [encoder dispatchThreadgroups:MTLSizeMake(
             ((NSUInteger)intermediate + COLI_V4_MOE_THREADS - 1) / COLI_V4_MOE_THREADS,
-            1, 1) threadsPerThreadgroup:matmul_threads];
+            (NSUInteger)batch, 1) threadsPerThreadgroup:matmul_threads];
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_MATMUL_UP);
 
         [encoder setComputePipelineState:coli_v4_bf16_pipeline];
         [encoder setBuffer:coli_v4_gate_scratch offset:0 atIndex:0];
         [encoder setBytes:&intermediate_count length:sizeof(intermediate_count) atIndex:1];
-        [encoder dispatchThreads:MTLSizeMake(intermediate, 1, 1)
+        [encoder dispatchThreads:MTLSizeMake((NSUInteger)batch * intermediate, 1, 1)
                threadsPerThreadgroup:element_threads];
         [encoder setBuffer:coli_v4_up_scratch offset:0 atIndex:0];
-        [encoder dispatchThreads:MTLSizeMake(intermediate, 1, 1)
+        [encoder dispatchThreads:MTLSizeMake((NSUInteger)batch * intermediate, 1, 1)
                threadsPerThreadgroup:element_threads];
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_WEIGHTED_BF16);
@@ -896,17 +905,23 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         [encoder setBuffer:coli_v4_gate_scratch offset:0 atIndex:1];
         [encoder setBuffer:coli_v4_up_scratch offset:0 atIndex:2];
         [encoder setBytes:&swiglu_params length:sizeof(swiglu_params) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(intermediate, 1, 1)
+        [encoder dispatchThreads:MTLSizeMake((NSUInteger)batch * intermediate, 1, 1)
                threadsPerThreadgroup:element_threads];
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_SWIGLU);
 
         [encoder setComputePipelineState:coli_v4_weighted_pipeline];
-        [encoder setBuffer:coli_v4_weighted_scratch offset:0 atIndex:0];
-        [encoder setBuffer:coli_v4_activated_scratch offset:0 atIndex:1];
-        [encoder setBytes:&weighted_params length:sizeof(weighted_params) atIndex:2];
-        [encoder dispatchThreads:MTLSizeMake(intermediate, 1, 1)
-               threadsPerThreadgroup:element_threads];
+        for (int row = 0; row < batch; row++) {
+            const NSUInteger offset =
+                (NSUInteger)row * intermediate * sizeof(float);
+            const ColiV4WeightedBf16Params weighted_params = {
+                intermediate, route_weights[row] };
+            [encoder setBuffer:coli_v4_weighted_scratch offset:offset atIndex:0];
+            [encoder setBuffer:coli_v4_activated_scratch offset:offset atIndex:1];
+            [encoder setBytes:&weighted_params length:sizeof(weighted_params) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(intermediate, 1, 1)
+                   threadsPerThreadgroup:element_threads];
+        }
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         [encoder setComputePipelineState:coli_v4_qdq_pipeline];
@@ -919,7 +934,7 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_FP8_QDQ_DOWN_INPUT);
 
-        [encoder setComputePipelineState:coli_v4_matmul_pipeline];
+        [encoder setComputePipelineState:matmul_pipeline];
         [encoder setBuffer:coli_v4_down_input_scratch offset:0 atIndex:0];
         [encoder setBuffer:down_q4_buffer offset:down_q4_offset atIndex:1];
         [encoder setBuffer:down_scales_buffer offset:down_scales_offset atIndex:2];
@@ -927,14 +942,14 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         [encoder setBytes:&down_dims length:sizeof(down_dims) atIndex:4];
         [encoder dispatchThreadgroups:MTLSizeMake(
             ((NSUInteger)hidden + COLI_V4_MOE_THREADS - 1) / COLI_V4_MOE_THREADS,
-            1, 1) threadsPerThreadgroup:matmul_threads];
+            (NSUInteger)batch, 1) threadsPerThreadgroup:matmul_threads];
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_MATMUL_DOWN);
 
         [encoder setComputePipelineState:coli_v4_bf16_pipeline];
         [encoder setBuffer:coli_v4_output_scratch offset:0 atIndex:0];
         [encoder setBytes:&hidden_count length:sizeof(hidden_count) atIndex:1];
-        [encoder dispatchThreads:MTLSizeMake(hidden, 1, 1)
+        [encoder dispatchThreads:MTLSizeMake((NSUInteger)batch * hidden, 1, 1)
                threadsPerThreadgroup:element_threads];
         [encoder endEncoding];
         double submit_began = coli_v4_profile_now();
@@ -950,7 +965,7 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
                                 (submit_ended - submit_began) - (gpu > 0.0 ? gpu : 0.0));
             coli_v4_profile_forward();
         }
-        memcpy(out, coli_v4_output_scratch.contents, output_bytes);
+        memcpy(outs, coli_v4_output_scratch.contents, output_bytes);
         atomic_fetch_add_explicit(&coli_v4_metal_dispatch_count, 1,
                                   memory_order_relaxed);
         if (coli_v4_metal_stats_enabled_value)
@@ -959,6 +974,19 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         return 0;
 #undef COLI_V4_PROFILE_FLUSH
     }
+}
+
+COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
+    float *out, const ColiExpertView *expert, const float *input,
+    float route_weight, float swiglu_limit) {
+    if (expert && (expert->gate.block_rows != 1 ||
+                   expert->up.block_rows != 1 ||
+                   expert->down.block_rows != 1)) {
+        coli_v4_metal_reject(COLI_V4_METAL_REJECT_LAYOUT);
+        return -1;
+    }
+    return coli_v4_metal_expert_forward_batch(
+        out, expert, input, &route_weight, 1, swiglu_limit);
 }
 
 static id<MTLLibrary> coli_v4_load_metallib(id<MTLDevice> device,
