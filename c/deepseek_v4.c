@@ -2541,6 +2541,8 @@ int coli_v4_attention_window_token_ref(
 #undef coli_v4_attention_window_token_ref
 
 float coli_fp8_minprod = 3.4e38f;
+unsigned long coli_v4_fp8_qdq_ns;
+unsigned long coli_v4_fp8_qdq_elems;
 int   coli_fp8_minprod_enabled = 0;
 extern uint64_t coli_v4_profile_now_ns(void);
 /* ---- B3: PREFILL attention attribution (measurement only, COLI_V4_ATTN_STATS=1) ----
@@ -10617,11 +10619,18 @@ static void v4_metal_stats_emit(void) {
                                                unsigned long*,unsigned long*);
           unsigned long ci=0,cd=0,co=0,ct=0,rs=0;
           coli_v4_metal_fp8_timing(&ci,&cd,&co,&ct,&rs);
+          { extern unsigned long coli_v4_metal_fp8_cache_full(void);
+            fprintf(stderr, "metal_fp8_cache_full_events=%lu\n", coli_v4_metal_fp8_cache_full()); }
           fprintf(stderr, "metal_fp8_dispatches=%lu metal_fp8_upload_mb=%.1f\n",
                   coli_v4_metal_fp8_dispatches(),
                   (double)coli_v4_metal_fp8_upload_bytes() / 1e6);
           fprintf(stderr, "metal_fp8_ms total=%.1f memcpy_in=%.1f dispatch_wait=%.1f memcpy_out=%.1f\n",
-                  ct/1e6, ci/1e6, cd/1e6, co/1e6); }
+                  ct/1e6, ci/1e6, cd/1e6, co/1e6);
+          { extern unsigned long coli_v4_fp8_qdq_ns;
+            extern unsigned long coli_v4_fp8_qdq_elems;
+            fprintf(stderr, "fp8_qdq_ms=%.1f fp8_qdq_melems=%.1f\n",
+                    __atomic_load_n(&coli_v4_fp8_qdq_ns, __ATOMIC_RELAXED)/1e6,
+                    __atomic_load_n(&coli_v4_fp8_qdq_elems, __ATOMIC_RELAXED)/1e6); } }
     { extern void coli_v4_attn_report(void); coli_v4_attn_report(); }
     const char *profile = getenv("COLI_V4_METAL_PROFILE");
     if (profile && !strcmp(profile, "1")) coli_v4_metal_profile_report();
@@ -12890,6 +12899,11 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
     if (!activations || !activation_scales) {
         free(activation_scales); free(activations); return -1;
     }
+    {
+        extern uint64_t coli_v4_profile_now_ns(void);
+        extern unsigned long coli_v4_fp8_qdq_ns;
+        extern unsigned long coli_v4_fp8_qdq_elems;
+        uint64_t qdq_t0 = coli_v4_profile_now_ns();
     for (int item = 0; item < batch; item++)
         if (coli_fp8_activation_qdq_ref(
                 activations + (size_t)item * columns,
@@ -12897,6 +12911,11 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
             free(activation_scales); free(activations); return -1;
         }
+        __atomic_fetch_add(&coli_v4_fp8_qdq_ns,
+                           coli_v4_profile_now_ns() - qdq_t0, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&coli_v4_fp8_qdq_elems,
+                           (unsigned long)batch * columns, __ATOMIC_RELAXED);
+    }
 #ifdef __AVX2__
     if (weight->block_rows == 8) {
         if (rows % 8) {

@@ -3154,3 +3154,76 @@ trips; they could share one command buffer, and the two `wq_*` projections have 
 dependency chain but `wkv` does not. Cutting 511 round trips toward ~86 would recover most of the
 gap between the measured 1.42x and the kernel's 3.09x. **Projected, therefore to be measured, not
 assumed.**
+
+---
+
+## E71. A4b — a silent cache overflow in **my own** code was halving the lane; fixing it gives **1.107x / 1.135x**
+
+E70 shipped the attention lane at +5–6 % and blamed the gap to the kernel's 3.09x on per-call
+dispatch overhead. Attributing that properly found a different, larger cause — a bug I had written.
+
+### First, a self-correction: my 77 % claim was arithmetic across runs
+E70 inferred the fp8 QDQ was ~77 % of the projection cost by subtracting `6942.1 − 1561.4`. Those
+two figures came from **different runs**. Direct instrumentation says QDQ is **1273.5 ms of
+7477.8 ms = 17.0 %**, not 77 %. Same invalid-cross-run-arithmetic class as E56's stale baseline
+(which inflated a result 1.73x). **Measure the thing; do not subtract across runs.**
+
+Reconciling properly exposed the real gap:
+
+| component | ms | share |
+|---|---|---|
+| Metal path (measured) | 1861.7 | 24.9 % |
+| fp8 QDQ (measured) | 1273.5 | 17.0 % |
+| **unaccounted** | **4342.6** | **58.1 %** |
+
+### The bug: my weight cache silently overflowed
+`wo_a` is the **only** projection invoked **per output group**, each with a distinct pointer
+(`wo_a.data + group * o_rank * group_width`, `:2830`). My pointer-keyed cache therefore needs one
+entry per group, not one per projection:
+
+```
+43 layers x (4 single projections + o_groups=8 wo_a slices) x (data + scales) = 1032 entries
+my cap                                                                        =  512
+```
+
+Past 512 the cache **returned nil forever**, permanently falling back to CPU. `wo_a` is registered
+last per layer, so it was starved first — which is precisely why it measured as the most expensive
+projection (3058 ms, 40.9 %).
+
+**The dispatch count proves it exactly:**
+
+```
+metal_fp8_dispatches   511  ->  1031      (exactly double; half the calls had been falling back)
+metal_fp8_cache_full_events            0  (after the fix)
+```
+
+Fixed by sizing the cache to 4096 **and making overflow observable** — a silent nil is the exact
+failure class this project keeps re-learning (§12e's silent CPU fallback, E70's confound).
+
+### Effect
+
+| metric | cache-limited | fixed | vs E64 CPU baseline |
+|---|---|---|---|
+| `attn_total_ms` | — | **9629.8** | 14553.0 → **1.51x** |
+| five projections | 7477.8 | **4987.2** | 9837.8 → **1.97x** |
+| p064 TTFT (single run) | 40.557 s | **38.055 s** | ~42.5 s |
+
+### A/B — interleaved, n=3, `COLI_V4_METAL_ATTN=1` alone
+
+| prompt | off | on | delta | speedup | previous |
+|---|---|---|---|---|---|
+| p064 | 42.420 s | 38.305 s | **−9.70 %** | **1.107x** | 1.052x |
+| p256 | 109.443 s | 96.409 s | **−11.91 %** | **1.135x** | 1.062x |
+
+Bit-exact throughout (`PASS golden md5=5d04890413ff539e802985ce8c727814`).
+
+**p256 clears the plan's 1.12x gate** (which requires `delta <= -10.71%`); p064 at −9.70 % sits just
+under it. And the lane keeps **strengthening with prompt length** (9.70 % → 11.91 %, up from
+4.93 % → 5.80 %) — still the only optimisation measured in this project that improves on longer
+prompts, because it *is* the O(n²) term rather than being diluted by it.
+
+### Remaining headroom
+Projections now run 1.97x against a kernel measured at 3.09x (A2). `dispatch_wait` is 3586 ms of
+the 3625 ms Metal path (98.9 %) across 1031 calls, and memory traffic is negligible (39 ms, upload
+1.1 MB — resident weights are 16 KB-aligned and serve zero-copy). So the next lever is still
+**amortising the per-call blocking round trip**, now over 1031 calls rather than 511.

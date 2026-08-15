@@ -428,6 +428,7 @@ static id<MTLBuffer> coli_v4_fp8_out_scratch;
 static int coli_v4_fp8_enabled_value = -1;
 static _Atomic unsigned long coli_v4_fp8_dispatch_count;
 static _Atomic unsigned long coli_v4_fp8_upload_bytes;
+static _Atomic unsigned long coli_v4_fp8_cache_full;
 /* A4 diagnosis: split the per-call cost so the 42% miss can be attributed, not guessed. */
 static _Atomic unsigned long coli_v4_fp8_ns_memcpy_in;
 static _Atomic unsigned long coli_v4_fp8_ns_dispatch;
@@ -439,7 +440,11 @@ static inline unsigned long coli_v4_fp8_now(void){
     return (unsigned long)((double)mach_absolute_time()*tb.numer/tb.denom);
 }
 
-#define COLI_V4_FP8_CACHE 512
+/* 43 layers x (4 single projections + o_groups=8 per-group wo_a slices) x (data + scales)
+ * = 1032 entries. 512 overflowed partway through and then silently returned nil for every
+ * subsequent weight, permanently falling back to CPU - wo_a is registered last per layer so it
+ * was starved first, which is why it measured as the most expensive projection. */
+#define COLI_V4_FP8_CACHE 4096
 typedef struct { const void *key; id<MTLBuffer> buf; size_t bytes; int nocopy; } ColiV4Fp8Entry;
 static ColiV4Fp8Entry coli_v4_fp8_cache[COLI_V4_FP8_CACHE];
 static int coli_v4_fp8_cache_count;
@@ -465,7 +470,10 @@ static id<MTLBuffer> coli_v4_fp8_resident(const void *ptr, size_t bytes) {
     for (int i = 0; i < coli_v4_fp8_cache_count; i++)
         if (coli_v4_fp8_cache[i].key == ptr && coli_v4_fp8_cache[i].bytes == bytes)
             return coli_v4_fp8_cache[i].buf;
-    if (coli_v4_fp8_cache_count >= COLI_V4_FP8_CACHE) return nil;   /* refuse, fall back to CPU */
+    if (coli_v4_fp8_cache_count >= COLI_V4_FP8_CACHE) {
+        atomic_fetch_add_explicit(&coli_v4_fp8_cache_full, 1, memory_order_relaxed);
+        return nil;                      /* refuse, fall back to CPU - now COUNTED, not silent */
+    }
     id<MTLBuffer> buf = nil;
     int nocopy = 0;
     if (((uintptr_t)ptr % 16384u) == 0 && (bytes % 16384u) == 0) {
@@ -573,6 +581,9 @@ COLI_V4_METAL_EXTERN void coli_v4_metal_fp8_timing(unsigned long *in_ns, unsigne
     if(out_ns) *out_ns = atomic_load_explicit(&coli_v4_fp8_ns_memcpy_out, memory_order_relaxed);
     if(tot_ns) *tot_ns = atomic_load_explicit(&coli_v4_fp8_ns_total, memory_order_relaxed);
     if(rows_x_s)*rows_x_s=atomic_load_explicit(&coli_v4_fp8_rows_x_s, memory_order_relaxed);
+}
+COLI_V4_METAL_EXTERN unsigned long coli_v4_metal_fp8_cache_full(void) {
+    return atomic_load_explicit(&coli_v4_fp8_cache_full, memory_order_relaxed);
 }
 COLI_V4_METAL_EXTERN unsigned long coli_v4_metal_fp8_upload_bytes(void) {
     return atomic_load_explicit(&coli_v4_fp8_upload_bytes, memory_order_relaxed);
