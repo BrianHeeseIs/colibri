@@ -3741,3 +3741,49 @@ Chunking at 64 is not a limitation to remove; it is load-bearing.
 ### Tally of levers killed before implementation
 A5 (round trip, 5.1 % of dispatch_wait) · A7 (GPU QDQ, 0.35 % of wall) · chunk cap (negative).
 All three cost one probe each. The three scope errors (false 77 %, E77/E78) cost far more.
+
+---
+
+## E81. The expert-cache / prefetch family killed: prefill misses are **compulsory**, not capacity
+
+E80 left MoE as the target (58 % of p064, 52 % of p256). The obvious next hypothesis was that MoE
+is dominated by expert streaming: hit rate on the real prompts is only **49–62 %**, each miss pulls
+**12.58 MB**, and a 61-token prompt reads **50.85 GB** — roughly a third of the 155 GB model.
+
+### Test: vary the cache budget, hold everything else
+Real binary, ab.sh invocation (`--max-tokens 1`, p064 prompt, both lanes ON):
+
+| `--memory-gb` | ttft | misses | hit rate | payload |
+|---|---|---|---|---|
+| 96 | 35.310 s | 4258 | 53.6 % | 53.58 GB |
+| 64 | 35.216 s | 4292 | 51.8 % | 54.01 GB |
+
+**Cutting the cache budget by a third moved nothing.** Misses rose 0.8 %, payload rose 0.8 %, and
+ttft did not change (35.310 -> 35.216 s is inside noise, and if anything the smaller cache was
+marginally faster).
+
+### Why — and why this kills a whole family of ideas
+In a **single prefill pass** each expert is touched about once. The misses are therefore
+**compulsory (cold)**, not capacity misses. No amount of extra cache can capture reuse that does
+not exist within one pass. That explains every number above at once:
+
+- hit rate is low and *stays* low regardless of budget
+- E80's MoE marginal cost of 0.67x came from chunk 2 reusing chunk 1's experts — the only real
+  reuse in the workload, and it is already being captured
+- `COLI_V4_PREWARM` (E79) targets *decode* warm-up, which this metric excludes — doubly irrelevant
+
+### Also: I/O is not the swing factor
+At the measured 6.83 GB/s, p064's 53.58 GB is ~7.8 s of read service against a ~35.3 s wall — about
+22 %, and it barely moves with cache size. MoE's 58 % share is therefore **mostly compute, not
+streaming**. The direction I chased at the end of E77 ("expert weight streaming is the prime
+suspect") is now formally closed: it was wrong.
+
+### Lever tally — four killed before implementation, one probe each
+| lever | verdict | cost to find out |
+|---|---|---|
+| A5 round-trip elimination | 5.1 % of dispatch_wait | 1 probe |
+| A7 GPU fp8 QDQ | 0.35 % of wall, below noise | 1 probe |
+| chunk cap > 64 | negative (attention is O(n²)) | 1 probe |
+| expert cache / prefetch / I/O | flat under a 33 % budget cut | 1 probe |
+
+Remaining headroom is **MoE compute** — not its I/O, not its cache, not its chunking.
