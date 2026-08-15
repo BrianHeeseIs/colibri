@@ -352,3 +352,35 @@ TRAPS CONFIRMED THIS SESSION (all cost real time, all now documented):
   - enabling COLI_V4_METAL=1 alongside ATTN confounds the A/B with the known-1.118x-slower MoE path
   - subtracting figures ACROSS RUNS gave a 77% claim that direct measurement put at 17%
   - ab.sh delta sign: 100*(on-off)/off, so FASTER IS NEGATIVE
+
+## PINNED HARNESS FACTS (read from source, never infer these again)
+
+`bench/ab.sh`
+- invocation: `"$BINARY" "$MODEL" "$prompt" --max-tokens 1 --memory-gb 96`
+- parses ONLY `timing time_to_first_token=` (`parse_ttft`, ab.sh:115)
+- engine prints `time_to_first_token=<A>s after_first=<B>s`; ab.sh takes A, discards B
+- **metric = TTFT = load + prefill. Decode is excluded by construction.**
+- `p064` / `p256` = prompt FILES `.backlog/prefill_prompts/{p064,p256}.txt`
+  (61 words / 165 words). They are PROMPT LENGTHS, not `--max-tokens` values.
+- delta printed = `100*(on-off)/off` -> FASTER IS NEGATIVE. 1.12x == delta <= -10.71%
+
+`bench/golden.sh`
+- DIFFERENT: uses `--max-tokens "$max_tokens"` on a fixed ~20-token prompt.
+- Its `--max-tokens` values are NOT the ab.sh p064/p256 labels. Do not conflate.
+
+### Attribution valid for the ab.sh metric (prefill trace, both lanes ON)
+moe 63.9% | attention 26.7% | attention_norm+ffn_norm 4.0% | residual 4.7%
+=> **MoE is the remaining headroom.** Decode-targeted knobs (`COLI_V4_PREWARM`) are
+   IRRELEVANT to this metric.
+
+### Dead knobs (compiled out - verified, do not retest)
+- `PROF=1` / `prof_report`  -> lives in colibri.c only; deepseek_v4 binary never calls it
+- `COLI_V4_EXPERT_PREFETCH` -> behind `#ifdef COLI_V4_EXPERIMENTAL_PREFETCH`, not compiled
+- `COLI_V4_PREFILL_TRACE`   -> compile-time; build in a SCRATCH COPY, never in-tree
+  (scratch recipe: `cp -R c /tmp/tracebuild_c && printf '\nCFLAGS += -DCOLI_V4_PREFILL_TRACE\n' >> .../Makefile.deepseek-v4`
+   then verify `md5 c/deepseek_v4` unchanged)
+
+### Standing rule (supersedes "measure in the target configuration")
+Before dividing any counter by any wall: open the harness, read the exact invocation and the
+exact field it parses, and pin it. Never infer a metric's definition from a sibling script.
+Four errors (false-77%, A7, E78, E79) share this one root cause.
