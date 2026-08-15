@@ -1,0 +1,27 @@
+# clangd config for the DeepSeek-V4 amalgamated engine.
+#
+# WHY THIS FILE EXISTS:
+# deepseek_v4.c is compiled 33 times, once per unit, via `$(CC) $(CFLAGS) -D$* -c deepseek_v4.c`
+# (Makefile.deepseek-v4:137-142, unit list in Makefile.deepseek-v4.units). Without a unit macro
+# defined, clangd treats nearly the whole 13k-line file as inactive #ifdef'd-out code and reports
+# almost no symbols, which makes symbolic navigation/editing useless on the main engine file.
+#
+# Flags below mirror the real darwin/arm64 CFLAGS (Makefile.deepseek-v4:50-60, :121).
+#
+# UNIT SELECTION: clangd can only hold ONE view of the file. COLI_V4_UNIT_BLOCK_HYBRID is selected
+# because it contains the MoE grouped scheduler (coli_v4_moe_grouped_batch) under active work.
+# To navigate a different unit, swap the macro below. Defining several at once is NOT safe: units
+# intentionally redefine the same symbols (e.g. coli_v4_expert_forward_ref exists in several).
+CompileFlags:
+  Add:
+    - -D_DARWIN_C_SOURCE
+    - -D_FILE_OFFSET_BITS=64
+    - -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16
+    - -DCOLI_V4_PIN_RAMP_REQUESTS=24
+    - -DCOLI_V4_METAL_SEAM
+    - -DCOLI_V4_UNIT_BLOCK_HYBRID
+    - -include
+    - pthread.h
+    - -Wno-unused-parameter
+    - -Wno-misleading-indentation
+    - -Wno-unused-function
