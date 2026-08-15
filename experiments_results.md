@@ -3427,3 +3427,47 @@ microbenchmark here as an upper bound roughly 1.5–2x above what the enclosing 
 0.176 ms = 75 ms (2.5 %), essentially all of it is real kernel execution — so the next levers stay
 those named in E73: raise the chunk cap so more work runs at large S, and move the fp8 QDQ
 (1273.5 ms, 17 % of projections) onto the GPU.
+
+---
+
+## E76. Updated shipped headline — **1.189x / 1.179x**, bit-exact, composition holds again
+
+E72 measured both lanes at 1.163x / 1.169x. A6 (E75) improved the attention lane, so that figure
+was stale. Re-measured.
+
+### Correctness
+`COLI_V4_MOE_GROUPED=1 COLI_V4_METAL_ATTN=1` with fused `wo_a`:
+`PASS golden md5=5d04890413ff539e802985ce8c727814`.
+
+### Result — interleaved, n=3, sign-correct
+
+| prompt | off | on | delta | **measured** | E72 (pre-A6) | naive product | captured |
+|---|---|---|---|---|---|---|---|
+| p064 | 42.528 s | 35.782 s | **−15.86 %** | **1.189x** | 1.163x | 1.182x | 104 % |
+| p256 | 109.575 s | 92.900 s | **−15.22 %** | **1.179x** | 1.169x | 1.166x | 108 % |
+
+Composition holds for the second time (104 % / 108 % of the naive product, the excess within
+run-to-run noise), which is expected given the lanes touch disjoint parts of the wall.
+
+### Wall clock
+
+| | baseline | both lanes | saved |
+|---|---|---|---|
+| p064 TTFT | 42.528 s | **35.782 s** | **−6.75 s** |
+| p256 TTFT | 109.575 s | **92.900 s** | **−16.68 s** |
+
+### One thing NOT to over-read
+p064 (1.189x) now edges above p256 (1.179x), reversing the earlier ordering. **This is n=3 and the
+gap is 1 pp — do not read it as the length trend reversing.** The underlying mechanism (attention
+is the O(n²) term) still favours longer prompts, and the earlier, larger-margin observations
+(4.93 → 5.80 %, then 9.70 → 11.91 %) are the stronger evidence. Recorded as noise, not signal.
+
+### Summary of what is shipped
+
+| feature | flag (default OFF) | p064 | p256 |
+|---|---|---|---|
+| grouped MoE scheduler | `COLI_V4_MOE_GROUPED=1` | 1.043x | 1.021x |
+| bit-exact Metal attention projections | `COLI_V4_METAL_ATTN=1` | 1.133x | 1.142x |
+| **both together** | | **1.189x** | **1.179x** |
+
+Every combination verified at `golden md5=5d04890413ff539e802985ce8c727814`.
