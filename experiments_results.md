@@ -3787,3 +3787,80 @@ suspect") is now formally closed: it was wrong.
 | expert cache / prefetch / I/O | flat under a 33 % budget cut | 1 probe |
 
 Remaining headroom is **MoE compute** — not its I/O, not its cache, not its chunking.
+
+---
+
+## E82. The plan's centerpiece is **not wired**, and the A/B that looks like it would test it is a trap
+
+E81 left MoE compute as the only remaining target (58 % of p064, 52 % of p256, running at
+**2.28 GB/s effective** against 53.58 GB of MXFP4 weights while the disk alone does 6.83 GB/s).
+
+### The structural numbers, on the real config
+p064, `--max-tokens 1`, both lanes ON:
+
+| quantity | value |
+|---|---|
+| waves / groups / expert_requests | 89 / 5073 / 9324 |
+| **N = requests / groups** | **1.84 token-rows per expert visit** |
+| bytes per group | 10.56 MB |
+| MoE effective throughput | 2.28 GB/s (33 % of disk) |
+| grouping bookkeeping overhead | 2.33 s = 10.0 % of MoE — already small |
+
+Each expert visit does a **rank-1.8 update against 10.56 MB of weights**. Arithmetic intensity is
+~0: the weights must be touched in full regardless of N. Attention reuses one weight matrix across
+all 64 chunk tokens; **MoE structurally cannot.**
+
+### What I already knew, and re-derived independently
+§E58d had settled the kernel question: **"The fault is S=1, not the kernel."**
+
+| S | CPU | best GPU | verdict |
+|---|---|---|---|
+| 1 | 397.0 | 376.9 | GPU 1.05x |
+| 4 | 320.3 | 210.6 | **GPU 1.52x** |
+| 16 | 317.0 | 128.9 | **GPU 2.46x** |
+
+and §E58e measured that grouping lifts chunk-64 to **N≈4.1**. My N=1.84 above is the *whole-prompt*
+average including the 6-token tail chunk, and is the same finding from a different direction.
+
+### The trap I nearly walked into
+The obvious next test is `ab.sh "COLI_V4_MOE_GROUPED=1 COLI_V4_METAL=1 COLI_V4_METAL_ATTN=1"` —
+"group first, then let the GPU see S≈4". **It would not test that at all.**
+
+Grepping the whole MoE region (`deepseek_v4.c:5040–5800`) for any Metal seam call returns
+**nothing**. The grouped scheduler is **CPU-only**: it reorders expert loading into waves, but the
+matmul never reaches the Metal seam. `COLI_V4_METAL=1` and `COLI_V4_MOE_GROUPED=1` are independent
+switches. Enabling both would stack CPU grouping on top of a GPU path still dispatching at **S=1** —
+precisely the configuration §12 already measured at **1.118x slower**. The run would have cost
+~16 minutes and produced a predictable, meaningless loss.
+
+**Grouping feeding the GPU is not a flag combination. It is unbuilt code.**
+
+### Expected value of building it
+Applying the standing dilution correction (observed probe->in-situ ratios 2.39x, 2.15x, 3.58x):
+
+| | value |
+|---|---|
+| S=4 probe | 1.52x |
+| realised on the MoE stage | ~1.19x |
+| Amdahl total, p064 (MoE 58.0 %) | 1.103x |
+| minus CPU grouping already banked (1.043x) | **~1.06x incremental** |
+| p256 equivalent | **~1.07x incremental** |
+| shipped 1.189x would become | **~1.26x** |
+
+### Verdict
+This is the last identified lever with positive expected value, and it is real — but it is a
+**large architectural build** (wiring batched expert matmuls through the Metal seam) for roughly
+**1.06–1.07x incremental**, not a probe. Every cheap lever is now exhausted:
+
+| lever | verdict |
+|---|---|
+| A5 round-trip | 5.1 % of dispatch_wait — killed |
+| A7 GPU fp8 QDQ | 0.35 % of wall, below noise — killed |
+| chunk cap > 64 | negative, attention is O(n²) — killed |
+| expert cache / prefetch / I/O | flat under a 33 % budget cut — killed |
+| `COLI_V4_PREWARM` | targets decode; metric excludes decode — killed |
+| `GROUPED=1 METAL=1` | not wired; would measure S=1 — **trap, not a test** |
+| grouped -> GPU MoE | **unbuilt; ~1.06x incremental** |
+
+Stopping here deliberately, at a clean and fully pushed checkpoint, rather than starting a large
+build at the end of a long session.
