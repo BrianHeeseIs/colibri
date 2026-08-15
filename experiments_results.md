@@ -2750,3 +2750,73 @@ but the next implementation effort should target the five attention projections.
 
 Regression: default path re-verified `PASS golden md5=5d04890413ff539e802985ce8c727814` with all
 12 timing slots compiled in.
+
+---
+
+## E65. **Metal has no fp64, and the attention fp8 path accumulates in `double`** — a blocker found before writing the kernel
+
+E64 made the attention projections the top lane (1.23x). Before writing any Metal kernel I checked
+what bit-exactness would actually require, and hit a hard constraint.
+
+### The two paths are NOT symmetric
+
+| path | accumulator | source |
+|---|---|---|
+| `matmul_mxfp4` — **MoE** | **`float a0,a1,a2,a3`** | `quant.h:1438` |
+| `matmul_fp8` — **attention** | **`double a0,a1,a2,a3`** | `quant.h:505` |
+
+`matmul_fp8` keeps a `float` accumulator *within* each 128-column block, then accumulates across
+blocks in **`double`**, casting to `float` only at the very end (`quant.h:505-521`):
+
+```c
+double a0=0, ...;
+for (bi ...) {                       /* 32 blocks for I=4096 */
+    float acc0=0, ...;
+    for (i ...) acc0 += e4m3_decode(w0[i])*xv;   /* 128 iters, float */
+    a0 += (double)acc0*scl0[bi];                 /* double */
+}
+y[s*O+o] = (float)a0;
+```
+
+### Metal cannot do this
+
+```
+program_source:3:22: error: 'double' is not supported in Metal
+```
+Verified by compiling a trivial `device double*` kernel on this device. Apple Silicon GPUs have **no
+fp64 at all** — it is a compiler error, not a slow path.
+
+**Therefore a straightforward Metal fp8 kernel cannot be bit-exact with the CPU reference**, and the
+project's bit-exactness contract is non-negotiable (K1/K2 in the plan). Had this been discovered
+after writing the kernel and host glue, the whole lane would have been wasted work.
+
+### Why it is probably not fatal — the double work is only 1/128th of the arithmetic
+
+| per output element (I=4096) | ops |
+|---|---|
+| inner loop (stays `float`) | **4096** float MACs |
+| outer accumulation (needs `double`) | **32** double MACs |
+
+Emulating just those 32 operations with **double-float arithmetic** (a hi/lo float pair, Dekker
+`TwoProduct` + `TwoSum`) costs roughly 10–30 float ops each, i.e. **2.4–7.3 % overhead** on top of a
+kernel that already measured **6.0x faster than the CPU** (E59). The expensive inner loop stays
+pure `float`.
+
+### The honest catch, and the next experiment
+Double-float carries **~48 mantissa bits vs double's 53**. The result is cast to `float` (24 bits)
+at the end, so the two will *usually* round identically — but **"usually" is not "bit-exact"**, and
+double-rounding can differ in the last ULP.
+
+**This must be settled empirically, not by argument.** The next probe compares, over the real shapes
+and many random seeds, `(float)double_accumulate(...)` against `(float)doublefloat_accumulate(...)`
+and counts differing outputs. If the count is exactly zero across the real reduction lengths, the
+attention lane is viable at full bit-exactness; if not, the lane is capped at whatever
+`sparse_core`-free approximation the F-rule would permit — which this project has historically
+refused to ship.
+
+### Consequence for priority
+The **MoE lane is unaffected** — `matmul_mxfp4` accumulates in `float`, so a Metal kernel can
+reproduce it exactly, and E60 already showed the kernel reaching 421.6 GFLOP/s. So the ranking is
+now conditional:
+- if double-float proves exact -> **attention lane (1.23x) leads**
+- if not -> **MoE lane leads** by default, since it has no such obstacle
