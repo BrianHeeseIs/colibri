@@ -384,3 +384,40 @@ moe 63.9% | attention 26.7% | attention_norm+ffn_norm 4.0% | residual 4.7%
 Before dividing any counter by any wall: open the harness, read the exact invocation and the
 exact field it parses, and pin it. Never infer a metric's definition from a sibling script.
 Four errors (false-77%, A7, E78, E79) share this one root cause.
+
+## SESSION CLOSE (E76-E82) - resumable state
+
+### Shipped, bit-exact, both default OFF
+| flag | p064 | p256 |
+|---|---|---|
+| `COLI_V4_MOE_GROUPED=1` | 1.043x | 1.021x |
+| `COLI_V4_METAL_ATTN=1` | 1.133x | 1.142x |
+| **both** | **1.189x** | **1.179x** |
+Golden `md5=5d04890413ff539e802985ce8c727814` verified on every combination.
+
+### Attribution valid for the ab.sh metric (TTFT, prefill)
+p064 (70 tok): moe 58.0% | attn 34.9% | residual 1.7%
+p256 (184 tok): moe 51.7% | attn 42.4% | residual 0.7%
+Chunking: 43 layers x ceil(tok/64) chunks. p064=[64,6], p256=[64,64,56]. **Cap 64 is load-bearing.**
+
+### ALL cheap levers exhausted - do not retry without new evidence
+- A5 round-trip .................. 5.1% of dispatch_wait
+- A7 GPU fp8 QDQ ................. 0.35% of wall (on-lane), below noise floor
+- chunk cap >64 .................. NEGATIVE (attention O(n^2); marginal<average measured)
+- expert cache / prefetch / I/O ... flat under a 33% budget cut (96->64 GB: ttft unchanged)
+- `COLI_V4_PREWARM` .............. targets decode; ab.sh metric excludes decode
+- `GROUPED=1 METAL=1` ............ **TRAP**: grouped path is CPU-only (no Metal seam call in
+                                   deepseek_v4.c:5040-5800), so GPU still sees S=1 = known 1.118x slower
+
+### THE ONE REMAINING LEVER (unbuilt, ~1.06-1.07x incremental -> ~1.26x total)
+Wire the grouped MoE wave to dispatch **batched (S~4) expert matmuls through the Metal seam**.
+This is the approved plan of record (`docs/plans/metal-batched-moe-architecture.md`).
+Evidence: E58d GPU is 1.05x at S=1, **1.52x at S=4**, 2.46x at S=16; E58e grouping lifts chunk-64
+to N~4.1. Apply the dilution correction (observed 2.39x/2.15x/3.58x) -> ~1.19x on the MoE stage.
+MoE is ~58%/52% of the metric, so Amdahl gives ~1.10x total, ~1.06x over what grouping already banks.
+Start here. It is a real build, not a flag.
+
+### Key structural fact that bounds everything
+N = 1.84 token-rows per expert visit against 10.56 MB of weights. Arithmetic intensity ~0: expert
+weights are touched in full regardless of N. Attention reuses one matrix across all 64 chunk tokens;
+**MoE structurally cannot.** MoE runs at 2.28 GB/s effective vs 6.83 GB/s disk -> compute-bound.
