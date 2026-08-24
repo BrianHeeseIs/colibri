@@ -5062,6 +5062,20 @@ static uint64_t coli_v4_moe_chunk_ns;
 static uint64_t coli_v4_moe_waves;
 static uint64_t coli_v4_moe_wave_fallbacks;
 static uint64_t coli_v4_moe_groups;
+/* A8 sweep instrumentation. Raising COLI_V4_MOE_BATCHED_MIN_N is NOT monotonically better:
+ * a higher threshold makes each accepted dispatch larger but sends FEWER groups to Metal, and
+ * the down projection measured faster at S=4 than at S=8. Deciding the threshold therefore
+ * needs the split below, not just wall time. The histogram covers ALL groups regardless of
+ * which path they took, so the capture rate of any candidate threshold can be read off
+ * directly rather than inferred from a wall-clock delta. */
+#define COLI_V4_MOE_HIST_MAX 32
+static uint64_t coli_v4_moe_batched_groups;   /* groups actually dispatched to Metal */
+static uint64_t coli_v4_moe_batched_rows;     /* sum of N over those groups */
+static uint64_t coli_v4_moe_batched_ns;       /* wall inside the batched dispatch */
+static uint64_t coli_v4_moe_batched_rejects;  /* seam returned nonzero -> fell back to CPU */
+static uint64_t coli_v4_moe_cpu_rows;         /* rows executed via the per-row CPU path */
+static uint64_t coli_v4_moe_cpu_ns;           /* wall inside the per-row CPU path */
+static uint64_t coli_v4_moe_hist[COLI_V4_MOE_HIST_MAX + 1]; /* group-size histogram, N clamped */
 
 static void coli_v4_moe_grouped_init(void) {
     const char *grouped = getenv("COLI_V4_MOE_GROUPED");
@@ -5118,6 +5132,30 @@ void coli_v4_moe_grouped_stats_emit(void) {
     fprintf(stderr, "moe_chunk_ns=%llu\n",
             (unsigned long long)__atomic_load_n(
                 &coli_v4_moe_chunk_ns, __ATOMIC_RELAXED));
+    {   /* A8 threshold-sweep view: which groups actually reached Metal, how many rows
+         * that covered, and what the CPU path still absorbed. MIN_N trades dispatch size
+         * against capture rate, so both must be visible. */
+        uint64_t bg = __atomic_load_n(&coli_v4_moe_batched_groups, __ATOMIC_RELAXED);
+        uint64_t br = __atomic_load_n(&coli_v4_moe_batched_rows, __ATOMIC_RELAXED);
+        uint64_t bn = __atomic_load_n(&coli_v4_moe_batched_ns, __ATOMIC_RELAXED);
+        uint64_t rj = __atomic_load_n(&coli_v4_moe_batched_rejects, __ATOMIC_RELAXED);
+        uint64_t cr = __atomic_load_n(&coli_v4_moe_cpu_rows, __ATOMIC_RELAXED);
+        uint64_t cn = __atomic_load_n(&coli_v4_moe_cpu_ns, __ATOMIC_RELAXED);
+        fprintf(stderr,
+                "moe_batched min_n=%d groups=%llu rows=%llu ms=%.1f rejects=%llu"
+                " | cpu_rows=%llu cpu_ms=%.1f | metal_row_share=%.1f%%\n",
+                coli_v4_moe_batched_min_n(),
+                (unsigned long long)bg, (unsigned long long)br, bn / 1e6,
+                (unsigned long long)rj,
+                (unsigned long long)cr, cn / 1e6,
+                (br + cr) ? 100.0 * (double)br / (double)(br + cr) : 0.0);
+        fprintf(stderr, "moe_group_hist");
+        for (int i = 0; i <= COLI_V4_MOE_HIST_MAX; i++) {
+            uint64_t v = __atomic_load_n(&coli_v4_moe_hist[i], __ATOMIC_RELAXED);
+            if (v) fprintf(stderr, " %d:%llu", i, (unsigned long long)v);
+        }
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr,
             "moe_waves=%llu moe_wave_fallbacks=%llu moe_groups=%llu\n",
             (unsigned long long)__atomic_load_n(
@@ -5410,6 +5448,16 @@ static int coli_v4_moe_grouped_batch(
         for (int current = 0; !result && current < count; current++) {
             int group = first + current;
             int batched_done = 0;
+            /* Histogram every group, whichever path it takes: the capture rate of any
+             * candidate MIN_N is then a property of the distribution, not something that
+             * has to be re-measured per threshold. */
+            int group_rows = offsets[group + 1] - offsets[group];
+            if (stats_enabled) {
+                int bucket = group_rows < 0 ? 0
+                    : (group_rows > COLI_V4_MOE_HIST_MAX ? COLI_V4_MOE_HIST_MAX
+                                                         : group_rows);
+                __atomic_fetch_add(&coli_v4_moe_hist[bucket], 1, __ATOMIC_RELAXED);
+            }
 #ifdef COLI_V4_METAL_SEAM
             /* A8: collapse this group's N routed rows into ONE Metal dispatch.
              * Gated on N because the GPU LOSES below S=4 at production dims
@@ -5420,8 +5468,7 @@ static int coli_v4_moe_grouped_batch(
              * the scalar seam, which accepts only block_rows==1 and delegates to
              * this same batched entry at S=1.  rows16 (pinned hot slots) has no
              * such proof, so it keeps the CPU path. */
-            int group_n = offsets[group + 1] - offsets[group];
-            if (batched_enabled && group_n >= batched_min_n &&
+            if (batched_enabled && group_rows >= batched_min_n &&
                 wave_views[current].gate.block_rows == 1 &&
                 wave_views[current].up.block_rows == 1 &&
                 wave_views[current].down.block_rows == 1) {
@@ -5429,7 +5476,7 @@ static int coli_v4_moe_grouped_batch(
                     float *outs, const ColiExpertView *expert,
                     const float *inputs_gathered, const float *weights_in,
                     int batch_rows, float swiglu_limit);
-                for (int k = 0; k < group_n; k++) {
+                for (int k = 0; k < group_rows; k++) {
                     int gathered_route = route_slots[offsets[group] + k];
                     int gathered_item = gathered_route / topk;
                     memcpy(batch_inputs + (size_t)k * dimension,
@@ -5441,15 +5488,28 @@ static int coli_v4_moe_grouped_batch(
                     ? coli_v4_profile_now_ns() : 0;
                 int batch_result = coli_v4_metal_expert_forward_batch(
                     batch_outputs, &wave_views[current], batch_inputs,
-                    batch_weights, group_n, config->swiglu_limit);
+                    batch_weights, group_rows, config->swiglu_limit);
                 uint64_t batch_elapsed = stats_enabled || coli_v4_profile_on
                     ? coli_v4_profile_now_ns() - batch_began : 0;
-                if (stats_enabled) compute_ns += batch_elapsed;
+                if (stats_enabled) {
+                    compute_ns += batch_elapsed;
+                    __atomic_fetch_add(&coli_v4_moe_batched_ns, batch_elapsed,
+                                       __ATOMIC_RELAXED);
+                    if (batch_result)
+                        __atomic_fetch_add(&coli_v4_moe_batched_rejects, 1,
+                                           __ATOMIC_RELAXED);
+                    else {
+                        __atomic_fetch_add(&coli_v4_moe_batched_groups, 1,
+                                           __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&coli_v4_moe_batched_rows,
+                                           (uint64_t)group_rows, __ATOMIC_RELAXED);
+                    }
+                }
                 if (coli_v4_profile_on)
                     coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_FORWARD,
                                         batch_elapsed);
                 if (!batch_result) {
-                    for (int k = 0; k < group_n; k++) {
+                    for (int k = 0; k < group_rows; k++) {
                         int gathered_route = route_slots[offsets[group] + k];
                         int gathered_item = gathered_route / topk;
                         const float *row =
@@ -5477,7 +5537,12 @@ static int coli_v4_moe_grouped_batch(
                     config->swiglu_limit);
                 uint64_t elapsed = stats_enabled || coli_v4_profile_on
                     ? coli_v4_profile_now_ns() - began : 0;
-                if (stats_enabled) compute_ns += elapsed;
+                if (stats_enabled) {
+                    compute_ns += elapsed;
+                    __atomic_fetch_add(&coli_v4_moe_cpu_rows, 1, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&coli_v4_moe_cpu_ns, elapsed,
+                                       __ATOMIC_RELAXED);
+                }
                 if (coli_v4_profile_on)
                     coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_FORWARD,
                                         elapsed);

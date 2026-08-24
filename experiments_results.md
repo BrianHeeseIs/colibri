@@ -3955,3 +3955,59 @@ no data race (call path is serial, buffers per-call). One finding **declined wit
 to AND-in `coli_v4_metal_enabled()`, but the shipped attention lane already gates on its OWN flag
 (`coli_v4_metal_fp8_enabled()` reads `COLI_V4_METAL_ATTN`), so per-feature gating is the established
 precedent, and adopting the change would disable the feature in the exact configuration measured.
+
+---
+
+## E85. A8 sweep instrumentation — the MIN_N sweep explores the *losing* direction
+
+Added per-group counters to `coli_v4_moe_grouped_stats_emit` so the threshold decision rests on the
+measured distribution rather than wall-clock alone:
+
+```
+moe_batched min_n=4 groups=1012 rows=8959 ms=2823.3 rejects=0 | cpu_rows=9101 cpu_ms=6667.5 | metal_row_share=49.6%
+moe_group_hist 1:2269 2:1003 3:539 4:337 5:223 6:141 7:106 8:76 9:44 10:51 11:45 12:30 13:17 14:34 15:13 16:15 17:10 18:9 19:5 20:6 21:6 22:4 23:3 24:4 25:4 26:6 27:2 28:7 29:3 30:3 31:3 32:56
+```
+(p064, MIN_N=4, shipped flags. Bucket 32 is the clamp, i.e. N>=32.)
+Golden re-verified **PASS `5d04890413ff539e802985ce8c727814`** — emission-only, no behaviour change.
+
+### Finding 1 — Metal is 2.32x cheaper per row than the CPU path
+| path | rows | ms | ms/row |
+|---|---|---|---|
+| Metal (batched) | 8959 | 2823.3 | **0.315** |
+| CPU (per-row) | 9101 | 6667.5 | **0.733** |
+
+Only **49.6 %** of rows reach Metal. `rejects=0`, so the seam never refused a dispatch — every
+excluded row was excluded by our own gating.
+
+### Finding 2 — raising MIN_N monotonically REDUCES coverage. The specified sweep only explores loss.
+Rows captured at each threshold, read directly off the measured histogram:
+
+| MIN_N | groups >= T | rows >= T | row share | vs MIN_N=4 |
+|---|---|---|---|---|
+| 1 | 5074 | 16938 | 100.0 % | 1.00x |
+| 2 | 2805 | 14669 | 86.6 % | 1.33x |
+| 3 | 1802 | 12663 | 74.8 % | 1.15x |
+| **4** | 1263 | 11046 | 65.2 % | **1.00x** |
+| 5 | 926 | 9698 | 57.3 % | 0.88x |
+| 6 | 703 | 8583 | 50.7 % | 0.78x |
+| 8 | 456 | 6995 | 41.3 % | 0.63x |
+| 12 | 240 | 4986 | 29.4 % | 0.45x |
+| 16 | 146 | 3734 | 22.0 % | 0.34x |
+
+Since Metal costs 0.315 ms/row against the CPU's 0.733, moving rows OFF Metal is a loss unless
+per-row GPU efficiency at that S is worse than the CPU — and the S-scaling probe says efficiency
+*improves* with S. **MIN_N ∈ {5,6,8,12,16} is therefore the strictly-worse direction**: at MIN_N=8
+we would hand 4051 rows back to a path that is 2.3x more expensive. The genuinely open question is
+DOWNWARD — MIN_N=3 adds 1617 rows (+15 %), MIN_N=2 adds another 2006 — bounded by the probe's
+S=1 0.40x / S=2 0.73x penalty. **S=3 was never measured**, and it is exactly the crossover.
+
+### Finding 3 — the biggest lever is not MIN_N at all
+1263 groups (11046 rows) clear N>=4, but only **1012 groups / 8959 rows** are dispatched.
+**251 groups / 2087 rows are blocked by our own `block_rows == 1` gate** — hot-pinned rows16
+experts. That is **23 % of all CPU rows, already the right size to batch**, rejected for a layout
+reason rather than a size one, and paying the 2.3x CPU penalty for it.
+
+Removing that restriction adds rows at NO efficiency cost, because they are already N>=4. It is
+strictly better than any threshold move. The blocker is that rows16 has no bit-exactness proof —
+the scalar Metal seam rejects `block_rows==16`, so `COLI_V4_METAL=1` golden never exercised
+GPU-vs-CPU for that layout (E84). Proving rows16 bit-exact is worth more than the entire MIN_N sweep.
