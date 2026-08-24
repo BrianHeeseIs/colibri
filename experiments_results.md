@@ -4011,3 +4011,99 @@ Removing that restriction adds rows at NO efficiency cost, because they are alre
 strictly better than any threshold move. The blocker is that rows16 has no bit-exactness proof —
 the scalar Metal seam rejects `block_rows==16`, so `COLI_V4_METAL=1` golden never exercised
 GPU-vs-CPU for that layout (E84). Proving rows16 bit-exact is worth more than the entire MIN_N sweep.
+
+---
+
+## E86. rows16 proven bit-exact — E85's "biggest lever" cashed, **1.049x / 1.058x incremental**
+
+E85 closed by arguing that removing the `block_rows == 1` gate was worth more than the entire MIN_N
+sweep, blocked only by the absence of a bit-exactness proof for rows16. That proof now exists, and
+the blocker was a real kernel defect rather than a missing argument.
+
+### The flag
+`COLI_V4_MOE_BATCHED_ROWS16=1` (default OFF) lets `block_rows==16` experts reach the Metal batched
+path. `coli_v4_moe_layout_batchable()` requires gate/up/down to agree on layout — a mixed-layout
+expert would index one of the three wrongly.
+
+### First attempt was NOT bit-exact — and the cheap explanation was wrong
+`golden` with the flag ON returned `1ebd8d83d88d9557dadfc1bb8ad849a6`. Three things had to be
+separated before the cause was identifiable, and two of them nearly produced a wrong fix:
+
+1. **"The hot kernel reorders the accumulation."** False. Diffing
+   `coli_v4_matmul_mxfp4_ordered_hot_xcache` against the cold `..._ordered_xcache` shows an
+   *identical* arithmetic sequence; only the indexing differs (flat `o*rb` vs tile/lane
+   `(tile*rb + i>>1)*16 + lane`). The divergence is GPU-vs-**CPU**, not GPU-vs-GPU.
+2. **"A changed md5 means the kernel is broken."** Not distinguishable a priori: it is equally
+   consistent with the *cold* kernel being dispatched against rows16-interleaved data, which would
+   index wrongly and emit garbage. Discriminated by reading the generated text — it stayed fluent
+   and semantically identical, diverging only at one token choice (`*same*` -> `exact same`). That
+   is a 1-ULP argmax flip, not a layout bug.
+3. **"UE8M0 scales are powers of two, so scale placement cannot matter."** Wrong, and this one
+   would have killed the investigation. `a*s` *is* individually exact — but the two forms build
+   different **summation trees**.
+
+### Root cause
+| path | scale application | matches its CPU reference? |
+|---|---|---|
+| cold GPU `..._ordered_xcache` | once per 32-group (`a += ga*sc`) | yes — scalar `matmul_mxfp4` does the same |
+| CPU cold scalar `matmul_mxfp4` | once per 32-group | — |
+| **hot GPU `..._ordered_hot_xcache`** | once per 32-group | **no** |
+| **CPU rows16 `neon_rows16_accumulate`** | **per column** (`sums += (x*w)*scale`) | — |
+
+The per-group form sums 32 unscaled products before rounding once; the CPU rounds each scaled
+product into the running total. Different rounding points, different magnitudes.
+
+Quantified with a standalone harness (`.backlog/lab/scale_order_differential.c`, no model load):
+```
+trials=20000  differing=19251 (96.25%)  max_rel=1.932e-02  denormal_products=0
+```
+Zero denormals rules out underflow. This is reassociation.
+
+### The fix
+Apply the scale per column in the hot kernel only (`c/metal/coli_v4_matmul.metal`). One expression.
+
+### Gates
+| gate | result |
+|---|---|
+| `golden` rows16 **OFF** | `PASS md5=5d04890413ff539e802985ce8c727814` |
+| `golden` rows16 **ON** | `PASS md5=5d04890413ff539e802985ce8c727814` |
+| metallib contains hot kernel | yes (nil pipeline would silently fall back to CPU) |
+| build | `-fno-fast-math`, seam symbol count 1 |
+
+**Golden is a valid gate for this feature** — contrary to the standing warning that its ~20-token
+prompt never fires batch-gated paths. The pre-fix FAIL proves the path executed during golden.
+
+### Path executed — not a silent fallback (p064, `--max-tokens 1`)
+| | groups | rows | metal_row_share | cpu_rows | cpu_ms | metal_ms |
+|---|---|---|---|---|---|---|
+| OFF | 1010 | 8932 | 49.5 % | 9128 | 6514.2 | 3504.7 |
+| ON | **1262** | **12165** | **67.4 %** | **5895** | **4330.6** | 4038.8 |
+
+Net expert time **10018.9 -> 8369.4 ms**. The per-column multiply costs only **~93 ms** of GPU time
+(3945.5 pre-fix -> 4038.8 post-fix): the kernel is memory-bound, so the extra ALU work is nearly free.
+
+**Discrepancy worth recording:** E85 predicted 251 groups / **2087** rows would be unblocked. The
+measured delta is 252 groups / **3233** rows — groups match within one, rows exceed the prediction by
+55 %. E85's row count came from a histogram of blocked groups; the gap is unexplained and should be
+re-derived before that histogram is trusted for sizing another lever.
+
+### A/B — interleaved, N=3, sign-correct (faster is negative)
+| prompt | off | on | delta | speedup | off range | on range |
+|---|---|---|---|---|---|---|
+| p064 | 38.374 s | 36.595 s | **−4.64 %** | 1.049x | 38.358–38.680 | 36.361–36.819 |
+| p256 | 102.061 s | 96.453 s | **−5.49 %** | 1.058x | 100.279–105.688 | 96.108–96.613 |
+
+Ranges are non-overlapping on both prompts — every ON run beat every OFF run. The gain **grows with
+prompt length** (4.64 % -> 5.49 %), which only the attention lane had previously done here; the MoE
+features measured so far decayed with length.
+
+### Disposition
+**KEPT, default OFF** per the house rule that new optimisations ship behind their own flag. It is
+bit-exact with the flag ON and OFF, and inert when unset.
+
+Command:
+```
+COLI_V4_METAL=1 COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 \
+  N=3 ./bench/ab.sh "COLI_V4_MOE_BATCHED_ROWS16=1" ./c/deepseek_v4
+```
+Raw log: `.backlog/lab/rows16_ab_20260825-002043.log`.
