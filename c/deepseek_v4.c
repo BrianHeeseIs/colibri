@@ -5057,6 +5057,7 @@ static int coli_v4_moe_grouped_enabled_value;
 static int coli_v4_moe_grouped_stats_enabled_value;
 static int coli_v4_moe_batched_enabled_value;
 static int coli_v4_moe_batched_min_n_value;
+static int coli_v4_moe_batched_rows16_value;
 static int coli_v4_moe_grouped_degenerate_reported;
 static uint64_t coli_v4_moe_group_overhead_ns;
 static uint64_t coli_v4_moe_chunk_ns;
@@ -5089,6 +5090,16 @@ static void coli_v4_moe_grouped_init(void) {
      * Default OFF.  MIN_N exists because the GPU LOSES below S=4 at production
      * dims (measured CPU/GPU: S=1 0.40x, S=2 0.73x, S=4 1.68x-2.41x), and real
      * routing produces many N=1..2 groups; batching those would regress. */
+    /* A9: also batch hot-pinned rows16 experts. Measured on p064 (E85): 251 groups /
+     * 2087 rows already clear N>=4 but are refused by our own block_rows==1 gate - 23% of
+     * all CPU rows, excluded for a LAYOUT reason rather than a size one, and paying the
+     * 2.32x per-row CPU penalty for it. The Metal seam already accepts block_rows 1 or 16
+     * and selects coli_v4_matmul_mxfp4_ordered_hot_xcache for the latter, so this is a
+     * gating question, not a kernel one. Default OFF until the differential proves it
+     * bit-exact on real data. */
+    const char *rows16 = getenv("COLI_V4_MOE_BATCHED_ROWS16");
+    coli_v4_moe_batched_rows16_value =
+        rows16 && *rows16 && atoi(rows16) != 0;
     const char *batched = getenv("COLI_V4_MOE_BATCHED");
     const char *min_n = getenv("COLI_V4_MOE_BATCHED_MIN_N");
     coli_v4_moe_batched_enabled_value =
@@ -5118,6 +5129,11 @@ static int coli_v4_moe_batched_min_n(void) {
     pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
     return coli_v4_moe_batched_min_n_value;
 }
+
+static int coli_v4_moe_batched_rows16(void) {
+    pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
+    return coli_v4_moe_batched_rows16_value;
+}
 #endif
 
 static int coli_v4_moe_grouped_stats_enabled(void) {
@@ -5143,9 +5159,9 @@ void coli_v4_moe_grouped_stats_emit(void) {
         uint64_t cr = __atomic_load_n(&coli_v4_moe_cpu_rows, __ATOMIC_RELAXED);
         uint64_t cn = __atomic_load_n(&coli_v4_moe_cpu_ns, __ATOMIC_RELAXED);
         fprintf(stderr,
-                "moe_batched min_n=%d groups=%llu rows=%llu ms=%.1f rejects=%llu"
+                "moe_batched min_n=%d rows16=%d groups=%llu rows=%llu ms=%.1f rejects=%llu"
                 " | cpu_rows=%llu cpu_ms=%.1f | metal_row_share=%.1f%%\n",
-                coli_v4_moe_batched_min_n(),
+                coli_v4_moe_batched_min_n(), coli_v4_moe_batched_rows16(),
                 (unsigned long long)bg, (unsigned long long)br, bn / 1e6,
                 (unsigned long long)rj,
                 (unsigned long long)cr, cn / 1e6,
@@ -5171,6 +5187,16 @@ static int coli_v4_int_ascending(const void *left, const void *right) {
     int lhs = *(const int *)left;
     int rhs = *(const int *)right;
     return (lhs > rhs) - (lhs < rhs);
+}
+
+
+/* The Metal seam accepts block_rows 1 or 16 and picks the matching pipeline, but the three
+ * tensors must agree - a mixed-layout expert would silently index one of them wrongly. */
+static int coli_v4_moe_layout_batchable(const ColiExpertView *view, int allow_rows16) {
+    uint32_t g = view->gate.block_rows, u = view->up.block_rows, d = view->down.block_rows;
+    if (g != u || g != d) return 0;
+    if (g == 1) return 1;
+    return (g == 16) && allow_rows16;
 }
 
 static int coli_v4_moe_grouped_scalar_fallback(
@@ -5231,6 +5257,7 @@ static int coli_v4_moe_grouped_batch(
 #ifdef COLI_V4_METAL_SEAM
     int batched_enabled = coli_v4_moe_batched_enabled();
     int batched_min_n = coli_v4_moe_batched_min_n();
+    int batched_rows16 = coli_v4_moe_batched_rows16();
     float *batch_inputs = NULL;
     float *batch_outputs = NULL;
     float *batch_weights = NULL;
@@ -5470,9 +5497,8 @@ static int coli_v4_moe_grouped_batch(
              * this same batched entry at S=1.  rows16 (pinned hot slots) has no
              * such proof, so it keeps the CPU path. */
             if (batched_enabled && group_rows >= batched_min_n &&
-                wave_views[current].gate.block_rows == 1 &&
-                wave_views[current].up.block_rows == 1 &&
-                wave_views[current].down.block_rows == 1) {
+                coli_v4_moe_layout_batchable(&wave_views[current],
+                                             batched_rows16)) {
                 extern int coli_v4_metal_expert_forward_batch(
                     float *outs, const ColiExpertView *expert,
                     const float *inputs_gathered, const float *weights_in,
