@@ -8,7 +8,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 # /tmp is cleared on reboot and the snapshot vanished once mid-run, which would have
 # silently invalidated every measurement. Prefer the durable in-repo copy.
 SEED_SNAP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/coli_usage.snapshot"
-[ -f "$SEED_SNAP" ] || SEED_SNAP=/tmp/coli_usage.snapshot
+# NO /tmp FALLBACK. /tmp is cleared on reboot; relying on it is what let a gate run start
+# against a missing seed. The in-repo copy is the only source of truth.
 if [ ! -f "$SEED_SNAP" ]; then echo "ABORT: no usage snapshot at $SEED_SNAP"; exit 1; fi
 if [ "$(md5 -q "$SEED_SNAP")" != "599f3d12e9347ef30541bd6f9ba18bde" ]; then
   echo "ABORT: snapshot md5 mismatch - refusing to measure against a drifted seed"; exit 1
