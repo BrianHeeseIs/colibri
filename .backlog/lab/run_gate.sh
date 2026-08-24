@@ -3,6 +3,15 @@
 # OFF arm (env -u on each ON_ENV var) inherits it. usage: run_gate.sh "ON_ENV" N
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+
+# /tmp is cleared on reboot and the snapshot vanished once mid-run, which would have
+# silently invalidated every measurement. Prefer the durable in-repo copy.
+SEED_SNAP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/coli_usage.snapshot"
+[ -f "$SEED_SNAP" ] || SEED_SNAP=/tmp/coli_usage.snapshot
+if [ ! -f "$SEED_SNAP" ]; then echo "ABORT: no usage snapshot at $SEED_SNAP"; exit 1; fi
+if [ "$(md5 -q "$SEED_SNAP")" != "599f3d12e9347ef30541bd6f9ba18bde" ]; then
+  echo "ABORT: snapshot md5 mismatch - refusing to measure against a drifted seed"; exit 1
+fi
 ON=${1:?on-env}; N=${2:-5}
 LOG=.backlog/lab/gate_$(date +%Y%m%d-%H%M%S).log
 if pgrep -f '[d]eepseek_v4' >/dev/null; then echo "ABORT: engine already running"; exit 1; fi
@@ -10,7 +19,7 @@ printf '\033[1;36m=== GATE  ON=%s  N=%s ===\033[0m\n' "$ON" "$N" | tee -a "$LOG"
 printf '\033[1;33mSIGN: delta=100*(on-off)/off -> FASTER IS NEGATIVE\033[0m\n' | tee -a "$LOG"
 echo "binary md5 $(md5 -q c/deepseek_v4)" | tee -a "$LOG"
 export COLI_V4_MOE_GROUPED=1 COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED=1
-cp /tmp/coli_usage.snapshot models/deepseek-v4-flash/.coli_usage
+cp $SEED_SNAP models/deepseek-v4-flash/.coli_usage
 
 # PRE-FLIGHT. bench/ab.sh is `set -euo pipefail`; its run_model sends the engine's own
 # output to a per-run log inside a mktemp $WORK dir, and `trap cleanup EXIT` deletes that
@@ -30,13 +39,13 @@ else
   rc=$?
   printf '\033[1;31mPRE-FLIGHT FAILED (exit %d). Engine output:\033[0m\n' "$rc" | tee -a "$LOG"
   tail -25 "$PREFLIGHT" | tee -a "$LOG"
-  cp /tmp/coli_usage.snapshot models/deepseek-v4-flash/.coli_usage
+  cp $SEED_SNAP models/deepseek-v4-flash/.coli_usage
   rm -f "$PREFLIGHT"
   echo "aborting before ab.sh; fix the engine first" | tee -a "$LOG"
   exit 1
 fi
 rm -f "$PREFLIGHT"
-cp /tmp/coli_usage.snapshot models/deepseek-v4-flash/.coli_usage
+cp $SEED_SNAP models/deepseek-v4-flash/.coli_usage
 # Do NOT filter this pipeline. An earlier version piped through
 #   grep -E '^(RUN|AB) '
 # which silently swallowed ab.sh's own diagnostics: a run exited straight after both
@@ -50,5 +59,5 @@ fi
 if ! grep -qE '^AB ' "$LOG"; then
   printf '\033[1;31mNO AB LINES: the gate did not produce a result. Do not interpret this run.\033[0m\n'
 fi
-cp /tmp/coli_usage.snapshot models/deepseek-v4-flash/.coli_usage
+cp $SEED_SNAP models/deepseek-v4-flash/.coli_usage
 echo "log: $LOG"

@@ -3,6 +3,15 @@
 # the already-shipped lanes. Parent env MUST be clean so ab.sh's OFF arm is bare.
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+
+# /tmp is cleared on reboot and the snapshot vanished once mid-run, which would have
+# silently invalidated every measurement. Prefer the durable in-repo copy.
+SEED_SNAP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/coli_usage.snapshot"
+[ -f "$SEED_SNAP" ] || SEED_SNAP=/tmp/coli_usage.snapshot
+if [ ! -f "$SEED_SNAP" ]; then echo "ABORT: no usage snapshot at $SEED_SNAP"; exit 1; fi
+if [ "$(md5 -q "$SEED_SNAP")" != "599f3d12e9347ef30541bd6f9ba18bde" ]; then
+  echo "ABORT: snapshot md5 mismatch - refusing to measure against a drifted seed"; exit 1
+fi
 LOG=.backlog/lab/m2_$(date +%Y%m%d-%H%M%S).log
 unset COLI_V4_MOE_GROUPED COLI_V4_METAL_ATTN COLI_V4_MOE_BATCHED COLI_V4_METAL
 
@@ -24,9 +33,9 @@ run_ab() {
   local flag=$1 want=$2
   banner "AB  $flag     (expect $want)"
   date '+  start %H:%M:%S'
-  cp /tmp/coli_usage.snapshot models/deepseek-v4-flash/.coli_usage
+  cp $SEED_SNAP models/deepseek-v4-flash/.coli_usage
   N=5 ./bench/ab.sh "$flag" ./c/deepseek_v4 2>&1 | tee -a "$LOG" | grep -E "^(RUN|AB) " 
-  cp /tmp/coli_usage.snapshot models/deepseek-v4-flash/.coli_usage
+  cp $SEED_SNAP models/deepseek-v4-flash/.coli_usage
   date '+  done  %H:%M:%S'
 }
 

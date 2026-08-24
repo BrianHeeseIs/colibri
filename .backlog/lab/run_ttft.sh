@@ -4,10 +4,19 @@
 # usage: run_ttft.sh LABEL N "ENV KEY=VAL ..."
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+
+# /tmp is cleared on reboot and the snapshot vanished once mid-run, which would have
+# silently invalidated every measurement. Prefer the durable in-repo copy.
+SEED_SNAP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/coli_usage.snapshot"
+[ -f "$SEED_SNAP" ] || SEED_SNAP=/tmp/coli_usage.snapshot
+if [ ! -f "$SEED_SNAP" ]; then echo "ABORT: no usage snapshot at $SEED_SNAP"; exit 1; fi
+if [ "$(md5 -q "$SEED_SNAP")" != "599f3d12e9347ef30541bd6f9ba18bde" ]; then
+  echo "ABORT: snapshot md5 mismatch - refusing to measure against a drifted seed"; exit 1
+fi
 LABEL=${1:?label}; N=${2:?n}; ENVSPEC=${3:-}
 LOG=.backlog/lab/ttft_${LABEL}_$(date +%Y%m%d-%H%M%S).log
 unset COLI_V4_MOE_GROUPED COLI_V4_METAL_ATTN COLI_V4_MOE_BATCHED COLI_V4_METAL COLI_NO_OMP_TUNE
-SNAP=/tmp/coli_usage.snapshot; USAGE=models/deepseek-v4-flash/.coli_usage
+SNAP=$SEED_SNAP; USAGE=models/deepseek-v4-flash/.coli_usage
 if pgrep -f '[d]eepseek_v4' >/dev/null; then echo "ABORT: engine already running"; exit 1; fi
 printf '\033[1;36m=== TTFT %s  N=%s  env: %s ===\033[0m\n' "$LABEL" "$N" "${ENVSPEC:-<bare>}" | tee -a "$LOG"
 echo "binary md5 $(md5 -q c/deepseek_v4)" | tee -a "$LOG"
