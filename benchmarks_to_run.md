@@ -320,3 +320,101 @@ Corrections to this section's premises, now that it has been measured:
 B1 and B2 together decide whether `V4_DRAFT=4 V4_NGRAM=1 --ram 96` remains the recommended config
 at all. Until they run, **the honest recommendation for a coding workload is the one E57 actually
 measured fastest: `--ram 48`, speculation off** — with the caveat that E57 could not attribute why.
+
+---
+
+## 10. Upstream re-survey (2026-08-24) — new work since the first survey
+
+Verified against `origin` directly, not taken from the PR description.
+
+### 10.1 ADOPT — beneficial, applies to arm64 + Metal
+| PR | commit | what it does | why us |
+|---|---|---|---|
+| #1097 | `31debb7` | DeepSeek-V4 loader pool default **3 → 9 lanes**, claims **1.41x decode** | our TTFT metric excludes decode, so verify on TTFT before believing it helps *us* |
+| #1109 | `93271fd` | ARM64 dotprod probe by compile, `armv8.2-a` first | Apple Silicon build path |
+| #1211 | `c6b951a` | build shard index once per engine open | TTFT includes load, so this lands directly on our metric |
+| #1164 | `74a5270` | resident expert lookup O(1) | high-RAM box, hot path |
+| #1193 | `1d371230` | index expert slots | same hot path |
+| #1162 | `c27a203` | coalesce duplicate concurrent expert loads | expert-store contention |
+| #1121 | `909f2b4` | LRU victim selection respects lowered `ecap` | fixes a cache-thrash loop |
+| #1092 | `b00688b` | second-chance expert eviction | same cache-pressure lane |
+
+### 10.2 ISSUE #900 IS FIXED UPSTREAM — supersedes the W5/W6 plan
+`e36a1c7` (merge of PR #1023) packs hot pinned experts **outside `state->mutex`**. Confirmed present
+upstream; confirmed ABSENT here (`hot_pack_slot_locked` x3, zero `hot_pack_slot_prepare`/`pack_mutex`).
+
+This changes the plan: W5 was "measure PACK_SHARE, then decide whether hand-porting #983 is worth
+the risk". The fix is now a cherry-pick, so the adoption cost collapses and the decision bar drops
+with it. **Still measure** — adopting churn that buys nothing is its own failure — but the
+measurement is now validation, not a go/no-go gate.
+
+### 10.3 OVERLAP — upstream is building the same thing we already shipped
+| PR | commit | overlaps |
+|---|---|---|
+| #941 | `4b9b47d` | expert-major prefill, each distinct expert read once per chunk = our `COLI_V4_MOE_GROUPED` |
+| #1166 | `d2bb447` | batch FP4 expert matmuls during prefill = our `COLI_V4_MOE_BATCHED`, different engine |
+| #1180 | `5129f836` | reuse expert cache + batch shared prefill |
+| #1197 | `44d1970` | batch shared experts during prefill |
+| #1200 | `3d0bab1` | batch dense + shared prefill |
+| #1213 | `ee9bc1f` | double-buffered expert bank prefetch for GPU prefill — latency hiding, not S |
+| #1202/#1203 | `929e99b`/`6896e5f` | hybrid GPU/CPU split on decode misses, DMA overlap — latency hiding, not S |
+
+**Read this honestly:** convergent evolution, and upstream is now moving faster on this lane than we
+are. Our differentiator is not "batching MoE" — they have that too. It is that ours runs **on Metal
+and is bit-exact**, which upstream has no equivalent of for deepseek_v4.
+
+### 10.4 IGNORE
+#1177 (RTX 3090 / Direct I/O / MTP), #1171/#1178/#1155 (CUDA/CPU quant, attention, KV cache),
+#1160/#1212 (CI noise). All x86/CUDA or non-perf.
+
+### 10.5 Apple Silicon datapoints for calibration (decode tok/s)
+M4 Max 128 GB `#1210` **0.45** (TB5 SSD, iobench 12.49 GB/s) | M1 Max 64 GB `#1030` **0.61**
+(Metal ~2.5x CPU, thermally sensitive) | M3 Max 128 GB `#47` **0.35–0.45**.
+Ours on M3 Max measures **~1.2–1.5 tok/s** decode — 2-3x the published figures for comparable
+hardware. Treat with suspicion until compared like-for-like (prompt, topp, RAM_GB all differ).
+
+---
+
+## 11. B8 — MIN_N threshold sweep for `COLI_V4_MOE_BATCHED`  **[next experiment]**
+
+### The question
+Metal loses badly at S=1 and only becomes worthwhile around S>=4. The scalar wrapper invokes the
+batch kernel with `batch_rows=1` (`c/backend_metal_v4.mm:979`), and the grouped scheduler therefore
+offloads only groups of >= `COLI_V4_MOE_BATCHED_MIN_N` (default 4).
+
+**Raising MIN_N 4 → 8 is NOT automatically faster.** It makes each accepted dispatch larger but sends
+FEWER groups to Metal. And the down projection measured faster at S=4 (2.413x) than S=8 (1.933x) in
+`validation/probes/mxfp4_s_scaling.m`. That inversion is non-monotonic in a way that smells like
+noise, and it was measured while a stray process was stealing a core — **re-measure it on the clean
+host before treating it as a kernel property.**
+
+### Design — interleaved sweep of MIN_N ∈ {4, 5, 6, 8, 12, 16}
+Record per threshold:
+- TTFT **and** decode separately (`time_to_first_token=` / `after_first=` — already emitted)
+- number of offloaded groups
+- rows handled by Metal
+- group-size histogram
+- Metal dispatch/wait time
+- CPU fallback time
+
+Instrumentation for the middle four did not exist and has been added to
+`coli_v4_moe_grouped_stats_emit`:
+```
+moe_batched min_n=N groups=N rows=N ms=N rejects=N | cpu_rows=N cpu_ms=N | metal_row_share=N%
+moe_group_hist 1:N 2:N 3:N 4:N ...
+```
+The histogram counts **every** group regardless of path, so the capture rate of any candidate
+threshold is a property of the measured distribution rather than something re-derived per run. That
+is what makes a losing threshold interpretable: it distinguishes "few groups reach 8" from "the ones
+that do cannot offset the CPU absorbing 4-7".
+
+### Beyond the threshold — the real ways to raise S
+The threshold only *selects* from the group sizes routing happens to produce. To actually raise S:
+1. **Continuous batching across concurrent decode requests** — needs a scheduler; biggest structural win.
+2. **Grouping accepted speculative tokens before expert execution** — caution: upstream #689 reports
+   deep speculative verify batches are not token-exact on CUDA; our bit-exactness bar is absolute.
+3. **Grouping routes across a larger prefill window**, bounded by expert-cache capacity.
+4. **Fusing multiple expert ops into fewer command buffers** — we already did this once for `wo_a`
+   (A6, 8 dispatches → 1); the same shape should apply here.
+5. **A small hot-expert set in private GPU-optimised buffers** — the only idea that could rescue S=1,
+   which is where the GPU currently loses 0.40x.
