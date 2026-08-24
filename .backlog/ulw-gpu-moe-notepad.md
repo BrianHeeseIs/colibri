@@ -405,3 +405,46 @@ RAM is **137.4 GB** (an earlier plan claimed 128 — wrong). Swap was 95% used w
 eased to 9341M used / 3970M free after stopping it. Rebuild ALWAYS with
 `make -C c -f Makefile.deepseek-v4 METAL=1 deepseek-v4 -j8`; verify with
 `nm c/deepseek_v4 | grep -c coli_v4_metal_expert_forward_batch` > 0.
+
+## W3.3/W3.4 RESOLVED — KEEP 1684e89 (neutral). And a near-miss worth recording.
+
+### Verdict (clean host, N=5, run_ttft + ab.sh --math)
+OFF = tuning ACTIVE (13 threads, the pick) | ON = `COLI_NO_OMP_TUNE=1` (16 threads, old)
+
+| prompt | pick | old | delta | verdict |
+|---|---|---|---|---|
+| p064 | 32.759 | 32.721 | **-0.12 %** | within band |
+| p256 | 84.667 | 84.111 | **-0.66 %** | within band |
+
+Neither prompt reaches the -1.5 % revert trigger. **KEEP**, per the decision table's neutral row:
+adopt for upstream parity, and carry the F3 caveat.
+
+### F3 caveat (still true, still recorded)
+`COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER` has **9 guards in c/deepseek_v4.c and 0 occurrences in
+the build config**, so the commit reserves 3 of 16 CPUs for a loader pool that is never compiled
+in here. The measurement says that costs us nothing detectable (<=0.66 %), which is a *weaker*
+claim than "it is harmless" — it means the reserved cores were not the bottleneck on this metric.
+Revisit if that pool is ever enabled.
+
+### THE NEAR-MISS — this is the part to remember
+The FIRST attempt at this gate ran while a stray `perl` process (an IBAN scan, `NL[0-9]{2}...`)
+had been pinning a full core for **4 days 12 hours**. Under that contamination:
+
+    p064 +1.12 %   p256 -2.37 %   -> would have TRIGGERED A REVERT
+
+After killing the perl (and its `xargs -0` parent, which would otherwise respawn it), the same
+comparison gives -0.12 % / -0.66 % -> KEEP. **The noise did not merely widen the error bars; it
+flipped the decision.** Within-arm spread went from 4.69-4.85 % to 0.76 % on the tight arm.
+
+Rule reinforced: before trusting an A/B, check `ps aux` for anything above ~15 % CPU that is not
+yours. A single stolen core on a 16-core box is enough to invent a 2.4 % regression.
+
+### W0.6 shipped-config TTFT baseline — SATISFIED by arm A5
+Same binary, same shipped flags, N=5, clean host:
+  p064 median **32.759 s**  (values 33.142 33.680 32.759 32.548 32.568)
+  p256 median **84.667 s**  (values 84.667 84.370 85.012 84.591 84.730, spread 0.76 %)
+This is the denominator for the #900 PACK_SHARE work and the reference for future --math checks.
+
+### Host hygiene note
+`mds_stores` / CoreServices was also observed at ~94 % CPU (Spotlight indexing). Not killed — it is
+a system service — but it is a known contributor to the residual p064 spread (~3.5 %).
