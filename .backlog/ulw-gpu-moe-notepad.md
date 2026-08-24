@@ -448,3 +448,29 @@ This is the denominator for the #900 PACK_SHARE work and the reference for futur
 ### Host hygiene note
 `mds_stores` / CoreServices was also observed at ~94 % CPU (Spotlight indexing). Not killed — it is
 a system service — but it is a known contributor to the residual p064 spread (~3.5 %).
+
+## W4.1 ADJACENT REGRESSION — 5/6 in band
+| lane | prompt | measured | expected | drift | verdict |
+|---|---|---|---|---|---|
+| GROUPED alone | p064 | 1.011x (-1.05%) | -4.4% | +3.35pp | **OUT OF BAND** |
+| GROUPED alone | p256 | 1.032x (-3.09%) | -3.6% | +0.51pp | PASS |
+| METAL_ATTN alone | p064 | 1.132x (-11.68%) | -11.5% | -0.18pp | PASS |
+| METAL_ATTN alone | p256 | 1.145x (-12.68%) | -13.0% | +0.32pp | PASS |
+| BATCHED increment | p064 | 1.117x (-10.46%) | -10.8% | +0.34pp | PASS |
+| BATCHED increment | p256 | 1.128x (-11.31%) | -11.7% | +0.39pp | PASS |
+
+**The shipped stack is confirmed.** METAL_ATTN and BATCHED — the two lanes carrying the headline —
+reproduce within 0.4pp on both prompts.
+
+### The GROUPED p064 outlier, and a hypothesis I am RETRACTING
+I suspected `1684e89` (16 -> 13 compute threads) was hurting the CPU-only path while being masked
+under Metal offload. **That is not supported**: if it were, ATTN and BATCHED bare-vs-flag would have
+shifted too, and both landed within 0.4pp.
+
+Better explanation: GROUPED is the SMALLEST effect (4.4pp) measured on the NOISIEST prompt, and the
+bare baseline drifted **+2.64% on p064** between the GROUPED and ATTN A/Bs, which ran ~26 min apart.
+A 3.35pp drift on a 4.4pp effect sits inside that envelope. Recorded as UNRESOLVED, not as a pass —
+it does not affect the shipped stack, which always runs all three flags together.
+
+Follow-up if it matters later: re-run GROUPED alone back-to-back with a bare arm in the SAME ab.sh
+invocation (it interleaves, so drift cancels) rather than comparing across separately-run A/Bs.
