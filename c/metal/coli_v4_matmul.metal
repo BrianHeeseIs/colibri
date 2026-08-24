@@ -200,13 +200,21 @@ kernel void coli_v4_matmul_mxfp4_ordered_hot_xcache(
         int base = g * 32, glen = 32;
         if (base + glen > D.I) glen = D.I - base;
         float sc = coli_v4_mx4_scale(e8s[((long)(tile * D.ng) + g) * 16 + lane]);
-        float ga = 0.0f;
+        /* Scale is applied PER COLUMN, not factored out per 32-group.  This kernel must
+         * match coli_fp4_dual_matvec_rows16_v10's NEON inner loop, which does
+         * sums += (x * w) * scale for every column.  Both forms are individually exact
+         * (UE8M0 scales are powers of two) but they build DIFFERENT summation trees:
+         * factoring the scale out sums 32 unscaled products before rounding, while the
+         * CPU rounds each scaled product into the running total.  Measured divergence
+         * between the two orders is 96.25% of dot products, which is why the rows16 path
+         * failed golden while the cold kernel - whose per-group form matches the scalar
+         * matmul_mxfp4 reference - passes.  Do not "optimise" this back into a per-group
+         * multiply; it is bit-exactness, not arithmetic waste. */
         for (int i = base; i < base + glen; i += 2) {
             uchar byte = q4[((long)(tile * D.rb) + (i >> 1)) * 16 + lane];
-            ga += xcache[i] * coli_v4_mx4_lut[byte & 0xF];
-            if (i + 1 < base + glen) ga += xcache[i + 1] * coli_v4_mx4_lut[byte >> 4];
+            a += (xcache[i] * coli_v4_mx4_lut[byte & 0xF]) * sc;
+            if (i + 1 < base + glen) a += (xcache[i + 1] * coli_v4_mx4_lut[byte >> 4]) * sc;
         }
-        a += ga * sc;
     }
     y[(long)s * D.O + o] = a;
 }
