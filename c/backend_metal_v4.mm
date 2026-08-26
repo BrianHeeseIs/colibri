@@ -142,9 +142,38 @@ enum {
     COLI_V4_MOE_MAX_INTERMEDIATE = 2048,
     COLI_V4_MOE_FP8_BLOCK = 128,
     COLI_V4_MOE_THREADS = 256,
+    /* Apple GPUFamily 9 threadExecutionWidth. The simdgroup matmul geometry below maps one
+     * simdgroup to one output row, so this must equal the device's actual execution width --
+     * coli_v4_get_chain_pipelines verifies that against the pipeline before selecting it. */
+    COLI_V4_MOE_SIMD_WIDTH = 32,
 };
 
 typedef struct { int S, I, O, rb, ng; } ColiV4MatmulDims;
+
+/* The expert chain encodes three matmuls (gate, up, down) that differ only in their output
+ * dimension. They previously carried three copies of the dispatch geometry; a kernel whose
+ * grid shape differs would have needed that copied correctly three times, and a grid bug in
+ * exactly one of them produces a plausible wrong answer rather than a crash. One helper. */
+typedef enum {
+    /* One thread per (s,o). Grid (ceil(O/256), S). Used by the ordered/xcache kernels, whose
+     * threadgroup also stages the x vector, so all threads in a group must share one s. */
+    COLI_V4_MATMUL_GEOM_ROWS = 0,
+    /* One simdgroup per (s,o); lane L owns group gb+L. Grid (32, S*O). Used by simd_exact. */
+    COLI_V4_MATMUL_GEOM_SIMDGROUP = 1,
+} ColiV4MatmulGeometry;
+
+static void coli_v4_encode_matmul(id<MTLComputeCommandEncoder> encoder,
+                                  ColiV4MatmulGeometry geometry,
+                                  NSUInteger out_dim, NSUInteger batch) {
+    if (geometry == COLI_V4_MATMUL_GEOM_SIMDGROUP) {
+        [encoder dispatchThreadgroups:MTLSizeMake(1, batch * out_dim, 1)
+                threadsPerThreadgroup:MTLSizeMake(COLI_V4_MOE_SIMD_WIDTH, 1, 1)];
+        return;
+    }
+    [encoder dispatchThreadgroups:MTLSizeMake(
+                (out_dim + COLI_V4_MOE_THREADS - 1) / COLI_V4_MOE_THREADS, batch, 1)
+            threadsPerThreadgroup:MTLSizeMake(COLI_V4_MOE_THREADS, 1, 1)];
+}
 typedef struct { int length, block_size; } ColiV4QdqParams;
 typedef struct { int dimension; float limit; } ColiV4SwigluParams;
 typedef struct { int n; float w; } ColiV4WeightedBf16Params;
@@ -722,6 +751,7 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward_batc
     }
 
     id<MTLComputePipelineState> matmul_pipeline = nil;
+    ColiV4MatmulGeometry matmul_geometry = COLI_V4_MATMUL_GEOM_ROWS;
     if (!coli_v4_get_chain_pipelines(block_rows, &matmul_pipeline)) {
         coli_v4_metal_reject(COLI_V4_METAL_REJECT_PIPELINES);
         return -1;
@@ -840,7 +870,6 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward_batc
         const uint32_t hidden_count = (uint32_t)(batch * hidden);
         const MTLSize qdq_threads = MTLSizeMake(COLI_V4_MOE_FP8_BLOCK, 1, 1);
         const MTLSize element_threads = MTLSizeMake(COLI_V4_MOE_THREADS, 1, 1);
-        const MTLSize matmul_threads = MTLSizeMake(COLI_V4_MOE_THREADS, 1, 1);
 #define COLI_V4_PROFILE_FLUSH(stage) do { \
         if (coli_v4_metal_profile_enabled_value) { \
             [encoder endEncoding]; \
@@ -873,18 +902,14 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward_batc
         [encoder setBuffer:gate_scales_buffer offset:gate_scales_offset atIndex:2];
         [encoder setBuffer:coli_v4_gate_scratch offset:0 atIndex:3];
         [encoder setBytes:&gate_dims length:sizeof(gate_dims) atIndex:4];
-        [encoder dispatchThreadgroups:MTLSizeMake(
-            ((NSUInteger)intermediate + COLI_V4_MOE_THREADS - 1) / COLI_V4_MOE_THREADS,
-            (NSUInteger)batch, 1) threadsPerThreadgroup:matmul_threads];
+        coli_v4_encode_matmul(encoder, matmul_geometry, (NSUInteger)intermediate, (NSUInteger)batch);
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_MATMUL_GATE);
         [encoder setComputePipelineState:matmul_pipeline];
         [encoder setBuffer:coli_v4_qdq_scratch offset:0 atIndex:0];
         [encoder setBuffer:up_q4_buffer offset:up_q4_offset atIndex:1];
         [encoder setBuffer:up_scales_buffer offset:up_scales_offset atIndex:2];
         [encoder setBuffer:coli_v4_up_scratch offset:0 atIndex:3];
-        [encoder dispatchThreadgroups:MTLSizeMake(
-            ((NSUInteger)intermediate + COLI_V4_MOE_THREADS - 1) / COLI_V4_MOE_THREADS,
-            (NSUInteger)batch, 1) threadsPerThreadgroup:matmul_threads];
+        coli_v4_encode_matmul(encoder, matmul_geometry, (NSUInteger)intermediate, (NSUInteger)batch);
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_MATMUL_UP);
 
@@ -940,9 +965,7 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward_batc
         [encoder setBuffer:down_scales_buffer offset:down_scales_offset atIndex:2];
         [encoder setBuffer:coli_v4_output_scratch offset:0 atIndex:3];
         [encoder setBytes:&down_dims length:sizeof(down_dims) atIndex:4];
-        [encoder dispatchThreadgroups:MTLSizeMake(
-            ((NSUInteger)hidden + COLI_V4_MOE_THREADS - 1) / COLI_V4_MOE_THREADS,
-            (NSUInteger)batch, 1) threadsPerThreadgroup:matmul_threads];
+        coli_v4_encode_matmul(encoder, matmul_geometry, (NSUInteger)hidden, (NSUInteger)batch);
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         COLI_V4_PROFILE_FLUSH(COLI_V4_PROFILE_MATMUL_DOWN);
 
