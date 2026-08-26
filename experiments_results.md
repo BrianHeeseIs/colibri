@@ -4684,3 +4684,91 @@ Characterise the `simd` variant end-to-end: what it is, whether it passes the ta
 what it does to decode when wired into the expert path. This supersedes both remaining item-2
 proposals and the concurrent-batching lane, because it wins at S=1 and therefore needs no
 concurrency at all.
+
+## E95. The `simd` kernel was TIMED but never CHECKED — and a bit-exact replacement beats it
+
+Answers E94's "recommended next step". The answer is not the one E94 expected.
+
+### 1. A harness integrity gap: `bench_matmul` never checked five of its six variants
+`validation/metal/bench_matmul.m` computed its mismatch count against `yg`, and only the `ordered`
+dispatch filled `yg`. Every other variant — `ordered_hot`, `ordered_xcache`, `ordered_hot_xcache`,
+`simd` — was dispatched with `out=NULL`. **A kernel returning garbage would have benchmarked
+exactly as fast as a correct one.** E94's line "simd bit-exactness status is inferred from its
+exclusion from best EXACT" was therefore not a measurement at all; nothing had ever been compared.
+
+Fixed: every variant now gets its own output buffer and its own mismatch count against the CPU
+reference. Two divergences surfaced immediately, one real and one benign:
+
+| variant | mismatches / 2048 (gate\|up S=1) | verdict |
+|---|---|---|
+| `ordered`, `ordered_hot`, `ordered_xcache` | 0 | bit-exact, as assumed |
+| `ordered_hot_xcache` | 1976 | **expected** — deliberately applies the scale PER COLUMN to match `coli_fp4_dual_matvec_rows16_v10`'s NEON loop, a different reference than the cold scalar path (see `c/metal/coli_v4_matmul.metal:203-212`). Compared here against the wrong reference, not a defect |
+| `simd` | 1587 | **real** — see below |
+
+### 2. `simd` carries ~1e-3 relative error, and it is intrinsic
+New gate `validation/metal/probe_simd_parity.m`. On production shapes `simd` shows
+**max relative error 1.06e-3** — three decimal digits — with no NaN/Inf.
+
+Narrowing the UE8M0 per-group scale band from 30 exponents to 4 does **not** reduce it
+(1.49e-3 at spread=4). So this is not adversarial synthetic data; it is the kernel.
+
+**Cause.** The scalar reference contracts `ga += x*w` into a single **fma**, so the product is
+never separately rounded. `simd` computes the product, rounds it to fp32, and only then feeds
+`simd_sum`. That is one extra rounding per column, on top of the tree-vs-serial reassociation.
+
+### 3. New kernel `coli_v4_matmul_mxfp4_simd_exact` — bit-exact AND fast
+Same occupancy idea as `simd` (a whole simdgroup per output row instead of one thread, which is
+what actually wins at S=1: the GPU is thread-starved when O=2048 launches only 2048 threads), but
+the simdgroup is spread over **groups**, not columns. Lane L runs group gb+L's 32-FMA chain
+privately — serial, therefore exact — and only the outer accumulation uses shuffles, with BOTH
+factors shuffled so the outer link stays a single fma. Dependent chain falls from ~4096 links to
+~(32+ng). Consecutive lanes read consecutive 16-byte weight spans, so each round is one contiguous
+512-byte burst.
+
+**Bit-exact on 12 shape/seed/scale-band combinations, ~48k values, zero mismatches**, ragged tails
+included (I not a multiple of 32, O not a multiple of 16, odd I, ng not a multiple of 32).
+
+`bench_matmul 20`, M3 Max, engine not running, OpenMP 16 threads:
+
+| shape | CPU | `ordered_xcache` (THE PRODUCTION KERNEL) | `simd` (approx) | `simd_exact` (bit-exact) |
+|---|---|---|---|---|
+| gate\|up S=1 4096->2048 | 0.428 ms | 0.379 | 0.079 | **0.072 = 5.3x production** |
+| down S=1 2048->4096 | 0.417 ms | 0.199 | 0.055 | **0.068 = 2.9x production** |
+| gate\|up S=8 4096->2048 | 3.012 ms | 0.416 | 0.389 | **0.387 = 1.08x production** |
+
+Quote speedups against `ordered_xcache`, not `ordered`: `c/backend_metal_v4.mm:371-378` shows the
+production chain selects the xcache kernels.
+
+**This supersedes E94's lead.** E94's "biggest unexploited lever" was a NON-bit-exact kernel that
+would have needed the task-level capability gate. `simd_exact` is within 7-14% of it and needs no
+accuracy gate at all — the stronger md5 gate applies instead.
+
+### 4. DEAD LEVER: column-split bit-exact simdgroup reduction (3.6x SLOWER)
+The first cut of `simd_exact` put lane L on COLUMN base+L and replayed the reference sum with a
+per-column shuffle chain. It **is** bit-exact. It measured **1.374 ms vs 0.379 ms for
+`ordered_xcache` on gate|up S=1 — 3.6x slower than production, 17x slower than `simd`.** It keeps
+the full 4096-deep dependent FMA chain and adds two shuffles per link while 31 of 32 lanes do
+redundant work. Do not retry column splitting; the win comes from splitting on GROUPS.
+
+### 5. PRE-REGISTERED prediction and decision rule (written BEFORE any engine measurement)
+Recorded here, and committed before the E96 measurement commit, so the outcome cannot be
+retrofitted. Kernel microbenchmarks over-predict in situ on this host by **2.15x-3.58x**;
+`expert_forward` is only 52.5% of the decode wall; the matmul is only 3 of the 9 dispatches in the
+expert chain; and `COLI_V4_METAL=1` is currently recorded as **1.118x SLOWER** than CPU on decode.
+
+**Prediction.**
+- **TTFT: ~0.** Prefill runs at large S, where the microbench advantage is only 1.08x. Any TTFT win
+  would be a surprise and must be reported as one, not explained after the fact.
+- **tok/s: materially better than `metal_ordered`; whether it beats CPU is genuinely open.**
+  Point estimate: CPU-relative moves from ~0.89x to somewhere in 1.0x-1.3x.
+
+**Decision rule.**
+| outcome | action |
+|---|---|
+| any correctness gate fails | **REJECT the wiring.** Revert the seam commits, keep the kernel, probes and ledger |
+| bit-exact passes AND median tok/s beats CPU by >10% at n>=5 on BOTH p064 and p256, AND TTFT not worse than +2% | **KEEP, default-on candidate** (operator decides the default) |
+| bit-exact passes AND beats `metal_ordered` by >10% but not CPU | **KEEP as documented opt-in, default OFF** — it makes the Metal expert path viable and is the prerequisite for any dispatch-fusion work |
+| not better than `metal_ordered` beyond the noise floor | **REJECT the wiring**, record the negative result |
+
+10% is the threshold because the recorded decode spread on this host is 5-13%; anything smaller
+cannot be resolved, and several apparent effects here reversed when a fifth point was added.
