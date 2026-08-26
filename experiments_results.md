@@ -4569,3 +4569,61 @@ bit-exact.
 **Keep it OFF for:** `bench/golden.sh`, any bit-exactness differential, and regression triage —
 anything that needs a stable md5. Output is nondeterministic at p064 (two variants over eight runs),
 stable-per-arm at p256, bit-exact at p512.
+
+---
+
+## E93. LENGTH-SCALING of the gains measured today — growth factors
+
+Two features measured today both improve with prompt length on TTFT. This is unusual here: most
+optimisations in this ledger DECAY with length because O(n^2) attention dilutes them (prefill
+prefetch 6.20 -> 2.70 %, grouped MoE 4.15 -> 2.09 %). Recording the growth factors explicitly,
+because they change which prompts a feature is worth enabling for.
+
+Prompt sizes: p064 = 61 words, p256 = 165 words (2.7x), p512 = 331 words (5.4x).
+
+### `COLI_V4_KERNELS=all` — TTFT gain grows 1.94x from p064 to p512
+| prompt | words | TTFT delta | growth vs p064 |
+|---|---|---|---|
+| p064 | 61 | **-10.44 %** | 1.00x |
+| p256 | 165 | **-17.99 %** | **1.72x** |
+| p512 | 331 | **-20.23 %** | **1.94x** |
+
+Per-leg: p064->p256 **1.72x**, p256->p512 **1.12x**. The growth is real but DECELERATING — most of
+it is captured by p256, and the curve is flattening by p512. Extrapolating further would be
+unjustified; p1024 was not measured.
+
+Absolute time saved grows far faster than the percentage: **3.94 s** at p064, **17.87 s** at p256,
+**42.31 s** at p512 — a **10.7x** increase in seconds saved across a 5.4x increase in prompt size.
+On long-prompt workloads this is the dominant effect.
+
+### rows16 batching — TTFT gain grows 1.18x from p064 to p256
+| prompt | TTFT delta | growth vs p064 |
+|---|---|---|
+| p064 | -4.64 % | 1.00x |
+| p256 | -5.49 % | **1.18x** |
+
+Measured in E86 before the flag was parked as non-bit-exact. Same direction, much weaker slope, and
+only two points — treat 1.18x as indicative, not a trend.
+
+### The tok/s axis does NOT grow — do not assume symmetry
+| prompt | tok/s delta |
+|---|---|
+| p064 | +16.66 % |
+| p256 | +12.08 % |
+| p512 | +20.12 % |
+
+**Non-monotonic.** p256 is a dip. The correct statement is 12-20 % across p064-p512 with no trend at
+n=2. This is worth stating loudly because the TTFT growth invites the assumption that both axes
+scale together — they do not, and an E91 conclusion drawn from only p064 and p256 asserted a
+*decline* that the p512 point refuted.
+
+### Mechanism
+`attn_sparse` is one of the two kernels `KERNELS=all` enables, and attention is the O(n^2) term of
+prefill. As the prompt lengthens, attention's share of TTFT grows, so the share of work the fast
+kernel accelerates grows with it — hence a rising percentage. Decode has no equivalent growth term:
+per-token cost is roughly length-independent, which is consistent with the flat/noisy tok/s row.
+
+### Practical consequence
+`COLI_V4_KERNELS=all` should be enabled preferentially for LONG prompts, where it is both largest
+(-20.2 % TTFT, 42 s saved at p512) and, on the evidence at p512, bit-exact. Its weakest case is
+short-prompt TTFT at -10.4 %, which is still the second-largest TTFT win in this ledger.
