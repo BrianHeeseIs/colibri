@@ -4014,7 +4014,15 @@ GPU-vs-CPU for that layout (E84). Proving rows16 bit-exact is worth more than th
 
 ---
 
-## E86. rows16 proven bit-exact — E85's "biggest lever" cashed, **1.049x / 1.058x incremental**
+## E86. rows16 — real 1.049x/1.058x gain, but **NOT bit-exact**; golden PASSED and was insufficient
+
+> **CORRECTION (same session).** This entry originally claimed rows16 was proven bit-exact on the
+> strength of `golden` passing with the flag ON. **That claim was wrong and is retracted.** A
+> differential on the longer p256 prompt diverges. See "Falsification" at the end of this entry.
+> The performance numbers below stand; the correctness verdict does not. The flag remains OFF and
+> is **not shippable** until the residual divergence is found. Details of the retracted reasoning
+> are kept deliberately, because the failure mode — a single-prompt gate mistaken for a proof —
+> is the reusable lesson.
 
 E85 closed by arguing that removing the `block_rows == 1` gate was worth more than the entire MIN_N
 sweep, blocked only by the absence of a bit-exactness proof for rows16. That proof now exists, and
@@ -4107,3 +4115,38 @@ COLI_V4_METAL=1 COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 \
   N=3 ./bench/ab.sh "COLI_V4_MOE_BATCHED_ROWS16=1" ./c/deepseek_v4
 ```
 Raw log: `.backlog/lab/rows16_ab_20260825-002043.log`.
+
+### Falsification — the bit-exactness claim above is RETRACTED
+
+`golden` passing was treated as proof. It is not. Its prompt is ~20 tokens and fits a single
+64-token prefill chunk, so it never exercises the multi-chunk, larger-S regime that the real
+benchmark prompts do. A differential on p256 (184 tokens, 3 chunks), 60 tokens generated:
+
+| run | rows16 OFF | rows16 ON |
+|---|---|---|
+| 1 | `a7c26649d499596915fa54137e2e28f4` | `32ae1a03e511b85f4a9f6ea8f046f28c` |
+| 2 | `a7c26649d499596915fa54137e2e28f4` | `32ae1a03e511b85f4a9f6ea8f046f28c` |
+
+**Both configurations are individually deterministic and they disagree.** That is the same control
+used at E36 to separate real reassociation from engine nondeterminism, and it rules the divergence
+IN: it is attributable to the rows16 path, not to run-to-run noise.
+
+So the per-column scale fix is **necessary but not sufficient**. It removed the divergence in the
+short single-chunk case (golden went FAIL -> PASS, genuinely, with the path executing) but a second
+divergence source remains that only manifests at p256 scale. Prime suspects, none yet tested:
+multi-chunk prefill, S>1 batching in the hot kernel, or a different CPU rows16 reference variant
+taking over at larger sizes. Note also that the metallib carries a second kernel
+`coli_v4_matmul_mxfp4_ordered_hot` (non-xcache) whose selection rule was never established.
+
+**Method lesson, which is the durable part of this entry:** a correctness gate is only as strong as
+the regime it exercises. `golden` is a necessary gate, not a sufficient one, for any feature whose
+code path is conditioned on batch/group/chunk size. Any such feature needs a differential on a
+multi-chunk prompt before "bit-exact" may be written down. The pre-fix golden FAIL did prove path
+execution, so golden remains useful as a fast screen — it just cannot certify.
+
+### Standing status
+- Performance: **real and reproduced** (-4.64% p064, -5.49% p256, non-overlapping ranges).
+- Correctness: **NOT bit-exact.** Meaning retention IS established on the short prompt (fluent,
+  semantically identical, one argmax flip); meaning retention at p256 scale is NOT yet assessed.
+- Flag `COLI_V4_MOE_BATCHED_ROWS16` stays **default OFF**. Not shippable as bit-exact. Retained as a
+  candidate under a non-bit-exact/meaning-retained acceptance bar, which requires its own evaluation.
