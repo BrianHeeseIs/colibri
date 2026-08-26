@@ -55,6 +55,13 @@ kernel void coli_v4_matmul_mxfp4_ordered(
 // SIMD: one simdgroup per (s,o); lane L owns column base+L.
 // V4 block_columns == 32 == threadExecutionWidth, so one FP4 group maps to one simdgroup.
 // Group-level scale structure is preserved; only the intra-group summation order changes.
+//
+// NOT BIT-EXACT. simd_sum() is a tree reduction; the CPU reference sums the 32 columns
+// serially. Measured against the scalar reference by validation/metal/probe_simd_parity:
+// max relative error ~1e-3 on production shapes (the outer `a += ga*sc` accumulation over
+// 128 groups whose UE8M0 scales span many exponents amplifies the ~1e-7 inner difference).
+// Use only behind a task-level capability gate. For a BIT-EXACT simdgroup kernel with the
+// same occupancy, see coli_v4_matmul_mxfp4_simd_exact below.
 kernel void coli_v4_matmul_mxfp4_simd(
         device const float          *x   [[buffer(0)]],
         device const uchar          *q4  [[buffer(1)]],
@@ -84,6 +91,66 @@ kernel void coli_v4_matmul_mxfp4_simd(
         }
         float ga = simd_sum(v);              // uniform: every lane participates
         a += ga * coli_v4_mx4_scale(scl[g]);
+    }
+    if (lane == 0) y[(long)s * D.O + o] = a;
+}
+
+// SIMD-EXACT: bit-identical to coli_v4_matmul_mxfp4_ordered, with the simdgroup spread over
+// GROUPS rather than over columns.
+//
+// The reference accumulation is two-level and BOTH levels are strictly serial:
+//     inner: ga = 0; ga = fma(x[base+0], w0, ga); fma(x[base+1], w1, ga); ...   (32 columns)
+//     outer: a  = 0; a  = fma(ga_0, sc_0, a);     fma(ga_1, sc_1, a);  ...      (ng groups)
+// (each `+=` of a product is contracted into one fma, so the product is never separately
+// rounded -- reproducing that is what bit-exactness turns on).
+//
+// A previous cut of this kernel put lane L on COLUMN base+L and replayed the inner sum with
+// per-column shuffles. That is bit-exact but was measured at 1.374 ms vs 0.379 ms for
+// ordered_xcache on gate|up S=1 -- 3.6x SLOWER. It keeps the full 4096-deep dependent FMA chain
+// AND adds two shuffles per link, with 31 of 32 lanes doing redundant work. Recorded as dead.
+//
+// This version instead puts lane L on GROUP gb+L. Each lane runs ONE group's 32-FMA inner chain
+// privately -- serial, therefore exact -- and all 32 groups run concurrently. Only the outer
+// accumulation needs shuffles, and it needs ng of them instead of I. The dependent chain falls
+// from ~4096 links to ~(32 + ng). Both factors are shuffled so the outer link stays a single
+// fma, matching the reference rounding.
+//
+// Memory behaviour is also better than the column split: lane L reads w[16*(gb+L) .. +16), so
+// consecutive lanes read consecutive 16-byte spans -- one contiguous 512-byte burst per round.
+kernel void coli_v4_matmul_mxfp4_simd_exact(
+        device const float          *x   [[buffer(0)]],
+        device const uchar          *q4  [[buffer(1)]],
+        device const uchar          *e8s [[buffer(2)]],
+        device float                *y   [[buffer(3)]],
+        constant ColiV4MatmulDims   &D   [[buffer(4)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    int lane = (int)gid.x;
+    int idx  = (int)gid.y;
+    if (idx >= D.S * D.O) return;          // uniform: whole simdgroup shares idx
+    int s = idx / D.O;
+    int o = idx % D.O;
+    device const uchar *w   = q4  + (long)o * D.rb;
+    device const uchar *scl = e8s + (long)o * D.ng;
+    device const float *xs  = x   + (long)s * D.I;
+
+    float a = 0.0f;
+    for (int gb = 0; gb < D.ng; gb += 32) {
+        int g  = gb + lane;
+        float ga = 0.0f, sc = 0.0f;
+        if (g < D.ng) {
+            int base = g * 32, glen = 32;
+            if (base + glen > D.I) glen = D.I - base;
+            for (int i = base; i < base + glen; i += 2) {
+                uchar byte = w[i >> 1];
+                ga = fma(xs[i], coli_v4_mx4_lut[byte & 0xF], ga);
+                if (i + 1 < base + glen)
+                    ga = fma(xs[i + 1], coli_v4_mx4_lut[byte >> 4], ga);
+            }
+            sc = coli_v4_mx4_scale(scl[g]);
+        }
+        int n = D.ng - gb; if (n > 32) n = 32;   // uniform across the simdgroup
+        for (int l = 0; l < n; ++l)
+            a = fma(simd_shuffle(ga, (ushort)l), simd_shuffle(sc, (ushort)l), a);
     }
     if (lane == 0) y[(long)s * D.O + o] = a;
 }
