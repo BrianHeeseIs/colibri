@@ -4772,3 +4772,88 @@ expert chain; and `COLI_V4_METAL=1` is currently recorded as **1.118x SLOWER** t
 
 10% is the threshold because the recorded decode spread on this host is 5-13%; anything smaller
 cannot be resolved, and several apparent effects here reversed when a fifth point was added.
+
+## E96. `simd_exact` wired into the expert path — **bit-exact, +33.9% tok/s, and a TTFT surprise**
+
+Executes E95's plan. All correctness gates that were run PASSED. The performance measurement is
+**PARTIAL**: the remaining runs are specified in `.backlog/simd-exact-remaining-measurements.md`.
+Every number below is labelled with its N. Nothing here is extrapolated.
+
+### What shipped
+`COLI_V4_METAL_VARIANT=simd_exact_cold` (variant 4) selects `coli_v4_matmul_mxfp4_simd_exact` for
+the three expert matmuls when the expert is in the cold (`block_rows==1`) layout. Default is
+unchanged (`ordered_cold`). `simd_cold`/`simd_hot` remain rejected — that kernel's 1.06e-3 error
+is recorded in E95.
+
+Three guards, each of which exists because its absence would have produced a believable wrong
+number rather than a failure:
+1. **`threadExecutionWidth == 32` check.** The bit-exactness argument requires one threadgroup to
+   be exactly one simdgroup. On a device of a different width the pipeline is refused, not used.
+2. **rows16 falls back, does not reject.** Rejecting returns -1, which sends that expert to the
+   **CPU** — turning a kernel A/B into a GPU-vs-CPU swap and making the measurement mean nothing.
+   It falls back to `ordered_hot_xcache` and increments a counter instead.
+3. **The probe refuses unrecognised variant strings.** `coli_v4_metal_read_environment` maps any
+   unknown variant to 0 = the production baseline. A typo would therefore compare the baseline
+   against itself and report a perfect match. `probe_expert_variant` exits 2 in that state. This
+   fired for real during the RED phase.
+
+### Correctness — every gate run, PASSED
+| gate | result |
+|---|---|
+| `probe_simd_parity` — kernel vs scalar reference | **0 bit-mismatches** on 12 shape/seed/scale-band combos, ~48k values, ragged tails included |
+| `probe_expert_variant` — the SEAM, not the kernel, at batch 1 and 8 | RED before wiring (rc=2, unrecognised variant); **GREEN after: digests identical** `d25414e617ca191f` / `fd1cac6e801bba12` |
+| `bench/golden.sh` x3 (cpu / metal+ordered / metal+simd_exact) | **3x PASS `5d04890413ff539e802985ce8c727814`** |
+| execution proof (`COLI_V4_METAL_STATS=1`, 8 tokens) | `v4_metal_simd_exact matmuls=` **0 without the flag, 11544 with it**; `rows16_fallbacks=0` |
+| **multi-chunk differential p256** (184 tokens, 3 chunks), N=2, 60 tokens | both arms **deterministic**, **identical** `md5=e44c2b5ca42288fcc5e06888a1c62497` |
+
+The p256 differential is the gate golden cannot give: golden's ~20-token prompt fits one 64-token
+prefill chunk, and a prior "bit-exact" claim in this project passed golden then diverged on p256.
+The determinism control was run first, so the matching md5 means something.
+
+**p512 was started and interrupted; it has no data.** Backlogged.
+
+### Performance — p256, N=2, 60 tokens (PROVISIONAL)
+| arm | tok/s | TTFT |
+|---|---|---|
+| `metal_ord` (COLI_V4_METAL=1, today's Metal path) | 0.9724 | 143.70 / 143.81 s |
+| `metal_simd` (+ `COLI_V4_METAL_VARIANT=simd_exact_cold`) | **1.30205** | 119.90 / 119.70 s |
+| | **+33.90% tok/s** | **-16.6% TTFT** |
+
+**N=2 is below the n>=5 this project requires for decode**, and that limit is stated here rather
+than worked around. What supports reading the delta anyway: the recorded decode noise floor is
+5-13% and this delta is 33.9%; the `metal_simd` arm's own two points differ by 0.2%
+(1.3006 / 1.3035); and both arms reproduced their md5 exactly. It is nonetheless provisional.
+
+### The TTFT result CONTRADICTS the E95 pre-registration
+E95 predicted, before any engine ran: *"TTFT: ~0. Prefill runs at large S, where the microbench
+advantage is only 1.08x. Any TTFT win would be a surprise and must be reported as one, not
+explained after the fact."*
+
+TTFT fell **16.6%**. That is a surprise and is reported as one. The prediction was wrong because it
+reasoned from the S=8 microbench as if prefill ran entirely at large S. It does not: the batched
+MoE path gates at `MIN_N=4`, so prefill dispatches a distribution of group sizes starting at 4,
+and the `simd_exact` advantage is largest exactly at the small end of that distribution.
+
+Caveat that keeps this honest: this TTFT number comes from **`tokps.sh`**, not from `bench/ab.sh`,
+which is the TTFT harness. It should be confirmed on `ab.sh` with the export-vs-ON_ENV isolation
+handled correctly. Backlogged as item 4.
+
+### Verdict under E95's pre-registered decision rule
+The rule's top branch requires beating **CPU** by >10% at n>=5 on both p064 and p256. **The CPU arm
+was not run**, so that branch is not evidenced and is not claimed.
+
+What IS evidenced is the third branch — *"beats `metal_ordered` by >10% but CPU unmeasured"*:
+
+> **KEEP as a documented opt-in, default OFF.**
+
+This is not a consolation. Project memory recorded `COLI_V4_METAL=1` as **1.118x SLOWER** than CPU,
+which is why the Metal expert path was unused. A 33.9% decode gain on that path is roughly the size
+needed to erase that deficit, which would make the Metal expert path viable for the first time —
+but "roughly the size needed" is arithmetic, not a measurement, and the CPU arm is what settles it.
+
+### What this changes about E90 and E94
+E94 named the approximate `simd` kernel the biggest unexploited lever and said it would need the
+task-level capability gate. It does not: the bit-exact form is within 7-14% of it and clears the
+stronger md5 gate instead. E90's dispatch-fusion idea also deserves re-sizing rather than burial —
+with the matmul now ~5x cheaper at S=1, per-call submit+wait is a proportionally larger share of
+the expert chain than when fusion was last measured.

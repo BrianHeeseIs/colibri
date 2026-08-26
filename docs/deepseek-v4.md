@@ -80,6 +80,40 @@ generation and one active KV slot; tools and grammar are rejected. Requests
 re-prefill their context, while the process, weights, dense tensors, head, and
 expert cache stay warm.
 
+### Apple Silicon: the Metal expert path (`METAL=1` builds)
+
+Build with `make -f Makefile.deepseek-v4 METAL=1 deepseek-v4`. `METAL` defaults to `0`
+and a plain `make` compiles the seam out with no error and no warning, which makes every
+Metal environment variable a silent no-op — check with
+`nm c/deepseek_v4 | grep -c coli_v4_metal_expert_forward_batch`.
+
+| variable | default | effect |
+|---|---|---|
+| `COLI_V4_METAL=1` | off | run the routed-expert forward on the GPU |
+| `COLI_V4_MOE_BATCHED=1` | off | batch expert groups during prefill (gated by `COLI_V4_MOE_BATCHED_MIN_N`, default 4) |
+| `COLI_V4_METAL_VARIANT=simd_exact_cold` | `ordered_cold` | use the simdgroup expert matmul |
+| `COLI_V4_METAL_STATS=1` | off | print dispatch, reject and `simd_exact` counters at exit |
+
+`simd_exact_cold` maps one simdgroup to each output row instead of one thread. At decode the
+expert matmul is a single row against 2048 outputs, so the default kernel launches only 2048
+threads and leaves the GPU thread-starved; the simdgroup form is a 32x occupancy increase and
+is **bit-identical** to the CPU path — `bench/golden.sh` is unchanged and a multi-chunk p256
+differential produces an identical generated-text md5.
+
+Measured at p256 (N=2, 60 tokens) against `COLI_V4_METAL=1` alone: **+33.9% tok/s and -16.6%
+TTFT**. It is **off by default**: that sample is below the n>=5 this project requires on the
+decode axis, and the comparison against the pure-CPU path has not been run yet. See
+`experiments_results.md` E95/E96.
+
+```bash
+COLI_V4_METAL=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold \
+  ./c/deepseek_v4 /path/to/DeepSeek-V4-Flash "your prompt" --max-tokens 60 --memory-gb 96
+```
+
+Note: an unrecognised `COLI_V4_METAL_VARIANT` value silently falls back to `ordered_cold`, so a
+typo produces the default rather than an error. `COLI_V4_METAL_STATS=1` prints
+`v4_metal_simd_exact matmuls=N`, which is zero unless the simdgroup kernel actually ran.
+
 ## Validation
 
 The tiny safetensors fixture is generated locally, ignored, and not committed:

@@ -78,8 +78,35 @@ OUTPUT HAS NEVER BEEN CHECKED FOR CORRECTNESS. Wire it in, gated, and measure TT
 - The whole 9-dispatch expert chain shares ONE command buffer + encoder, committed once
   (`.mm:~730-955`). So per-expert GPU overhead is one submit+wait, not nine.
 
-## Now
-Plan agent, then wire simd_exact into the production seam.
+## RESULT (session end)
+Shipped on branch `simd-apple-metal`. `COLI_V4_METAL_VARIANT=simd_exact_cold`, default OFF.
+- Correctness: kernel parity 0/48k mismatches; SEAM differential GREEN (identical digests at
+  batch 1 and 8); golden x3 PASS `5d04890413ff539e802985ce8c727814`; execution counter 0 -> 11544;
+  p256 multi-chunk differential identical md5 `e44c2b5ca42288fcc5e06888a1c62497`, both arms
+  deterministic.
+- Perf (p256, N=2, PROVISIONAL): **+33.90% tok/s** (0.9724 -> 1.30205) and **-16.6% TTFT**
+  (143.7 -> 119.9 s) vs `metal_ord`.
+- **The TTFT gain contradicts the E95 pre-registration** (predicted ~0). Reported as a surprise in
+  E96, not explained away. Cause: prefill is not all large-S; the batched path gates at MIN_N=4 so
+  it dispatches a distribution of group sizes starting at 4, where simd_exact is strongest.
+- Verdict under the pre-registered rule: **KEEP as documented opt-in, default OFF** — the CPU arm
+  was not run, so the default-on branch is not evidenced and is not claimed.
+- Deferred runs (p512 differential, 3-arm N=5 at p064/p256 incl. CPU, ab.sh TTFT) with exact
+  commands: `.backlog/simd-exact-remaining-measurements.md`.
+
+## Learnings
+- **A harness that TIMES a variant must also CHECK it.** `bench_matmul` dispatched 5 of 6 variants
+  with `out=NULL`; `simd` carried a 1.06e-3 error through many benchmark runs unnoticed.
+- **Unknown enum values that silently fall back to the baseline are a measurement hazard.**
+  `COLI_V4_METAL_VARIANT=<typo>` parses to 0 = production, so an A/B would compare the baseline
+  with itself and report a clean match. The probe now refuses that state; it fired for real.
+- **Reject vs fall back matters for measurement, not just behaviour.** Rejecting an unsupported
+  layout sends the expert to the CPU, converting a kernel A/B into a GPU-vs-CPU swap.
+- **FMA contraction is part of the bit-exactness contract.** `ga += x*w` contracts to one fma;
+  any GPU form that shuffles the pre-rounded product adds a rounding per column. Shuffle BOTH
+  factors and keep the fma.
+- Split a simdgroup over GROUPS, not columns. Columns keeps the full dependent chain (3.6x slower
+  than production); groups shortens it from ~4096 links to ~(32+ng).
 
 ## Todo
 see TODO list in session

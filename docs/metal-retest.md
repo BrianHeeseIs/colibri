@@ -85,3 +85,38 @@ decode batch-6 projects 2.1x FASTER than CPU, prefill batch-64 projects 6.5x —
 verification (that the first-touch pool is per-slab-one-time rather than recurring with evictions).
 The measured outcome of this document — Metal as currently dispatched is 2.747x slower — still
 stands; the *mechanism* and the *remedy* changed. See E48.
+
+---
+
+## 2026-08-26 update — the remedy landed, and the verdict is now conditional
+
+This document's verdict line ("CONFIRMED slower … lane closed") was correct for the kernel the
+expert path dispatched at the time, and remains correct for it. It is **not** a statement about the
+Metal expert path in general, and should no longer be read as one.
+
+The expert chain selected `coli_v4_matmul_mxfp4_ordered_xcache`, which dispatches **one thread per
+output row**. At decode the expert matmul is S=1 with O=2048, so that launches 2048 threads — the
+GPU is thread-starved, and the loss recorded here follows from that, not from the shaders.
+
+`coli_v4_matmul_mxfp4_simd_exact` (experiments E95/E96) maps **one simdgroup per output row**, a 32x
+occupancy increase, while remaining **bit-identical** to the scalar reference — verified at kernel
+level (0 mismatches over ~48k values), at the seam (identical digests at batch 1 and 8), through
+`bench/golden.sh` (unchanged md5 `5d04890413ff539e802985ce8c727814`), and by a multi-chunk p256
+differential (identical generated-text md5, both arms deterministic).
+
+Measured at p256, N=2, 60 tokens, against `COLI_V4_METAL=1` alone:
+
+| | tok/s | TTFT |
+|---|---|---|
+| `COLI_V4_METAL=1` (this document's configuration) | 0.9724 | 143.7 s |
+| `+ COLI_V4_METAL_VARIANT=simd_exact_cold` | **1.30205** | **119.9 s** |
+| | **+33.9%** | **-16.6%** |
+
+Enable with:
+```bash
+COLI_V4_METAL=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold ./c/deepseek_v4 ...
+```
+Default is unchanged (`ordered_cold`). **N=2 is below the n>=5 this project requires for the decode
+axis, and the CPU arm was not run**, so this is explicitly provisional: it establishes that
+`simd_exact` is much faster than the other Metal arm, not yet that Metal now beats the CPU. The
+outstanding runs are specified in `.backlog/simd-exact-remaining-measurements.md`.

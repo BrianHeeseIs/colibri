@@ -1,0 +1,10 @@
+tok/s A/B  tokens=60  N=2  prompt=p256.txt
+  run1 metal_ord              ttft= 143.702s decode=  59.078s tok/s=0.9987   md5=e44c2b5ca42288fcc5e06888a1c62497
+  run1 metal_simd             ttft= 119.898s decode=  45.365s tok/s=1.3006   md5=e44c2b5ca42288fcc5e06888a1c62497
+  run2 metal_ord              ttft= 143.811s decode=  62.364s tok/s=0.9461   md5=e44c2b5ca42288fcc5e06888a1c62497
+  run2 metal_simd             ttft= 119.697s decode=  45.263s tok/s=1.3035   md5=e44c2b5ca42288fcc5e06888a1c62497
+
+SUMMARY (median tok/s)
+  metal_ord                0.9724 tok/s  baseline            deterministic  md5=e44c2b5ca42288fcc5e06888a1c62497 
+  metal_simd              1.30205 tok/s  +33.90% tok/s       deterministic  md5=e44c2b5ca42288fcc5e06888a1c62497 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.S0AxUN

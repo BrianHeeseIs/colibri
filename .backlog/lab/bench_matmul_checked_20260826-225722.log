@@ -1,0 +1,22 @@
+  CPU threads (OpenMP): 16
+  iters/variant: 20 (best-of)
+
+  shape                         CPU ms       ord       hot    ord+xc    hot+xc      simd
+  gate|up  S=1 4096->2048
+      cpu   0.416+-0.037 | ord   0.706+-0.033 | hot   0.752+-0.061
+      ord+xc   0.522+-0.066 | hot+xc   0.617+-0.029 | simd   0.083+-0.004
+      simd_exact   0.084+-0.006
+      CHECK vs cpu (bit-mismatches / 2048):  ord 0 | hot 0 | ord+xc 0 | hot+xc 1976 | simd 1587 | simd_exact 0
+      => best EXACT 0.084 ms = 4.96x CPU  |  simd 5.01x CPU  |  simd_exact 4.96x CPU  |  ord==cpu bit-exact
+  down     S=1 2048->4096
+      cpu   0.433+-0.013 | ord   0.251+-0.040 | hot   0.289+-0.001
+      ord+xc   0.214+-0.010 | hot+xc   0.276+-0.012 | simd   0.063+-0.002
+      simd_exact   0.066+-0.004
+      CHECK vs cpu (bit-mismatches / 4096):  ord 0 | hot 0 | ord+xc 0 | hot+xc 3922 | simd 3192 | simd_exact 0
+      => best EXACT 0.066 ms = 6.51x CPU  |  simd 6.90x CPU  |  simd_exact 6.51x CPU  |  ord==cpu bit-exact
+  gate|up  S=8 4096->2048
+      cpu   2.979+-0.233 | ord   0.517+-0.046 | hot   0.557+-0.022
+      ord+xc   0.420+-0.008 | hot+xc   0.495+-0.002 | simd   0.382+-0.007
+      simd_exact   0.415+-0.030
+      CHECK vs cpu (bit-mismatches / 16384):  ord 0 | hot 0 | ord+xc 0 | hot+xc 15874 | simd 12977 | simd_exact 0
+      => best EXACT 0.415 ms = 7.17x CPU  |  simd 7.79x CPU  |  simd_exact 7.17x CPU  |  ord==cpu bit-exact
