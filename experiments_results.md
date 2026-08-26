@@ -4230,3 +4230,64 @@ labelled unconfirmed on purpose.
    S=draft, clearing MIN_N=4 for free and finally making speculation pay.
 3. **Phase-dependent METAL_ATTN** (Finding 4).
 DEAD: #1097 loader lanes, V4_NGRAM as shipped, rows16/MoE batching for decode (prefill-only).
+
+---
+
+## E88. `COLI_V4_KERNELS=all` — **+17.08% tok/s AND -9.6% TTFT**, capability-identical, nondeterministic
+
+First item of the user-specified work order (`todo.md`). The reassociated-FP kernel set was measured
+historically at 11.01% faster decode but had never been evaluated against the tok/s axis or against
+an acceptance bar for non-bit-exact output.
+
+### What it is
+`COLI_V4_KERNEL_LIST` (`c/deepseek_v4.c:57-59`) holds exactly two kernels: `attn_sparse` (bit 0) and
+`router` (bit 1). `--fast-kernels` / `--fast-sparse-attn` sets `COLI_V4_KERNEL_ALL` (`:10173-10175`).
+The env equivalent is **`COLI_V4_KERNELS=all`**, which is what a harness can drive. They target
+attention (26.3% of decode) and router (3.2%).
+
+### Acceptance bar — task-level correctness (PASS)
+Per user decision, non-bit-exact changes are gated on CAPABILITY, not token identity. New harness
+`.backlog/lab/taskcheck.sh` packs five verifiable questions into one prompt (model load dominates
+run cost, so packing turns 12 runs into 4) and grades arithmetic / geography / geometry / chemistry
+/ primality.
+
+| arm | correctness vector | stable |
+|---|---|---|
+| exact | `11111` (5/5) | 2/2 |
+| `KERNELS=all` | `11111` (5/5) | 2/2 |
+
+**PASS — capability identical.**
+
+### Performance (n=5, 24 tokens, p064)
+| metric | exact | KERNELS=all | delta | ranges |
+|---|---|---|---|---|
+| **tok/s** | 0.9661 | **1.1311** | **+17.08%** | 0.9435-1.0022 vs 1.0967-1.1377 — NON-overlapping |
+| **TTFT** | 38.162-38.923 s | **34.399-35.225 s** | **-9.6%** | NON-overlapping |
+
+It improves BOTH phases, and beats its own historical 11.01% decode figure. This is the largest
+tok/s result measured in this project.
+
+### The caveat: output is NONDETERMINISTIC
+The exact arm produced one md5 across all 5 runs. `KERNELS=all` produced **two**:
+`7f068fd53a245c899c254a6626d37be2` (run 1, byte-identical to the exact arm) and
+`0c3030aa870698b1438f65e337789f15` (runs 2-5). Same binary, same seed, same flags.
+
+Reassociated FP summation whose order depends on thread scheduling / work distribution will do
+this. It is a DIFFERENT property from "non-bit-exact": the output is not merely different from the
+exact arm, it is not reproducible against itself.
+
+Meaning is nevertheless retained. The two variants on p064:
+- A: `...抓住了Transformer和MoE（混合专家）架构的核心机制`
+- B: `...抓住了Transformer架构和混合专家（MoE）模型的核心机制`
+
+Reordered noun phrases, identical semantics; variant A is byte-identical to the exact arm. So the
+nondeterminism moves between semantically equivalent phrasings, not between correct and incorrect.
+
+### Disposition
+**Accepted under the task-level bar, stays default OFF** per the house rule that new optimisations
+ship behind their own flag. Recommend `COLI_V4_KERNELS=all` for interactive use where +17% tok/s
+matters more than reproducibility; keep it OFF for any run that needs a stable md5 (golden,
+bit-exactness differentials, regression triage).
+
+**Open question for the user:** whether nondeterminism is acceptable in a shipped default. It is
+not covered by the task-level bar, which tests capability only.

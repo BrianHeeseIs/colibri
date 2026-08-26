@@ -17,15 +17,18 @@ divergence verbatim for human judgment. This is a human-gated QA pass, not an au
 
 ## Work order (user-specified sequence)
 
-### 1. Evaluate `--fast-kernels` for tok/s  — IN PROGRESS
+### 1. Evaluate `--fast-kernels` for tok/s  — **DONE (E88): +17.08% tok/s, -9.6% TTFT, PASS**
 Historically measured **11.01% faster decode** (38554.8 -> 34311.2 ms, n=3 interleaved), already
 implemented, gated behind a flag. Non-bit-exact: md5 `7155bab905cbfa70aa06afa08f757cee` vs golden
 `5d04890413ff539e802985ce8c727814`. Zero implementation cost — needs only the task-level check
 plus a tok/s A/B. Fastest available path to the tok/s pain.
-- [ ] confirm invocation (`--fast-kernels` flag vs `COLI_V4_KERNELS` env) and what it changes
-- [ ] task-level check OFF vs ON — identical correctness required
-- [ ] tok/s A/B, n>=5 (decode spread is 5-13%, so n=3 cannot resolve <10%)
-- [ ] record as an experiments_results.md entry
+- [x] invocation: env `COLI_V4_KERNELS=all` == `--fast-kernels`; set is {attn_sparse, router}
+- [x] task-level check: 5/5 both arms, stable — PASS
+- [x] tok/s A/B n=5: **+17.08% tok/s**, **-9.6% TTFT**, both ranges non-overlapping
+- [x] recorded as E88
+- [ ] **DECISION NEEDED:** output is NONDETERMINISTIC (2 md5s across 5 runs, both semantically
+      equivalent). Task-level bar covers capability, NOT reproducibility. User must rule on whether
+      that is acceptable for a shipped default.
 
 ### 2. Amortise expert dispatch
 Attack the 52.5% of decode spent in `expert_forward` with the GPU idle. Fuse the 8-expert fan-out
