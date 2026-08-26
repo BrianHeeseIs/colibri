@@ -4150,3 +4150,83 @@ execution, so golden remains useful as a fast screen — it just cannot certify.
   semantically identical, one argmax flip); meaning retention at p256 scale is NOT yet assessed.
 - Flag `COLI_V4_MOE_BATCHED_ROWS16` stays **default OFF**. Not shippable as bit-exact. Retained as a
   candidate under a non-bit-exact/meaning-retained acceptance bar, which requires its own evaluation.
+
+---
+
+## E87. The decode (tok/s) axis, measured for the first time — and three levers falsified
+
+Every prior entry optimises TTFT. `bench/ab.sh` runs `--max-tokens 1` and parses only
+`time_to_first_token`, so **decode was excluded by construction** and tok/s had never been A/B'd.
+New harness `.backlog/lab/tokps.sh` measures it: tok/s = (max_tokens-1) / `after_first`, where
+`after_first` is `gen_stats.decode_sec` (`c/deepseek_v4.c:11708`). It verifies the seed HASH (not
+merely its existence, which is all ab.sh/golden.sh check) and captures the output md5 per arm.
+
+### Baseline
+**0.90-0.97 tok/s (~1046 ms/token)** on p064, current shipped stack.
+
+### Where decode actually goes (COLI_V4_PROFILE=1, 24 tokens, accounted_pct=99.6)
+| phase | ms | % |
+|---|---|---|
+| **expert_forward** | 12640.7 | **52.5** |
+| **attention** | 6333.2 | **26.3** |
+| expert_wait | 1055.8 | 4.4 |
+| shared_expert | 953.6 | 4.0 |
+| head | 849.2 | 3.5 |
+| router | 768.3 | 3.2 |
+
+### Finding 1 — decode is NOT I/O bound, which re-kills the loader lane lever
+`expert_wait` is **4.4%**. Upstream `ebc68da` (#1097) flips the loader pool 3->9 claiming
+"measured 1.41x decode". E34 already rejected loader depth here as a cold-cache artifact, and
+:1027 measured lanes 3/6/10 within ~1% with identical `expert_wait`. The profile now confirms it
+from a second, independent direction: there is no I/O stall to recover. **Do not port #1097.**
+
+### Finding 2 — the batched MoE path NEVER fires during decode
+Counter delta, p064, `COLI_V4_MOE_GROUPED_STATS=1`:
+
+| run | groups | rows |
+|---|---|---|
+| A prefill only (`--max-tokens 1`) | 1013 | 8973 |
+| B prefill + 23 decode tokens | 1009 | 8943 |
+| C prefill + 23 decode + `V4_DRAFT=4 V4_NGRAM=1` | 1012 | 8968 |
+
+**B - A is zero within run variance.** Decode contributes no batched groups: it runs at batch=1 and
+the path is gated `MIN_N=4`. So 100% of decode's expert compute is on the CPU while the GPU sits
+idle for MoE — 52.5% of the decode wall.
+
+**C - B is also zero.** Speculation does NOT manufacture S>1 for the MoE. The verify step processes
+its draft tokens without batching them through the expert path, so it can never clear MIN_N=4.
+That is the mechanism behind Finding 3.
+
+### Finding 3 — `V4_NGRAM` does not reproduce its +18.5%
+`.backlog/deepseek-v4-RESULTS.md:43,550` records `V4_DRAFT=4 V4_NGRAM=1` at **+18.5%, wins 6/6**,
+and recommends it for this host. Measured here (60 tokens, n=2): **+1.40%**, and not even that —
+base spread was 0.9% while the ngram arm spread **7.8%** (one run slower than base). It is noise.
+Output md5 is byte-identical across all arms, so speculation IS bit-exact; it simply buys nothing,
+consistent with Finding 2. The +18.5% figure should not be quoted again without re-measurement.
+
+### Finding 4 — the optimal flag set DIFFERS between prefill and decode
+`COLI_V4_METAL_ATTN=1`, bit-exact (md5 identical), 24 tokens, n=3:
+
+| metric | base | METAL_ATTN | delta | confidence |
+|---|---|---|---|---|
+| TTFT | 38.579-38.945 s | **32.439-32.813 s** | **-15.9 %** | ranges fully NON-overlapping |
+| tok/s | 0.9713 | 0.9203 | -5.25 % | ranges OVERLAP - NOT established |
+
+The TTFT win is unambiguous. The decode penalty is directionally consistent (2 of 3 pairs slower)
+but inside the noise band and is NOT claimed. If it holds, it is the same S-scaling penalty that
+governs MoE (GPU loses at S=1: 0.40x), and the remedy is a **phase-dependent flag**: Metal
+attention ON during prefill, OFF during decode, capturing -15.9% TTFT at no decode cost.
+
+### Methodological note
+tok/s run-to-run spread is 5-13%, far worse than TTFT's 0.6-0.8%. Detecting a <10% decode effect
+needs n>=5 or longer generations. Every decode delta below that threshold in this entry is
+labelled unconfirmed on purpose.
+
+### Standing tok/s candidate list (revised)
+1. **Batch decode experts across the 8-expert fan-out or across layers into one dispatch.** 52.5%
+   of decode, GPU currently idle. Naive per-expert dispatch at S=1 loses (0.40x), so the win
+   requires amortising dispatch overhead, not lowering MIN_N.
+2. **Make the speculative verify path batch its draft tokens through the MoE.** Would turn S=1 into
+   S=draft, clearing MIN_N=4 for free and finally making speculation pay.
+3. **Phase-dependent METAL_ATTN** (Finding 4).
+DEAD: #1097 loader lanes, V4_NGRAM as shipped, rows16/MoE batching for decode (prefill-only).
