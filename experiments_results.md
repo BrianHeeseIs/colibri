@@ -4627,3 +4627,60 @@ per-token cost is roughly length-independent, which is consistent with the flat/
 `COLI_V4_KERNELS=all` should be enabled preferentially for LONG prompts, where it is both largest
 (-20.2 % TTFT, 42 s saved at p512) and, on the evidence at p512, bit-exact. Its weakest case is
 short-prompt TTFT at -10.4 %, which is still the second-largest TTFT win in this ledger.
+
+---
+
+## E94. **The S=1 GPU penalty does not exist as assumed** — E90's premise was wrong
+
+Ran the existing `validation/metal/bench_matmul 20` (best-of-20, real shapes) to execute the probe
+E90 named as the way to settle compute-vs-dispatch. It settles something larger.
+
+```
+gate|up S=1 4096->2048   cpu 0.458+-0.040  ord 0.761  hot 0.778  ord+xc 0.498  hot+xc 0.603  simd 0.082+-0.005
+    => best EXACT 0.498 ms = 0.92x CPU | simd 5.56x CPU | ord==cpu bit-exact
+down    S=1 2048->4096   cpu 0.422+-0.021  ord 0.245  hot 0.298  ord+xc 0.239  hot+xc 0.294  simd 0.066+-0.004
+    => best EXACT 0.239 ms = 1.77x CPU | simd 6.34x CPU | ord==cpu bit-exact
+gate|up S=8 4096->2048   cpu 2.921+-0.219  ord 0.605  hot 0.687  ord+xc 0.533  hot+xc 0.613  simd 0.497
+    => best EXACT 0.533 ms = 5.48x CPU | simd 5.88x CPU
+```
+
+### Correction
+E87/E90 repeatedly cited "GPU is 0.40x at S=1" and built conclusions on it, including that decode
+expert compute cannot profitably reach the GPU and that dispatch amortisation "can only lose".
+
+**That figure was one VARIANT's column, not the best available kernel.** Measured properly:
+- gate/up at S=1: best bit-exact GPU is **0.92x** CPU — near parity, not 2.5x slower.
+- down at S=1: best bit-exact GPU is **1.77x FASTER** than CPU.
+
+So a bit-exact GPU path at S=1 is roughly break-even overall on its own, before any dispatch
+amortisation. E90's arithmetic ("trading ~7% dispatch for a 2.5x compute penalty") used a penalty
+that is not real for the best kernel. The E90 measurement (fused = -8.18%, racy) still stands as an
+observation about THAT implementation, but its explanation and its generalisation to "this
+forecloses the whole family" are **withdrawn**.
+
+### The larger find: a non-bit-exact `simd` variant is 5.5-6.3x CPU at S=1
+`simd` is excluded from "best EXACT", i.e. it is not bit-exact — exactly the category the operator's
+task-level acceptance bar admits (capability identical, token identity not required).
+
+At S=1: gate/up **0.082 ms vs CPU 0.458 (5.56x)**, down **0.066 ms vs CPU 0.422 (6.34x)**.
+
+Even charging the full measured per-dispatch cost of 0.176 ms (`:3285`), gate/up becomes
+0.082+0.176 = 0.258 ms vs CPU 0.458 — still **1.8x faster**. Amortising dispatch across the top-6
+fan-out would improve that further, which is the fusion idea E90 buried on a false premise.
+
+`expert_forward` is **52.5% of the decode wall**. A path that is several times cheaper per call at
+S=1 is the largest unexploited tok/s lever identified in this project.
+
+### Caveats before anyone acts on this
+- These are MICROBENCHMARKS of isolated matmuls, not the full expert chain (QDQ, SwiGLU, weighting,
+  BF16 rounding) and not the real gather/scatter around it.
+- Dispatch overhead is charged here from a separate measurement, not measured inside the same call.
+- `simd` bit-exactness status is inferred from its exclusion from "best EXACT"; it must be gated on
+  the task-level check (`.backlog/lab/taskcheck.sh`) before use, exactly like `COLI_V4_KERNELS=all`.
+- S=2 and S=4 were not in this run's output; the S-curve between 1 and 8 is unmeasured here.
+
+### Recommended next step
+Characterise the `simd` variant end-to-end: what it is, whether it passes the task-level gate, and
+what it does to decode when wired into the expert path. This supersedes both remaining item-2
+proposals and the concurrent-batching lane, because it wins at S=1 and therefore needs no
+concurrency at all.
