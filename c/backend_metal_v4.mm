@@ -29,6 +29,7 @@ static id<MTLComputePipelineState> coli_v4_probe_pipeline;
 static id<MTLComputePipelineState> coli_v4_qdq_pipeline;
 static id<MTLComputePipelineState> coli_v4_matmul_pipeline;
 static id<MTLComputePipelineState> coli_v4_matmul_hot_pipeline;
+static id<MTLComputePipelineState> coli_v4_matmul_simd_exact_pipeline;
 static id<MTLComputePipelineState> coli_v4_bf16_pipeline;
 static id<MTLComputePipelineState> coli_v4_swiglu_pipeline;
 static id<MTLComputePipelineState> coli_v4_weighted_pipeline;
@@ -39,6 +40,15 @@ static int coli_v4_metal_variant_value;
 static int coli_v4_metal_profile_enabled_value;
 static int coli_v4_metal_stats_enabled_value;
 static _Atomic unsigned long coli_v4_metal_dispatch_count;
+/* Execution proof for the simd_exact matmul. AGENTS.md: a golden PASS with a flag ON proves
+ * nothing about execution -- capture a counter that is zero without the feature. These are
+ * printed by coli_v4_metal_stats_report under COLI_V4_METAL_STATS=1.
+ *   simd_exact_matmuls  -- matmul encodes that used the simdgroup kernel (3 per expert call)
+ *   simd_exact_rows16   -- expert calls that ASKED for simd_exact but hit the rows16 layout,
+ *                          for which no simdgroup kernel exists yet, and so fell back to
+ *                          ordered_hot_xcache. Silent fallback would corrupt an A/B. */
+static _Atomic unsigned long coli_v4_metal_simd_exact_matmuls;
+static _Atomic unsigned long coli_v4_metal_simd_exact_rows16_fallbacks;
 
 typedef enum {
     COLI_V4_METAL_REJECT_VARIANT,
@@ -148,6 +158,14 @@ enum {
     COLI_V4_MOE_SIMD_WIDTH = 32,
 };
 
+/* COLI_V4_METAL_VARIANT values. 1/2/3 are parsed but rejected by the expert path:
+ * ordered_hot is superseded by the block_rows-driven selection, and simd_cold/simd_hot select
+ * the tree-reduction kernel whose measured relative error is 1.06e-3 (see experiments E95). */
+enum {
+    COLI_V4_METAL_VARIANT_ORDERED_COLD = 0,
+    COLI_V4_METAL_VARIANT_SIMD_EXACT_COLD = 4,
+};
+
 typedef struct { int S, I, O, rb, ng; } ColiV4MatmulDims;
 
 /* The expert chain encodes three matmuls (gate, up, down) that differ only in their output
@@ -166,6 +184,7 @@ static void coli_v4_encode_matmul(id<MTLComputeCommandEncoder> encoder,
                                   ColiV4MatmulGeometry geometry,
                                   NSUInteger out_dim, NSUInteger batch) {
     if (geometry == COLI_V4_MATMUL_GEOM_SIMDGROUP) {
+        atomic_fetch_add_explicit(&coli_v4_metal_simd_exact_matmuls, 1, memory_order_relaxed);
         [encoder dispatchThreadgroups:MTLSizeMake(1, batch * out_dim, 1)
                 threadsPerThreadgroup:MTLSizeMake(COLI_V4_MOE_SIMD_WIDTH, 1, 1)];
         return;
@@ -394,8 +413,9 @@ static id<MTLComputePipelineState> coli_v4_get_named_pipeline(const char *name) 
                     : nil;
 }
 
-static int coli_v4_get_chain_pipelines(uint32_t block_rows,
-                                       id<MTLComputePipelineState> *matmul) {
+static int coli_v4_get_chain_pipelines(uint32_t block_rows, int variant,
+                                       id<MTLComputePipelineState> *matmul,
+                                       ColiV4MatmulGeometry *geometry) {
     if (!coli_v4_qdq_pipeline) coli_v4_qdq_pipeline = coli_v4_get_named_pipeline("coli_v4_fp8_qdq");
     if (block_rows == 1 && !coli_v4_matmul_pipeline)
         coli_v4_matmul_pipeline = coli_v4_get_named_pipeline("coli_v4_matmul_mxfp4_ordered_xcache");
@@ -404,10 +424,44 @@ static int coli_v4_get_chain_pipelines(uint32_t block_rows,
     if (!coli_v4_bf16_pipeline) coli_v4_bf16_pipeline = coli_v4_get_named_pipeline("coli_v4_bf16_round_array");
     if (!coli_v4_swiglu_pipeline) coli_v4_swiglu_pipeline = coli_v4_get_named_pipeline("coli_v4_swiglu");
     if (!coli_v4_weighted_pipeline) coli_v4_weighted_pipeline = coli_v4_get_named_pipeline("coli_v4_weighted_bf16");
+
+    *geometry = COLI_V4_MATMUL_GEOM_ROWS;
     *matmul = block_rows == 16 ? coli_v4_matmul_hot_pipeline : coli_v4_matmul_pipeline;
+
+    if (variant == COLI_V4_METAL_VARIANT_SIMD_EXACT_COLD) {
+        if (block_rows == 1) {
+            if (!coli_v4_matmul_simd_exact_pipeline)
+                coli_v4_matmul_simd_exact_pipeline =
+                    coli_v4_get_named_pipeline("coli_v4_matmul_mxfp4_simd_exact");
+            /* The bit-exactness argument depends on one threadgroup being exactly one
+             * simdgroup: lane L owns group gb+L and the outer reduction shuffles across all
+             * 32 lanes. On a device whose execution width is not 32 the mapping is wrong, so
+             * refuse the pipeline rather than silently computing something else. */
+            if (coli_v4_matmul_simd_exact_pipeline &&
+                coli_v4_matmul_simd_exact_pipeline.threadExecutionWidth == COLI_V4_MOE_SIMD_WIDTH) {
+                *matmul = coli_v4_matmul_simd_exact_pipeline;
+                *geometry = COLI_V4_MATMUL_GEOM_SIMDGROUP;
+            } else {
+                return 0;   /* -> COLI_V4_METAL_REJECT_PIPELINES */
+            }
+        } else {
+            /* No rows16/hot simdgroup kernel exists yet. FALL BACK to ordered_hot_xcache
+             * rather than rejecting: rejecting returns -1 and sends the expert to the CPU,
+             * which would turn a kernel A/B into a GPU-vs-CPU swap and make the measurement
+             * uninterpretable. Counted so the fallback is never silent. */
+            atomic_fetch_add_explicit(&coli_v4_metal_simd_exact_rows16_fallbacks, 1,
+                                      memory_order_relaxed);
+        }
+    }
+
+    /* The 256-thread floor is a device-capability check on the ordered kernels, whose
+     * threadgroup stages the x vector. The simdgroup kernel dispatches 32-wide threadgroups
+     * and stages nothing, so that floor does not apply to it. */
+    NSUInteger required_threads =
+        (*geometry == COLI_V4_MATMUL_GEOM_SIMDGROUP) ? COLI_V4_MOE_SIMD_WIDTH : COLI_V4_MOE_THREADS;
     return coli_v4_qdq_pipeline && *matmul && coli_v4_bf16_pipeline &&
            coli_v4_swiglu_pipeline && coli_v4_weighted_pipeline &&
-           (*matmul).maxTotalThreadsPerThreadgroup >= COLI_V4_MOE_THREADS &&
+           (*matmul).maxTotalThreadsPerThreadgroup >= required_threads &&
            (*matmul).staticThreadgroupMemoryLength <= coli_v4_device.maxThreadgroupMemoryLength;
 }
 
@@ -429,6 +483,11 @@ __attribute__((constructor)) static void coli_v4_metal_read_environment(void) {
         coli_v4_metal_variant_value = 2;
     else if (!strcmp(variant, "simd_hot"))
         coli_v4_metal_variant_value = 3;
+    /* simd_exact_cold: the bit-exact simdgroup matmul (coli_v4_matmul_mxfp4_simd_exact).
+     * Distinct from simd_cold=2, which selects the tree-reduction kernel that measures
+     * 1.06e-3 relative error and is therefore still rejected by the expert path. */
+    else if (!strcmp(variant, "simd_exact_cold"))
+        coli_v4_metal_variant_value = 4;
     else
         coli_v4_metal_variant_value = 0;
 }
@@ -695,7 +754,8 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward_batc
     const float *route_weights, int batch, float swiglu_limit) {
     if (!outs || !expert || !inputs_gathered || !route_weights || batch < 1 ||
         swiglu_limit < 0.0f ||
-        coli_v4_metal_variant() != 0) {
+        (coli_v4_metal_variant() != COLI_V4_METAL_VARIANT_ORDERED_COLD &&
+         coli_v4_metal_variant() != COLI_V4_METAL_VARIANT_SIMD_EXACT_COLD)) {
         coli_v4_metal_reject(COLI_V4_METAL_REJECT_VARIANT);
         return -1;
     }
@@ -752,7 +812,8 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward_batc
 
     id<MTLComputePipelineState> matmul_pipeline = nil;
     ColiV4MatmulGeometry matmul_geometry = COLI_V4_MATMUL_GEOM_ROWS;
-    if (!coli_v4_get_chain_pipelines(block_rows, &matmul_pipeline)) {
+    if (!coli_v4_get_chain_pipelines(block_rows, coli_v4_metal_variant(),
+                                     &matmul_pipeline, &matmul_geometry)) {
         coli_v4_metal_reject(COLI_V4_METAL_REJECT_PIPELINES);
         return -1;
     }
@@ -1147,6 +1208,12 @@ static void coli_v4_metal_stats_report(void) {
                 &coli_v4_metal_rejects[COLI_V4_METAL_REJECT_PIPELINES],
                 memory_order_relaxed),
             atomic_load_explicit(&coli_v4_metal_successes,
+                                 memory_order_relaxed));
+    fprintf(stderr,
+            "v4_metal_simd_exact matmuls=%lu rows16_fallbacks=%lu\n",
+            atomic_load_explicit(&coli_v4_metal_simd_exact_matmuls,
+                                 memory_order_relaxed),
+            atomic_load_explicit(&coli_v4_metal_simd_exact_rows16_fallbacks,
                                  memory_order_relaxed));
     fprintf(stderr,
             "v4_metal_layout tensor_gate=%lu tensor_up=%lu tensor_down=%lu "
