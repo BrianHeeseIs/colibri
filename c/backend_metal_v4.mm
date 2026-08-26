@@ -33,9 +33,6 @@ static id<MTLComputePipelineState> coli_v4_bf16_pipeline;
 static id<MTLComputePipelineState> coli_v4_swiglu_pipeline;
 static id<MTLComputePipelineState> coli_v4_weighted_pipeline;
 static id<MTLComputePipelineState> coli_v4_expert_pipeline;
-static id<MTLComputePipelineState> coli_v4_fused_expert_pipeline;
-static id<MTLArgumentEncoder> coli_v4_fused_expert_argument_encoder;
-static id<MTLBuffer> coli_v4_fused_expert_argument_buffer;
 static const char *coli_v4_library_kind_value = "none";
 static int coli_v4_metal_enabled_value;
 static int coli_v4_metal_variant_value;
@@ -145,39 +142,17 @@ enum {
     COLI_V4_MOE_MAX_INTERMEDIATE = 2048,
     COLI_V4_MOE_FP8_BLOCK = 128,
     COLI_V4_MOE_THREADS = 256,
-    COLI_V4_MOE_FUSED_THREADS = 1024,
-    COLI_V4_MOE_FUSED_THREADGROUP_BYTES = 32768,
 };
 
 typedef struct { int S, I, O, rb, ng; } ColiV4MatmulDims;
 typedef struct { int length, block_size; } ColiV4QdqParams;
 typedef struct { int dimension; float limit; } ColiV4SwigluParams;
 typedef struct { int n; float w; } ColiV4WeightedBf16Params;
-typedef struct {
-    int expert_count;
-    int hidden;
-    int intermediate;
-    int gate_row_bytes;
-    int gate_groups;
-    int down_row_bytes;
-    int down_groups;
-    int fp8_block;
-    float swiglu_limit;
-    float route_weights[COLI_V4_MOE_FUSED_MAX_EXPERTS];
-    uint64_t gate_q4_offsets[COLI_V4_MOE_FUSED_MAX_EXPERTS];
-    uint64_t gate_scales_offsets[COLI_V4_MOE_FUSED_MAX_EXPERTS];
-    uint64_t up_q4_offsets[COLI_V4_MOE_FUSED_MAX_EXPERTS];
-    uint64_t up_scales_offsets[COLI_V4_MOE_FUSED_MAX_EXPERTS];
-    uint64_t down_q4_offsets[COLI_V4_MOE_FUSED_MAX_EXPERTS];
-    uint64_t down_scales_offsets[COLI_V4_MOE_FUSED_MAX_EXPERTS];
-} ColiV4MoeFusedParams;
 
 static_assert(sizeof(ColiV4MatmulDims) == 5 * sizeof(uint32_t), "Metal Matmul ABI changed");
 static_assert(sizeof(ColiV4QdqParams) == 2 * sizeof(uint32_t), "Metal QDQ ABI changed");
 static_assert(sizeof(ColiV4SwigluParams) == 2 * sizeof(uint32_t), "Metal SwiGLU ABI changed");
 static_assert(sizeof(ColiV4WeightedBf16Params) == 2 * sizeof(uint32_t), "Metal weighted ABI changed");
-static_assert(sizeof(ColiV4MoeFusedParams) == 352,
-              "Metal fused MoE parameter ABI changed");
 
 static id<MTLBuffer> coli_v4_input_scratch;
 static id<MTLBuffer> coli_v4_qdq_scratch;
@@ -405,35 +380,6 @@ static int coli_v4_get_chain_pipelines(uint32_t block_rows,
            coli_v4_swiglu_pipeline && coli_v4_weighted_pipeline &&
            (*matmul).maxTotalThreadsPerThreadgroup >= COLI_V4_MOE_THREADS &&
            (*matmul).staticThreadgroupMemoryLength <= coli_v4_device.maxThreadgroupMemoryLength;
-}
-
-static int coli_v4_get_fused_expert_pipeline(void) {
-    if (coli_v4_fused_expert_pipeline && coli_v4_fused_expert_argument_encoder)
-        return coli_v4_fused_expert_pipeline.maxTotalThreadsPerThreadgroup >=
-                   COLI_V4_MOE_FUSED_THREADS &&
-               coli_v4_fused_expert_pipeline.staticThreadgroupMemoryLength <=
-                   COLI_V4_MOE_FUSED_THREADGROUP_BYTES &&
-               coli_v4_fused_expert_pipeline.staticThreadgroupMemoryLength <=
-                   coli_v4_device.maxThreadgroupMemoryLength;
-    if (!coli_v4_device || !coli_v4_library) return 0;
-    NSError *error = nil;
-    id<MTLFunction> function = [coli_v4_library
-        newFunctionWithName:@"coli_v4_moe_experts_fp4_ordered_fused"];
-    id<MTLComputePipelineState> pipeline = function
-        ? [coli_v4_device newComputePipelineStateWithFunction:function error:&error]
-        : nil;
-    id<MTLArgumentEncoder> argument_encoder = function
-        ? [function newArgumentEncoderWithBufferIndex:1]
-        : nil;
-    if (!pipeline || !argument_encoder ||
-        pipeline.maxTotalThreadsPerThreadgroup < COLI_V4_MOE_FUSED_THREADS ||
-        pipeline.staticThreadgroupMemoryLength > COLI_V4_MOE_FUSED_THREADGROUP_BYTES ||
-        pipeline.staticThreadgroupMemoryLength >
-            coli_v4_device.maxThreadgroupMemoryLength)
-        return 0;
-    coli_v4_fused_expert_pipeline = pipeline;
-    coli_v4_fused_expert_argument_encoder = argument_encoder;
-    return 1;
 }
 
 __attribute__((constructor)) static void coli_v4_metal_read_environment(void) {
@@ -1043,199 +989,6 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
         out, expert, input, &route_weight, 1, swiglu_limit);
 }
 
-static int coli_v4_fused_expert_layout_valid(
-    const ColiExpertView *experts, int expert_count, int *hidden_out,
-    int *intermediate_out, size_t *gate_row_bytes_out,
-    size_t *gate_groups_out, size_t *down_row_bytes_out,
-    size_t *down_groups_out) {
-    if (!experts || expert_count < 1 ||
-        expert_count > COLI_V4_MOE_FUSED_MAX_EXPERTS) return 0;
-    const int64_t hidden64 = experts[0].down.rows;
-    const int64_t intermediate64 = experts[0].gate.rows;
-    if (hidden64 < 1 || hidden64 > COLI_V4_MOE_MAX_HIDDEN ||
-        intermediate64 < 1 || intermediate64 > COLI_V4_MOE_MAX_INTERMEDIATE)
-        return 0;
-    const int hidden = (int)hidden64;
-    const int intermediate = (int)intermediate64;
-    const size_t gate_row_bytes = ((size_t)hidden + 1) / 2;
-    const size_t gate_groups = ((size_t)hidden + 31) / 32;
-    const size_t down_row_bytes = ((size_t)intermediate + 1) / 2;
-    const size_t down_groups = ((size_t)intermediate + 31) / 32;
-    for (int index = 0; index < expert_count; index++) {
-        const ColiExpertView *expert = experts + index;
-        if (expert->gate.rows != intermediate ||
-            expert->up.rows != intermediate ||
-            expert->gate.columns != hidden || expert->up.columns != hidden ||
-            expert->down.rows != hidden || expert->down.columns != intermediate ||
-            expert->gate.block_rows != 1 || expert->up.block_rows != 1 ||
-            expert->down.block_rows != 1 ||
-            !coli_v4_ordered_tensor_valid(&expert->gate, intermediate, hidden,
-                                          gate_row_bytes, gate_groups, 1) ||
-            !coli_v4_ordered_tensor_valid(&expert->up, intermediate, hidden,
-                                          gate_row_bytes, gate_groups, 1) ||
-            !coli_v4_ordered_tensor_valid(&expert->down, hidden, intermediate,
-                                          down_row_bytes, down_groups, 1))
-            return 0;
-    }
-    *hidden_out = hidden;
-    *intermediate_out = intermediate;
-    *gate_row_bytes_out = gate_row_bytes;
-    *gate_groups_out = gate_groups;
-    *down_row_bytes_out = down_row_bytes;
-    *down_groups_out = down_groups;
-    return 1;
-}
-
-static id<MTLBuffer> coli_v4_fused_slab_buffer(const void *pointer,
-                                                size_t bytes,
-                                                uint64_t *offset_out) {
-    size_t offset = 0;
-    id<MTLBuffer> buffer = coli_v4_resolve_slab(pointer, &offset);
-    if (!buffer || offset > buffer.length || bytes > buffer.length - offset)
-        return nil;
-    *offset_out = (uint64_t)offset;
-    return buffer;
-}
-
-COLI_V4_METAL_EXTERN __attribute__((used)) int
-coli_v4_metal_expert_forward_fused(
-    float *out, const ColiExpertView *experts, const float *route_weights,
-    int expert_count, const float *input, float swiglu_limit) {
-    if (!out || !experts || !route_weights || !input || swiglu_limit < 0.0f ||
-        coli_v4_metal_variant() != 0) {
-        coli_v4_metal_reject(COLI_V4_METAL_REJECT_VARIANT);
-        return -1;
-    }
-    if (!coli_v4_metal_available() && !coli_v4_metal_init(NULL)) {
-        coli_v4_metal_reject(COLI_V4_METAL_REJECT_INIT);
-        return -1;
-    }
-    if (!coli_v4_queue) {
-        coli_v4_metal_reject(COLI_V4_METAL_REJECT_QUEUE);
-        return -1;
-    }
-
-    int hidden = 0, intermediate = 0;
-    size_t gate_row_bytes = 0, gate_groups = 0;
-    size_t down_row_bytes = 0, down_groups = 0;
-    if (!coli_v4_fused_expert_layout_valid(
-            experts, expert_count, &hidden, &intermediate, &gate_row_bytes,
-            &gate_groups, &down_row_bytes, &down_groups)) {
-        coli_v4_metal_reject(COLI_V4_METAL_REJECT_LAYOUT);
-        return -1;
-    }
-    if (!coli_v4_get_fused_expert_pipeline()) {
-        coli_v4_metal_reject(COLI_V4_METAL_REJECT_PIPELINES);
-        return -1;
-    }
-
-    @autoreleasepool {
-        const size_t input_bytes = (size_t)hidden * sizeof(*input);
-        const size_t output_bytes = (size_t)hidden * sizeof(*out);
-        const size_t gate_q4_bytes = (size_t)intermediate * gate_row_bytes;
-        const size_t gate_scales_bytes = (size_t)intermediate * gate_groups;
-        const size_t down_q4_bytes = (size_t)hidden * down_row_bytes;
-        const size_t down_scales_bytes = (size_t)hidden * down_groups;
-        id<MTLBuffer> gate_q4[COLI_V4_MOE_FUSED_MAX_EXPERTS] = {nil};
-        id<MTLBuffer> gate_scales[COLI_V4_MOE_FUSED_MAX_EXPERTS] = {nil};
-        id<MTLBuffer> up_q4[COLI_V4_MOE_FUSED_MAX_EXPERTS] = {nil};
-        id<MTLBuffer> up_scales[COLI_V4_MOE_FUSED_MAX_EXPERTS] = {nil};
-        id<MTLBuffer> down_q4[COLI_V4_MOE_FUSED_MAX_EXPERTS] = {nil};
-        id<MTLBuffer> down_scales[COLI_V4_MOE_FUSED_MAX_EXPERTS] = {nil};
-        ColiV4MoeFusedParams params = {
-            .expert_count = expert_count,
-            .hidden = hidden,
-            .intermediate = intermediate,
-            .gate_row_bytes = (int)gate_row_bytes,
-            .gate_groups = (int)gate_groups,
-            .down_row_bytes = (int)down_row_bytes,
-            .down_groups = (int)down_groups,
-            .fp8_block = COLI_V4_MOE_FP8_BLOCK,
-            .swiglu_limit = swiglu_limit,
-        };
-        for (int index = 0; index < expert_count; index++) {
-            const ColiExpertView *expert = experts + index;
-            gate_q4[index] = coli_v4_fused_slab_buffer(
-                expert->gate.data, gate_q4_bytes, &params.gate_q4_offsets[index]);
-            gate_scales[index] = coli_v4_fused_slab_buffer(
-                expert->gate.scales, gate_scales_bytes,
-                &params.gate_scales_offsets[index]);
-            up_q4[index] = coli_v4_fused_slab_buffer(
-                expert->up.data, gate_q4_bytes, &params.up_q4_offsets[index]);
-            up_scales[index] = coli_v4_fused_slab_buffer(
-                expert->up.scales, gate_scales_bytes,
-                &params.up_scales_offsets[index]);
-            down_q4[index] = coli_v4_fused_slab_buffer(
-                expert->down.data, down_q4_bytes,
-                &params.down_q4_offsets[index]);
-            down_scales[index] = coli_v4_fused_slab_buffer(
-                expert->down.scales, down_scales_bytes,
-                &params.down_scales_offsets[index]);
-            if (!gate_q4[index] || !gate_scales[index] || !up_q4[index] ||
-                !up_scales[index] || !down_q4[index] || !down_scales[index])
-                return -1;
-            params.route_weights[index] = route_weights[index];
-        }
-
-        coli_v4_input_scratch = coli_v4_ensure_scratch(
-            coli_v4_input_scratch, &coli_v4_input_scratch_capacity, input_bytes);
-        coli_v4_output_scratch = coli_v4_ensure_scratch(
-            coli_v4_output_scratch, &coli_v4_output_scratch_capacity, output_bytes);
-        const NSUInteger argument_bytes =
-            coli_v4_fused_expert_argument_encoder.encodedLength;
-        if (!coli_v4_fused_expert_argument_buffer ||
-            coli_v4_fused_expert_argument_buffer.length < argument_bytes)
-            coli_v4_fused_expert_argument_buffer = [coli_v4_device
-                newBufferWithLength:argument_bytes options:MTLResourceStorageModeShared];
-        if (!coli_v4_input_scratch || !coli_v4_output_scratch ||
-            !coli_v4_fused_expert_argument_buffer ||
-            !coli_v4_input_scratch.contents || !coli_v4_output_scratch.contents)
-            return -1;
-        memcpy(coli_v4_input_scratch.contents, input, input_bytes);
-
-        [coli_v4_fused_expert_argument_encoder
-            setArgumentBuffer:coli_v4_fused_expert_argument_buffer offset:0];
-        for (int index = 0; index < expert_count; index++) {
-            [coli_v4_fused_expert_argument_encoder setBuffer:gate_q4[index]
-                                                      offset:0 atIndex:index];
-            [coli_v4_fused_expert_argument_encoder setBuffer:gate_scales[index]
-                                                      offset:0 atIndex:index + 6];
-            [coli_v4_fused_expert_argument_encoder setBuffer:up_q4[index]
-                                                      offset:0 atIndex:index + 12];
-            [coli_v4_fused_expert_argument_encoder setBuffer:up_scales[index]
-                                                      offset:0 atIndex:index + 18];
-            [coli_v4_fused_expert_argument_encoder setBuffer:down_q4[index]
-                                                      offset:0 atIndex:index + 24];
-            [coli_v4_fused_expert_argument_encoder setBuffer:down_scales[index]
-                                                      offset:0 atIndex:index + 30];
-        }
-
-        id<MTLCommandBuffer> command_buffer = [coli_v4_queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = command_buffer
-            ? [command_buffer computeCommandEncoder] : nil;
-        if (!encoder) return -1;
-        [encoder setComputePipelineState:coli_v4_fused_expert_pipeline];
-        [encoder setBuffer:coli_v4_input_scratch offset:0 atIndex:0];
-        [encoder setBuffer:coli_v4_fused_expert_argument_buffer offset:0 atIndex:1];
-        [encoder setBuffer:coli_v4_output_scratch offset:0 atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(COLI_V4_MOE_FUSED_THREADS, 1, 1)];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted ||
-            command_buffer.error) return -1;
-        memcpy(out, coli_v4_output_scratch.contents, output_bytes);
-        atomic_fetch_add_explicit(&coli_v4_metal_dispatch_count, 1,
-                                  memory_order_relaxed);
-        if (coli_v4_metal_stats_enabled_value)
-            atomic_fetch_add_explicit(&coli_v4_metal_successes, 1,
-                                      memory_order_relaxed);
-        return 0;
-    }
-}
-
 static id<MTLLibrary> coli_v4_load_metallib(id<MTLDevice> device,
                                              const char *path) {
     if (!path || !path[0]) return nil;
@@ -1327,9 +1080,6 @@ COLI_V4_METAL_EXTERN void coli_v4_metal_shutdown(void) {
     coli_v4_input_scales_scratch_capacity = 0;
     coli_v4_qdq_scratch_capacity = 0;
     coli_v4_input_scratch_capacity = 0;
-    coli_v4_fused_expert_argument_buffer = nil;
-    coli_v4_fused_expert_argument_encoder = nil;
-    coli_v4_fused_expert_pipeline = nil;
     coli_v4_expert_pipeline = nil;
     coli_v4_weighted_pipeline = nil;
     coli_v4_swiglu_pipeline = nil;

@@ -69,6 +69,20 @@ S=1 into S=draft. Would make speculation pay for the first time.
 - [ ] phase-dependent `COLI_V4_METAL_ATTN` (ON prefill / OFF decode) — needs the decode penalty
       confirmed at n>=5 first; currently unestablished (ranges overlap)
 
+## ADOPTED
+- **`COLI_V4_KERNELS=all`** is the recommended interactive setting: -10.4/-18.0/-20.2 % TTFT and
+  +16.7/+12.1/+20.1 % tok/s at p064/p256/p512. Task-gate 5/5. Keep OFF for golden, bit-exactness
+  differentials, and regression triage (output is nondeterministic at short prompts).
+
+## BACKLOG (deferred, meaningful, do AFTER the performance work)
+- **Hunt the latent nondeterminism that `COLI_V4_KERNELS=all` exposes.** Both fast kernels are
+  deterministic pure functions (`sparse_attention_dot_fast:3461`, `route_bf16_fast:8733`), yet output
+  alternates between two stable variants at p064 and is bit-exact at p512. The variance is latent
+  elsewhere and merely surfaced when the fast kernels push a value onto a decision boundary. Prime
+  suspect: the rows16-vs-rows1 expert path divergence proven in E86 (per-column vs per-group MX4
+  scale). Fixing it would yield a BIT-EXACT +17 % — a meaningful upgrade over an accepted-but-
+  irreproducible win. Open-ended debugging; not on the critical path.
+
 ## Shelved
 - rows16 residual p256 divergence (user: SHELVE). Flag `COLI_V4_MOE_BATCHED_ROWS16` stays OFF.
   Perf is real (-4.64% p064 / -5.49% p256 TTFT); correctness is not bit-exact.

@@ -4538,3 +4538,34 @@ This is the THIRD upstream performance claim to fail on this host:
 Upstream numbers are measured on different hardware and workloads. **Every adopted claim must be
 re-measured here before it is believed**, and the adoption cost is only justified when it survives
 that. The code is retained (default OFF, bit-exact, zero risk) but should not be enabled.
+
+### E90 ADDENDUM — fused implementation REVERTED (code), result retained (ledger)
+
+Per user decision the racy implementation is removed from the tree while this entry and
+`.backlog/lab/fused_dispatch_notes.md` are kept. Rationale: the negative result is the deliverable,
+but a dormant race behind an env flag is a landmine for whoever enables it next. The measurements
+above (-8.18 %, three md5s in three runs) stand as the record.
+
+Post-revert verification: `..._fused` symbol count 0, seam symbol 1, golden PASS at
+`5d04890413ff539e802985ce8c727814` on the default path AND with `COLI_V4_HOT_PACK_UNLOCKED=1`,
+confirming the surgical revert did not disturb the hot-pack port that landed on top of it.
+
+---
+
+## ADOPTED SETTING — `COLI_V4_KERNELS=all`
+
+Per user decision, this is the **recommended setting for interactive use**. It is the largest
+measured gain in this project:
+
+| prompt | TTFT | tok/s |
+|---|---|---|
+| p064 | -10.44 % | +16.66 % |
+| p256 | -17.99 % | +12.08 % |
+| p512 | -20.23 % | +20.12 % |
+
+Task-level capability gate 5/5 (E88). Variants are semantic paraphrases; at p512 it is outright
+bit-exact.
+
+**Keep it OFF for:** `bench/golden.sh`, any bit-exactness differential, and regression triage —
+anything that needs a stable md5. Output is nondeterministic at p064 (two variants over eight runs),
+stable-per-arm at p256, bit-exact at p512.

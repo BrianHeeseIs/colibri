@@ -51,11 +51,6 @@ int  coli_v4_metal_fp8_matmul_grouped(float *outputs,
                                       const float *inputs,
                                       int batch, int rows, int columns, int groups);
 
-#define COLI_V4_MOE_FUSED_MAX_EXPERTS 6
-int coli_v4_metal_expert_forward_fused(
-    float *out, const ColiExpertView *experts, const float *route_weights,
-    int expert_count, const float *input, float swiglu_limit);
-
 #ifdef __cplusplus
 }
 #endif
