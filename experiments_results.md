@@ -4367,3 +4367,58 @@ that boundary and stays stable 5/5. Note this repo already contains one proven s
 path-dependent FP divergence: rows16 vs rows1 expert paths are not bit-identical (E86).
 
 **Status: +17.08% tok/s, capability-identical, semantically equivalent, but not reproducible.**
+
+---
+
+## E90. Single-dispatch multi-expert fusion — **BUILT, MEASURED, FAILED.** Item 2 is closed.
+
+Implemented at user direction (skipping the recommended one-command-buffer prototype gate). New
+default-OFF flag `COLI_V4_MOE_FUSED`: a true one-dispatch six-expert fused Metal seam with a
+36-resource argument buffer binding whole expert slabs plus per-expert byte offsets, 1024 threads,
+exactly 32768 B threadgroup, serial ascending-slot accumulation, falling back to the existing path
+on unresolved slab / rows16 / dim mismatch / pipeline rejection.
+Files: `c/backend_metal_v4.mm`, `c/metal/coli_v4_moe.metal`, `c/deepseek_v4.c:4894`,
+notes `.backlog/lab/fused_dispatch_notes.md`.
+
+### Gates
+| gate | result |
+|---|---|
+| build METAL=1 | exit 0; `..._batch` symbol 1, `..._fused` symbol 1, fused kernel in metallib |
+| golden, fused **OFF** | `PASS md5=5d04890413ff539e802985ce8c727814` — default genuinely inert |
+| golden, fused **ON** | **FAIL** `7e3a6d28bba3699723bdd3fddb21e612` (also proves the path executed) |
+
+### Performance — it is SLOWER (p064, 24 tokens, n=3)
+| | tok/s | range |
+|---|---|---|
+| nofuse | **0.9594** | 0.9591-1.0051 |
+| fused | **0.8809** | 0.8485-0.8866 |
+
+**-8.18%, ranges non-overlapping.** The slowdown is real, not noise.
+
+### It is also RACY, not merely non-bit-exact
+Three runs produced **three different md5s** (`b9be8c90`, `6bb1f175`, `188ea2fb`) against one stable
+md5 for the control. FP reassociation is deterministic — identical inputs give identical outputs.
+Three outputs from three identical runs means a genuine race in the threadgroup accumulation, a
+correctness defect rather than an association difference. (Contrast E88/E89, where `KERNELS=all`
+alternated between exactly TWO stable variants — that is boundary-flipping, this is not.)
+
+### Why the approach is doomed even with the race fixed
+Decode spends ~550 ms/token in `expert_forward` (12640 ms / 23 tokens). Dispatch count is
+43 layers x 6 experts = **258 dispatches/token**; at the measured 0.176 ms per empty dispatch +
+blocking wait (`:3285`) that is ~45 ms, i.e. **~8%** of expert time. Fusing 6->1 recovers at most
+5/6 of it, ~7%.
+
+But the same compute moved to the GPU at S=1 runs at the measured **0.40x** — roughly 150% MORE
+expensive. Trading ~7% of dispatch overhead for a 2.5x compute penalty can only lose.
+
+**The S=1 GPU penalty is COMPUTE inefficiency, not dispatch overhead.** Every plan premised on
+amortising dispatch — one-command-buffer fan-out included — inherits the same losing trade. The
+explore's stated top risk ("code lands but decode stays slower") is exactly what happened.
+
+**Item 2 is closed.** Making the GPU efficient at S=1 is a different and much harder problem than
+reducing dispatch count, and nothing in the measured data suggests it is reachable from here.
+
+### Disposition
+Code retained, **default OFF and proven inert** (golden OFF passes). Flag documented as NOT
+RECOMMENDED: it is both slower and racy. Retained because the negative result is the deliverable —
+it forecloses an entire family of proposals that would otherwise keep resurfacing.

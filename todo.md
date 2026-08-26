@@ -30,7 +30,14 @@ plus a tok/s A/B. Fastest available path to the tok/s pain.
       equivalent). Task-level bar covers capability, NOT reproducibility. User must rule on whether
       that is acceptable for a shipped default.
 
-### 2. Amortise expert dispatch — SIZED (E89), NOT STARTED, needs user go-ahead
+### 2. Amortise expert dispatch — **BUILT AND FAILED (E90). CLOSED.**
+Single-dispatch fusion implemented, measured **-8.18% tok/s** (non-overlapping) and found
+**RACY** (3 md5s in 3 runs). Root cause: the S=1 GPU penalty is COMPUTE inefficiency, not
+dispatch overhead — dispatch is only ~8% of expert time, so amortising it cannot pay for a
+2.5x compute penalty. This forecloses one-command-buffer fan-out too. Do not revisit without
+a way to make the GPU efficient at S=1.
+
+SUPERSEDED NOTE:
 **500-900 LOC** for one-command-buffer top-6 fan-out; **1200-2200** for true single-dispatch fusion.
 Current seam binds ONE expert per dispatch (`backend_metal_v4.mm:834`); cross-expert slabs are not
 contiguous, so a new ABI is required. Empty dispatch + wait costs 0.176 ms. Top risk: the perf

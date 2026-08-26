@@ -4779,6 +4779,10 @@ static int coli_v4_prefill_experts_forward(
     return 0;
 }
 
+#ifdef COLI_V4_METAL_SEAM
+static int coli_v4_moe_fused_enabled(void);
+#endif
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -4888,12 +4892,17 @@ static int moe_token_pipeline(float *output,
 #endif
 
     int prefill_loader_active = route_cache && route_cache->loader;
+    int fused_enabled = 0;
+#ifdef COLI_V4_METAL_SEAM
+    fused_enabled = !prefill_loader_active && selected <= COLI_V4_MOE_FUSED_MAX_EXPERTS &&
+        coli_v4_metal_enabled() && coli_v4_moe_fused_enabled();
+#endif
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_COUNT] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_COUNT] = {{0}};
     int loader_active[DUAL_EXPERT_LOADER_COUNT] = {0};
-    if (!result && !prefill_loader_active) {
+    if (!result && !prefill_loader_active && !fused_enabled) {
         int preload = selected < DUAL_EXPERT_LOADER_COUNT
             ? selected : DUAL_EXPERT_LOADER_COUNT;
         for (int i = 0; i < preload; i++) {
@@ -4911,7 +4920,7 @@ static int moe_token_pipeline(float *output,
     ExpertLoadJob job = {0};
     ExpertLoadHandle loader = {0};
     int loader_active = 0;
-    if (!result && !prefill_loader_active) {
+    if (!result && !prefill_loader_active && !fused_enabled) {
         job.store = store;
         job.key = (ColiExpertKey){weights->plan.layer, expert_ids[0]};
         job.result = -1;
@@ -4936,12 +4945,62 @@ static int moe_token_pipeline(float *output,
     }
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
+    int fused_handled = 0;
+#ifdef COLI_V4_METAL_SEAM
+    if (!result && fused_enabled) {
+        ColiExpertView fused_experts[COLI_V4_MOE_FUSED_MAX_EXPERTS] = {{0}};
+        int acquired = 0;
+        for (; acquired < selected; acquired++) {
+            uint64_t wait_began = coli_v4_profile_on
+                ? coli_v4_profile_now_ns() : 0;
+            int lookup_result = coli_expert_lookup(
+                store, (ColiExpertKey){weights->plan.layer, expert_ids[acquired]},
+                &fused_experts[acquired]);
+            if (coli_v4_profile_on)
+                coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_WAIT,
+                                    coli_v4_profile_now_ns() - wait_began);
+            if (lookup_result) {
+                result = -1;
+                break;
+            }
+        }
+        if (!result) {
+            double matmul_began = v4_now_mono();
+            uint64_t began = coli_v4_profile_on
+                ? coli_v4_profile_now_ns() : 0;
+            int fused_done = coli_v4_metal_expert_forward_fused(
+                output, fused_experts, expert_weights, selected, input,
+                config->swiglu_limit) == 0;
+            for (int current = 0; !fused_done && !result && current < selected;
+                 current++) {
+                int done = coli_v4_metal_expert_forward(
+                    expert_output, &fused_experts[current], input,
+                    expert_weights[current], config->swiglu_limit) == 0;
+                if (!done) result = coli_v4_prefill_trace_expert_forward(
+                    expert_output, &fused_experts[current], input,
+                    expert_weights[current], config->swiglu_limit);
+                if (!result)
+                    for (int index = 0; index < d; index++)
+                        output[index] += expert_output[index];
+            }
+            coli_v4_expert_store_add_matmul(
+                store, v4_now_mono() - matmul_began);
+            if (coli_v4_profile_on)
+                coli_v4_profile_add(COLI_V4_PROFILE_EXPERT_FORWARD,
+                                    coli_v4_profile_now_ns() - began);
+            fused_handled = !result;
+        }
+        for (int held = 0; held < acquired; held++)
+            coli_expert_release(store, &fused_experts[held]);
+    }
+#endif
+
     if (prefill_loader_active) {
         if (!result)
             result = coli_v4_prefill_experts_forward(
                 output, expert_output, weights, config, store, input,
                 expert_ids, expert_weights, selected, route_cache->loader);
-    } else {
+    } else if (!fused_handled) {
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     for (int current = 0; !result && current < selected; current++) {
         int slot = current % DUAL_EXPERT_LOADER_COUNT;
@@ -5058,6 +5117,7 @@ static int coli_v4_moe_grouped_stats_enabled_value;
 static int coli_v4_moe_batched_enabled_value;
 static int coli_v4_moe_batched_min_n_value;
 static int coli_v4_moe_batched_rows16_value;
+static int coli_v4_moe_fused_enabled_value;
 static int coli_v4_moe_grouped_degenerate_reported;
 static uint64_t coli_v4_moe_group_overhead_ns;
 static uint64_t coli_v4_moe_chunk_ns;
@@ -5102,8 +5162,11 @@ static void coli_v4_moe_grouped_init(void) {
         rows16 && *rows16 && atoi(rows16) != 0;
     const char *batched = getenv("COLI_V4_MOE_BATCHED");
     const char *min_n = getenv("COLI_V4_MOE_BATCHED_MIN_N");
+    const char *fused = getenv("COLI_V4_MOE_FUSED");
     coli_v4_moe_batched_enabled_value =
         batched && *batched && atoi(batched) != 0;
+    coli_v4_moe_fused_enabled_value =
+        fused && *fused && atoi(fused) != 0;
     coli_v4_moe_batched_min_n_value = 4;
     if (min_n && *min_n) {
         int parsed = atoi(min_n);
@@ -5133,6 +5196,11 @@ static int coli_v4_moe_batched_min_n(void) {
 static int coli_v4_moe_batched_rows16(void) {
     pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
     return coli_v4_moe_batched_rows16_value;
+}
+
+static int coli_v4_moe_fused_enabled(void) {
+    pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
+    return coli_v4_moe_fused_enabled_value;
 }
 #endif
 
