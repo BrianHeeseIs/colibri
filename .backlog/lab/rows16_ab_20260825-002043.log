@@ -1,0 +1,16 @@
+WARMUP AB state=off max_tokens=1
+WARMUP AB state=on max_tokens=1
+RUN p064 pair=1 state=off ttft=38.374s
+RUN p064 pair=1 state=on ttft=36.819s
+RUN p064 pair=2 state=off ttft=38.680s
+RUN p064 pair=2 state=on ttft=36.361s
+RUN p064 pair=3 state=off ttft=38.358s
+RUN p064 pair=3 state=on ttft=36.595s
+AB p064 off=38.374 on=36.595 delta=-4.64%
+RUN p256 pair=1 state=off ttft=105.688s
+RUN p256 pair=1 state=on ttft=96.108s
+RUN p256 pair=2 state=off ttft=102.061s
+RUN p256 pair=2 state=on ttft=96.453s
+RUN p256 pair=3 state=off ttft=100.279s
+RUN p256 pair=3 state=on ttft=96.613s
+AB p256 off=102.061 on=96.453 delta=-5.49%
