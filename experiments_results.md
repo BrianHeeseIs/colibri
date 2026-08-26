@@ -4193,9 +4193,15 @@ Counter delta, p064, `COLI_V4_MOE_GROUPED_STATS=1`:
 the path is gated `MIN_N=4`. So 100% of decode's expert compute is on the CPU while the GPU sits
 idle for MoE — 52.5% of the decode wall.
 
-**C - B is also zero.** Speculation does NOT manufacture S>1 for the MoE. The verify step processes
-its draft tokens without batching them through the expert path, so it can never clear MIN_N=4.
-That is the mechanism behind Finding 3.
+**C - B is also zero.** Speculation does NOT manufacture S>1 for the MoE.
+
+> **CORRECTED IN E89.** This entry originally explained that as "the verify step processes its draft
+> tokens without batching them through the expert path, so it can never clear MIN_N=4". **That
+> mechanism is wrong.** Verify DOES batch - it calls `target_batch(..., batch=proposals+1)` at
+> `:10714-10716`, converging on `coli_v4_block_window_batch_ref` -> `coli_v4_moe_grouped_batch`.
+> The observation (zero counter delta) is correct; the explanation is not. The real cause is draft
+> AVAILABILITY: `v4_ngram_draft` (`:10431-10464`) only proposes on a repeated 2/3-gram context and
+> never fired on this prompt. See E89.
 
 ### Finding 3 — `V4_NGRAM` does not reproduce its +18.5%
 `.backlog/deepseek-v4-RESULTS.md:43,550` records `V4_DRAFT=4 V4_NGRAM=1` at **+18.5%, wins 6/6**,
@@ -4291,3 +4297,73 @@ bit-exactness differentials, regression triage).
 
 **Open question for the user:** whether nondeterminism is acceptable in a shipped default. It is
 not covered by the task-level bar, which tests capability only.
+
+
+---
+
+## E89. Speculation is not a tok/s lever — verify already batches; the drafts are the problem
+
+Sizing pass for work-order items 2 and 3 (`todo.md`). Both target the same 52.5% of decode spent in
+`expert_forward` with the GPU idle. The result reorders them permanently.
+
+### Correction to E87 Finding 2
+E87 attributed the zero MoE-counter delta under speculation to the verify path not batching. **That
+was wrong.** Verify batches already:
+- `target_batch(..., batch=proposals+1)` — `c/deepseek_v4.c:10693-10716`
+- converges on `coli_v4_block_window_batch_ref` (`:9863-9866`) -> `coli_v4_moe_grouped_batch` (`:5944`)
+- rollback machinery already exists: snapshot `:7048-7102`, save `:10696-10700`, restore/replay
+  `:10790-10824`
+
+So the "batch speculative verify through the MoE" project is **0 LOC — already implemented.**
+
+### What actually happens (p064, 24 tokens, groups from COLI_V4_MOE_GROUPED_STATS)
+| config | groups | tok/s |
+|---|---|---|
+| none | 1011 | **0.9752** |
+| `V4_DRAFT=4 V4_NGRAM=1` | 1009 | 0.9605 |
+| `V4_MTP=1 V4_DRAFT=4` | **1030** | **0.9079** |
+
+- **ngram: groups unchanged.** The drafter never proposed. `v4_ngram_draft` (`:10431-10464`) only
+  fires on a repeated 2/3-gram context, which technical prose rarely produces. Speculation was
+  INERT — which also retires E87 Finding 3's "+1.40%" as not-noise-around-an-effect but nothing
+  happening at all.
+- **MTP: groups +19, and 6.9% SLOWER.** The drafter fires and verify genuinely batches through the
+  MoE — the mechanism works. But draft generation plus rejection replay costs more than 19 batched
+  groups save. Consistent with `.backlog/deepseek-v4-RESULTS.md:44` (+3.3%, "not recommended") and
+  with the recorded root cause being rejection-replay rather than acceptance rate.
+
+19 of 1011 groups could not move the 52.5% even if it were free.
+
+**Speculation is closed as a tok/s lever.** Not because batching is missing, but because no
+available drafter both fires and pays on this workload.
+
+### Item 2 (amortise expert dispatch) — sized, NOT started
+| aspect | finding |
+|---|---|
+| current seam | `coli_v4_metal_expert_forward_batch(...)` binds ONE expert's gate/up/down; `batch` is the S dimension for that single expert (`backend_metal_v4.mm:834,876,885,943`) |
+| decode today | `moe_token_pipeline` (`:4782`) loops selected experts one at a time (`:4998`), scalar seam = batch=1 wrapper (`:979`) |
+| shape | 43 layers, 256 routed experts, top-6 (`README.md:467-468`) |
+| storage | per-expert slabs are contiguous; ACROSS experts they are not. Fusion is not blocked by format but is unsupported by the current ABI |
+| dispatch cost | empty dispatch + blocking wait measured **0.176 ms** (`:3285`) |
+| LOC | one-command-buffer fan-out ~500-900; true single-dispatch heterogeneous fusion ~1200-2200 |
+| top risk | perf model false after integration — 18 buffer bindings for top-6, lease lifetime, first-touch/eviction cost may eat the win |
+
+Recommended gate if pursued: prototype the one-command-buffer top-6 fan-out FIRST and measure
+dispatch count + per-token expert wall + golden md5 before attempting true fusion.
+
+### Nondeterminism of `COLI_V4_KERNELS=all` — characterised (follow-up to E88)
+Both fast kernels are deterministic pure functions: `sparse_attention_dot_fast` (`:3461`, fixed
+4-accumulator NEON reduction) and `route_bf16_fast` (`:8733`, sequential). Neither can vary on
+identical inputs. Yet across **8 runs** with identical config and a seed verified unmutated each
+time, output alternated between two md5s: `0c3030aa...` x6, `7f068fd5...` x2 (the latter being
+byte-identical to the exact arm).
+
+`v4_kernels active=attn_sparse,router` was confirmed present on ALL fastkern runs, so the +17.08%
+is NOT contaminated by an inactive sample — a hypothesis that had to be checked and was falsified.
+
+The variance is therefore latent elsewhere and merely EXPOSED by the fast kernels, which move
+values onto a decision boundary (a routing or sparse-top-k tie). The exact arm never approaches
+that boundary and stays stable 5/5. Note this repo already contains one proven source of
+path-dependent FP divergence: rows16 vs rows1 expert paths are not bit-identical (E86).
+
+**Status: +17.08% tok/s, capability-identical, semantically equivalent, but not reproducible.**

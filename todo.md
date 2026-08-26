@@ -30,13 +30,26 @@ plus a tok/s A/B. Fastest available path to the tok/s pain.
       equivalent). Task-level bar covers capability, NOT reproducibility. User must rule on whether
       that is acceptable for a shipped default.
 
-### 2. Amortise expert dispatch
+### 2. Amortise expert dispatch — SIZED (E89), NOT STARTED, needs user go-ahead
+**500-900 LOC** for one-command-buffer top-6 fan-out; **1200-2200** for true single-dispatch fusion.
+Current seam binds ONE expert per dispatch (`backend_metal_v4.mm:834`); cross-expert slabs are not
+contiguous, so a new ABI is required. Empty dispatch + wait costs 0.176 ms. Top risk: the perf
+model goes false after integration (18 bindings for top-6, lease lifetime, first-touch cost).
+Recommended gate: prototype the one-command-buffer version and measure BEFORE attempting fusion.
+
+ORIGINAL NOTE:
 Attack the 52.5% of decode spent in `expert_forward` with the GPU idle. Fuse the 8-expert fan-out
 and/or cross-layer work into fewer dispatches. Naive `MIN_N` lowering does NOT work — the GPU is
 0.40x at S=1, so the win must come from amortising per-dispatch overhead, not from more dispatches.
 Largest prize, largest risk.
 
-### 3. Batch speculative verify through the MoE
+### 3. Batch speculative verify through the MoE — **DEAD (E89)**
+Verify ALREADY batches (`target_batch(..., batch=proposals+1)`, `:10714-10716`) — 0 LOC needed.
+The blocker is draft availability, not batching: ngram never proposes on technical prose (needs a
+repeated 2/3-gram, `:10431-10464`); MTP proposes and verify genuinely batches (+19 groups) but runs
+6.9% SLOWER because draft cost + rejection replay exceed the saving. Closed as a tok/s lever.
+
+ORIGINAL NOTE:
 `V4_DRAFT=4` currently yields ZERO extra batched groups (E87 Finding 2): the verify path does not
 batch its draft tokens through the expert path, so it never clears `MIN_N=4`. Making it batch turns
 S=1 into S=draft. Would make speculation pay for the first time.
