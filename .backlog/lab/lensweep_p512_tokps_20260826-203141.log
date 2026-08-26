@@ -1,0 +1,10 @@
+tok/s A/B  tokens=24  N=2  prompt=p512.txt
+  run1 off                    ttft= 214.078s decode=  31.521s tok/s=0.7297   md5=ddca1f21808d0a570cb532d038e5ead4
+  run1 on                     ttft= 165.239s decode=  26.619s tok/s=0.8640   md5=ddca1f21808d0a570cb532d038e5ead4
+  run2 off                    ttft= 207.618s decode=  29.580s tok/s=0.7776   md5=ddca1f21808d0a570cb532d038e5ead4
+  run2 on                     ttft= 164.840s decode=  24.300s tok/s=0.9465   md5=ddca1f21808d0a570cb532d038e5ead4
+
+SUMMARY (median tok/s)
+  off                     0.75365 tok/s  baseline            deterministic  md5=ddca1f21808d0a570cb532d038e5ead4 
+  on                      0.90525 tok/s  +20.12% tok/s       deterministic  md5=ddca1f21808d0a570cb532d038e5ead4 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.MAKAeG

@@ -1,0 +1,28 @@
+v4_kernels active=none
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_cli mode=chat memory=limited target_only=1
+v4_dense_resident layers=43 bytes=6.267GiB
+你的总结非常准确，精准地抓住了Transformer和MoE（混合专家）架构的核心机制。为了进一步深化这个理解，我们可以从以下几个维度进行补充和延伸：
+
+**1. 关于“条件稀疏”的精确含义**
+你提到的“条件稀疏”是MoE的关键。它
+v4_tokens prompt=70 generated=60 total=130 expert_requests=24548 hits=18553 misses=5927 hit_rate=75.578 bytes=79240101888 target_only=1
+generated_text=你的总结非常准确，精准地抓住了Transformer和MoE（混合专家）架构的核心机制。为了进一步深化这个理解，我们可以从以下几个维度进行补充和延伸：
+
+**1. 关于“条件稀疏”的精确含义**
+你提到的“条件稀疏”是MoE的关键。它
+timing time_to_first_token=32.354s after_first=42.660s
+v4_rows16 packed_slots=997
+v4_direct reads=5927 flock_reads=0 fallbacks=0 payload_bytes=74578919424
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=429 metal_fp8_upload_mb=1.1
+metal_fp8_ms total=2961.4 memcpy_in=11.9 dispatch_wait=2916.3 memcpy_out=33.0
+fp8_qdq_ms=448.0 fp8_qdq_melems=52.4
+moe_group_overhead_ns=2356591582
+moe_chunk_ns=20281940921
+moe_batched min_n=4 rows16=0 groups=1012 rows=8956 ms=2724.3 rejects=0 | cpu_rows=9104 cpu_ms=6535.9 | metal_row_share=49.6%
+moe_group_hist 1:2269 2:1003 3:539 4:337 5:223 6:141 7:106 8:76 9:44 10:51 11:45 12:30 13:17 14:34 15:13 16:15 17:10 18:9 19:5 20:6 21:6 22:4 23:3 24:4 25:4 26:6 27:2 28:7 29:3 30:3 31:3 32:56
+moe_waves=89 moe_wave_fallbacks=0 moe_groups=5074

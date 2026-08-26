@@ -1,0 +1,10 @@
+hot-pack-unlocked TTFT A/B, p064, interleaved n=3
+  r1 off ttft=37.728s
+  r1 on  ttft=37.765s
+  r2 off ttft=38.403s
+  r2 on  ttft=38.181s
+  r3 off ttft=37.787s
+  r3 on  ttft=37.769s
+  off=37.787s on=37.769s delta=-0.05% (negative=faster)
+  off range: 37.728 37.787 38.403 
+  on  range: 37.765 37.769 38.181 

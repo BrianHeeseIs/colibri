@@ -1,0 +1,8 @@
+[1;36m=== GATE  ON=COLI_NO_OMP_TUNE=1  N=5 ===[0m
+[1;33mSIGN: delta=100*(on-off)/off -> FASTER IS NEGATIVE[0m
+binary md5 1768774c7c7c770d7f822d267342be6a
+--- pre-flight: one engine run with ab.sh's invocation ---
+  pre-flight OK: time_to_first_token=39.414
+WARMUP AB state=off max_tokens=1
+WARMUP AB state=on max_tokens=1
+RUN p064 pair=1 state=off ttft=36.202s

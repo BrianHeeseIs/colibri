@@ -4472,3 +4472,69 @@ weakest case is short-prompt TTFT at -10.4 %, still a solid win.
 p512 tok/s was not captured (run stopped early). Determinism note: at p256 each arm produced ONE
 stable md5 (`4e3e987a` off, `4f74f9bd` on), unlike p064 where the ON arm alternates between two.
 So the E88/E89 boundary-flipping is prompt-dependent, not universal.
+
+### E91 CORRECTION — p512 falsifies the "tok/s shrinks with length" claim
+
+E91 above concluded from TWO points (p064 +16.66 %, p256 +12.08 %) that the tok/s gain shrinks with
+prompt length. The third point refutes it:
+
+| prompt | off tok/s | on tok/s | delta |
+|---|---|---|---|
+| p064 | 0.95535 | 1.11455 | +16.66 % |
+| p256 | 0.98440 | 1.10330 | +12.08 % |
+| **p512** | **0.75365** | **0.90525** | **+20.12 %** |
+
+Non-monotonic — p256 is a dip, not a trend. **Correct statement: the tok/s gain is 12-20 % across
+p064-p512 with no clean monotonic trend at n=2.** Two points looked like a trend and were not; a
+third point was enough to break it. The TTFT finding (gain GROWS: -10.44 / -17.99 / -20.23 %) has
+three points and stands.
+
+Also note the baseline itself degrades with length (0.955 -> 0.984 -> 0.754 tok/s) as KV grows, so
+the p512 percentage is computed against a slower reference.
+
+**Determinism is prompt-dependent.** At p512 BOTH arms produced the identical md5
+(`ddca1f21808d0a570cb532d038e5ead4`) — `KERNELS=all` is bit-exact on that prompt. At p256 each arm
+was internally stable but differed from the other. Only at p064 does the ON arm alternate between
+two variants. So the E88/E89 boundary-flipping is a property of specific inputs, not of the kernels.
+
+---
+
+## E92. Upstream `e36a1c7` hot-pack-outside-mutex — ported, bit-exact, **and worth nothing here**
+
+Hand-ported (not cherry-picked — it conflicts) as `COLI_V4_HOT_PACK_UNLOCKED`, default OFF.
+Implementation: per-slot mutexes; packing requires SOLE LEASE (`references == 1`) so no reader can
+observe a half-converted slot; every ON lookup crosses the slot mutex to prevent publishing a view
+mid-conversion; OFF allocates no pack mutexes and keeps the original lock-held call path.
+Files: `c/deepseek_v4.c:7673` + hot-store region; notes `.backlog/lab/hot_pack_unlocked_notes.md`.
+
+### Gates
+| gate | result |
+|---|---|
+| build METAL=1 | exit 0, no warnings, seam symbol 1 |
+| golden **OFF** | `PASS md5=5d04890413ff539e802985ce8c727814` |
+| golden **ON** | `PASS md5=5d04890413ff539e802985ce8c727814` |
+
+Bit-exact both ways, as a pure locking change must be. (Contrast E90, which failed this same gate.)
+
+### Result — NEUTRAL
+p064, `--max-tokens 1`, interleaved n=3:
+
+| arm | median TTFT | range |
+|---|---|---|
+| OFF | 37.787 s | 37.728-38.403 |
+| ON | 37.769 s | 37.765-38.181 |
+
+**-0.05 %.** Ranges fully overlapping. Upstream issue #900 attributes ~6.9 s of extra TTFT to
+packing under the store lock (~5.70 s lock-held). **That does not reproduce here.** The contention
+upstream measured does not exist in this configuration — plausibly because only 16 hot slots per
+layer are ever packed, so the lock is not held long enough to matter on this workload.
+
+### Pattern worth recording
+This is the THIRD upstream performance claim to fail on this host:
+- #1097 loader lanes 3->9 ("measured 1.41x decode") — no I/O stall exists to recover (E87)
+- `V4_NGRAM` (+18.5 %) — measures +1.40 %, and the drafter never fires (E87/E89)
+- `e36a1c7` hot-pack (~6.9 s TTFT) — measures -0.05 % (this entry)
+
+Upstream numbers are measured on different hardware and workloads. **Every adopted claim must be
+re-measured here before it is believed**, and the adoption cost is only justified when it survives
+that. The code is retained (default OFF, bit-exact, zero risk) but should not be enabled.

@@ -1,0 +1,26 @@
+v4_kernels active=none
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_cli mode=chat memory=limited target_only=1
+v4_dense_resident layers=43 bytes=6.267GiB
+你的理解非常准确。你精准地抓住了Transformer架构和混合专家（MoE）模型的核心机制。让我基于你的描述，进一步展开和深化这些概念，并补充一些关键的细节和权衡。
+
+**1. 关于Transformer的缩放点积注意力（Scaled Dot-Product Attention
+v4_tokens prompt=70 generated=60 total=130 expert_requests=24547 hits=18517 misses=5962 hit_rate=75.435 bytes=79708028928 target_only=1
+generated_text=你的理解非常准确。你精准地抓住了Transformer架构和混合专家（MoE）模型的核心机制。让我基于你的描述，进一步展开和深化这些概念，并补充一些关键的细节和权衡。
+
+**1. 关于Transformer的缩放点积注意力（Scaled Dot-Product Attention
+timing time_to_first_token=30.994s after_first=41.528s
+v4_rows16 packed_slots=992
+v4_direct reads=5962 flock_reads=0 fallbacks=0 payload_bytes=75019321344
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=429 metal_fp8_upload_mb=1.1
+metal_fp8_ms total=2861.9 memcpy_in=11.9 dispatch_wait=2815.3 memcpy_out=34.6
+fp8_qdq_ms=449.6 fp8_qdq_melems=52.4
+moe_group_overhead_ns=2366534900
+moe_chunk_ns=19036221456
+moe_batched min_n=4 rows16=1 groups=1262 rows=12165 ms=3706.9 rejects=0 | cpu_rows=5895 cpu_ms=4370.4 | metal_row_share=67.4%
+moe_group_hist 1:2268 2:1002 3:541 4:336 5:221 6:143 7:106 8:76 9:44 10:51 11:44 12:31 13:17 14:34 15:13 16:15 17:10 18:9 19:5 20:7 21:5 22:4 23:3 24:4 25:4 26:6 27:2 28:7 29:3 30:3 31:3 32:56
+moe_waves=89 moe_wave_fallbacks=0 moe_groups=5073

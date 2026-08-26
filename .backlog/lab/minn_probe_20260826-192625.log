@@ -1,0 +1,11 @@
+MIN_N probe p064 --max-tokens 1, interleaved n=3
+  r1 min_n=4 ttft=38.306s min_n=4 rows16=0 groups=1010 rows=8949 | cpu_rows=9111 cpu_ms=6456.7 | metal_row_share=49.6%
+  r1 min_n=3 ttft=37.991s min_n=3 rows16=0 groups=1452 rows=10279 | cpu_rows=7781 cpu_ms=5449.3 | metal_row_share=56.9%
+  r2 min_n=4 ttft=38.380s min_n=4 rows16=0 groups=1014 rows=8969 | cpu_rows=9091 cpu_ms=6448.9 | metal_row_share=49.7%
+  r2 min_n=3 ttft=38.691s min_n=3 rows16=0 groups=1449 rows=10257 | cpu_rows=7803 cpu_ms=5523.9 | metal_row_share=56.8%
+  r3 min_n=4 ttft=39.203s min_n=4 rows16=0 groups=1013 rows=8963 | cpu_rows=9097 cpu_ms=6542.0 | metal_row_share=49.6%
+  r3 min_n=3 ttft=38.893s min_n=3 rows16=0 groups=1450 rows=10273 | cpu_rows=7787 cpu_ms=5500.3 | metal_row_share=56.9%
+--- medians ---
+  min_n=4 median_ttft=38.380s
+  min_n=3 median_ttft=38.691s
+  delta = +0.81% (negative = MIN_N=3 faster)
