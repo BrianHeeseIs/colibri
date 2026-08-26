@@ -4411,9 +4411,23 @@ blocking wait (`:3285`) that is ~45 ms, i.e. **~8%** of expert time. Fusing 6->1
 But the same compute moved to the GPU at S=1 runs at the measured **0.40x** — roughly 150% MORE
 expensive. Trading ~7% of dispatch overhead for a 2.5x compute penalty can only lose.
 
-**The S=1 GPU penalty is COMPUTE inefficiency, not dispatch overhead.** Every plan premised on
-amortising dispatch — one-command-buffer fan-out included — inherits the same losing trade. The
-explore's stated top risk ("code lands but decode stays slower") is exactly what happened.
+**INFERRED, not directly measured.** The decomposition above splits the S=1 penalty into compute vs
+dispatch using two SEPARATELY measured numbers (0.176 ms/dispatch from `:3285`; 0.40x at S=1 from the
+S-scaling probe). No probe has isolated the two terms within a single seam call. What is EMPIRICALLY
+proven here is narrower: the fused path measured -8.18% with non-overlapping ranges, and is racy.
+"dispatch amortisation cannot pay" is a model-based prediction consistent with that result, not an
+independent measurement. To settle it directly: time the batched seam at S=6-same-expert against 6
+separate S=1 calls.
+
+**The structural point is separate and solid.** Fusion never raised S. Six experts in one dispatch
+still gives each expert ONE row, so it attacks dispatch COUNT, not batch size, and was never
+pursuing the S>=4 regime where Metal is measured 1.68-2.41x faster. For a single request, decode is
+S=1 by construction — one token is one row per expert. Only two mechanisms raise decode S:
+speculation (S=draft; E89 measured it working, +19 groups, but losing 6.9% to draft and
+rejection-replay cost) and concurrent multi-request batching (S = in-flight requests, which does
+reach S>=4 but improves aggregate throughput, not single-request tok/s).
+
+The explore's stated top risk ("code lands but decode stays slower") is exactly what happened.
 
 **Item 2 is closed.** Making the GPU efficient at S=1 is a different and much harder problem than
 reducing dispatch count, and nothing in the measured data suggests it is reachable from here.
@@ -4422,3 +4436,39 @@ reducing dispatch count, and nothing in the measured data suggests it is reachab
 Code retained, **default OFF and proven inert** (golden OFF passes). Flag documented as NOT
 RECOMMENDED: it is both slower and racy. Retained because the negative result is the deliverable —
 it forecloses an entire family of proposals that would otherwise keep resurfacing.
+
+---
+
+## E91. Prompt-length sweep — the two axes move in OPPOSITE directions
+
+Harnesses `.backlog/lab/lensweep.sh` (TTFT) and `.backlog/lab/tokps.sh` with `PROMPT_FILE` (tok/s),
+interleaved OFF/ON per length. Arm under test: `COLI_V4_KERNELS=all` (E88).
+
+### TTFT (--max-tokens 1, n=2)
+| prompt | words | off | on | delta |
+|---|---|---|---|---|
+| p064 | 61 | 37.707 s | 33.772 s | **-10.44 %** |
+| p256 | 165 | 99.336 s | 81.470 s | **-17.99 %** |
+| p512 | 331 | 209.187 s | 166.874 s | **-20.23 %** |
+
+**The TTFT gain GROWS with prompt length** (10.4 -> 18.0 -> 20.2 %). Only the attention lane had
+previously done this here; every MoE feature decayed with length. Mechanism is consistent:
+`attn_sparse` is one of the two reassociated kernels and attention is the O(n^2) term, so length
+works in its favour.
+
+### tok/s (24 tokens generated, n=2)
+| prompt | off | on | delta |
+|---|---|---|---|
+| p064 | 0.95535 | **1.11455** | **+16.66 %** |
+| p256 | 0.98440 | **1.10330** | **+12.08 %** |
+
+**The tok/s gain SHRINKS with prompt length** (16.7 -> 12.1 %) while the TTFT gain grows. Decode
+cost per token is roughly length-independent, but as KV grows the router/attention share of DECODE
+falls, leaving less for the fast kernels to win.
+
+**Practical consequence:** `KERNELS=all` is the right choice for long prompts on BOTH axes; its
+weakest case is short-prompt TTFT at -10.4 %, still a solid win.
+
+p512 tok/s was not captured (run stopped early). Determinism note: at p256 each arm produced ONE
+stable md5 (`4e3e987a` off, `4f74f9bd` on), unlike p064 where the ON arm alternates between two.
+So the E88/E89 boundary-flipping is prompt-dependent, not universal.
