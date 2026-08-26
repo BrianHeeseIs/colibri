@@ -1,0 +1,17 @@
+lensweep N=2 TOKENS=1 prompts='p064 p256 p512' on_extra='COLI_V4_KERNELS=all'
+  p064  (61w) r1 off ttft=37.761s
+  p064  (61w) r1 on  ttft=34.442s
+  p064  (61w) r2 off ttft=37.707s
+  p064  (61w) r2 on  ttft=33.772s
+  ==> p064 (61w) off=37.707s on=33.772s delta=-10.44%
+  p256  (165w) r1 off ttft=100.922s
+  p256  (165w) r1 on  ttft=81.470s
+  p256  (165w) r2 off ttft=99.336s
+  p256  (165w) r2 on  ttft=82.255s
+  ==> p256 (165w) off=99.336s on=81.470s delta=-17.99%
+  p512  (331w) r1 off ttft=209.187s
+  p512  (331w) r1 on  ttft=166.874s
+  p512  (331w) r2 off ttft=211.740s
+  p512  (331w) r2 on  ttft=169.006s
+  ==> p512 (331w) off=209.187s on=166.874s delta=-20.23%
+log: /Users/cptn/workbench/ai/colibri/.backlog/lab/lensweep_20260826-193111.log

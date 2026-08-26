@@ -1,0 +1,18 @@
+length sweep WITH decode: tok/s + TTFT, fast-kernels off/on, N=2 TOKENS=24
+--- p064 (61 words) ---
+  run1 off                    ttft=  38.391s decode=  24.179s tok/s=0.9512   md5=7f068fd53a245c899c254a6626d37be2
+  run1 on                     ttft=  34.573s decode=  20.301s tok/s=1.1329   md5=7f068fd53a245c899c254a6626d37be2
+  run2 off                    ttft=  37.976s decode=  23.971s tok/s=0.9595   md5=7f068fd53a245c899c254a6626d37be2
+  run2 on                     ttft=  34.278s decode=  20.981s tok/s=1.0962   md5=7f068fd53a245c899c254a6626d37be2
+SUMMARY (median tok/s)
+  off                     0.95535 tok/s  baseline            deterministic  md5=7f068fd53a245c899c254a6626d37be2 
+  on                      1.11455 tok/s  +16.66% tok/s       deterministic  md5=7f068fd53a245c899c254a6626d37be2 
+--- p256 (165 words) ---
+  run1 off                    ttft= 102.434s decode=  23.344s tok/s=0.9853   md5=4e3e987a7a61ff7fa38a7b031d6e5e97
+  run1 on                     ttft=  82.239s decode=  21.003s tok/s=1.0951   md5=4f74f9bd1eb1896d2103e9fe451513b5
+  run2 off                    ttft= 101.169s decode=  23.387s tok/s=0.9835   md5=4e3e987a7a61ff7fa38a7b031d6e5e97
+  run2 on                     ttft=  82.643s decode=  20.693s tok/s=1.1115   md5=4f74f9bd1eb1896d2103e9fe451513b5
+SUMMARY (median tok/s)
+  off                      0.9844 tok/s  baseline            deterministic  md5=4e3e987a7a61ff7fa38a7b031d6e5e97 
+  on                       1.1033 tok/s  +12.08% tok/s       deterministic  md5=4f74f9bd1eb1896d2103e9fe451513b5 
+--- p512 (331 words) ---
