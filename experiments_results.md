@@ -5242,3 +5242,62 @@ Attention sub-phases, subsets of the 38.7%: **attn_out 17.9%**, attn_sparse 11.7
 project a session of work aimed at the wrong phase on the wrong backend. Profiles drift with
 context length, pin policy and cache hit rate — this run had `pin_slots_per_layer=16` and a 78%
 hit rate, neither of which matches whenever the old profile was taken.
+
+## E103. The FP8 attention path has NO arm64 SIMD — it is scalar, and it is ~29%+ of decode
+
+Pure source analysis, no runs. Follows E102, which showed attention (38.7%) has overtaken
+expert_forward (27.0%) as the largest decode phase.
+
+### What `attn_out` actually is
+`c/deepseek_v4.c:2065-2098`: RoPE + bf16 per head, then the output projection — a loop of
+`coli_fp8_matvec_ref` over `wo_a` (one per group) and one over `wo_b`. `attn_qkv` (`:1881`, `:1928`,
+`:1938`) is three more calls to the same function. So is the indexer (`:3369`, `:6528`).
+
+### The finding
+`coli_fp8_matvec_ref` (`c/deepseek_v4.c:13313`) has exactly one SIMD fast path, guarded by
+**`#ifdef __AVX2__`**. On aarch64 that is dead code, and the call falls through to
+`matmul_fp8` (`c/quant.h:502`), which is:
+
+- a **plain scalar loop**, `acc += e4m3_decode(w[i]) * xv`, four output rows unrolled,
+- with a **256-entry float LUT gather** per element (`E4M3_LUT`),
+- parallelised only by `#pragma omp parallel for` across output rows,
+- and **no NEON whatsoever**.
+
+**This is an asymmetry, not an oversight of the whole file.** `c/quant.h` DOES carry hand-written
+NEON for the int4/int8 matmuls (`:114`, `:145` — `vfmaq_f32`, `vmovl_s16`, `vld1q_f32`), and the
+MXFP4 expert path has a full NEON rows16 kernel (`neon_rows16_accumulate`, with `vqtbl4q_u8` table
+lookups). **The FP8 path is the one that never got an arm64 kernel.**
+
+### Share of decode this covers (from E102's profile)
+| phase | % of decode | goes through `coli_fp8_matvec_ref`? |
+|---|---|---|
+| attn_out | 17.9 | YES — `groups`+1 calls per layer |
+| attn_qkv | 9.0 | YES — 3 calls per layer |
+| indexer | 2.3 | YES |
+| **verified subtotal** | **29.2** | |
+| shared_expert | 5.8 | takes fp8 views; not yet traced to the call — unverified |
+| head | 5.1 | unverified |
+
+**At least 29% of decode runs a scalar FP8 dot product on a machine with NEON**, on the arm that
+E99 measured as the fastest configuration (CPU, 1.4285 tok/s).
+
+### A second, independent and much cheaper defect
+`coli_fp8_matvec_ref` does `malloc(columns*4)` **and** `malloc(scale_columns)` on EVERY call, and
+frees both before returning. With 989 layer-visits per 23 tokens and (groups+4) calls each, that is
+tens of thousands of malloc/free pairs per generation. A thread-local scratch buffer removes it
+entirely and changes no arithmetic, so it is bit-exact by construction.
+
+### Why this was missed for ~100 experiments
+The recorded decode profile said expert_forward was 52.5% and attention 26.3%, so every
+optimisation went to the expert path — which has had a NEON kernel all along. E102 inverted that
+ranking; this entry is what the corrected ranking points at.
+
+### Blast radius warning for whoever implements it
+`c/quant.h` is a SHARED header — `colibri.c` (GLM), `inkling.c`, `kimi_k3.c`, `olmoe.c` and
+`deepseek_v4.c` all include it. A change to `matmul_fp8` touches all five engines. The bit-exactness
+contract is float accumulation WITHIN each 128-column block and double accumulation ACROSS blocks;
+a NEON version must reproduce both, and the per-row serial order, or it is not bit-exact.
+The 4-row unroll suggests a lane-per-row layout (the same trick that made `simd_exact` bit-exact),
+but the rows are strided by I bytes so the four byte-loads are not contiguous — that is the design
+problem to solve, and it should be prototyped in `validation/` against `matmul_fp8` before any
+engine is touched.
