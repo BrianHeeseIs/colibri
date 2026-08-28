@@ -5401,3 +5401,59 @@ COLI_V4_KERNELS=all        # Metal OFF
 ```
 `COLI_V4_METAL_VARIANT=simd_exact_cold` remains a documented opt-in for anyone whose configuration
 does favour the Metal path; it is bit-exact and it is the best Metal expert kernel available.
+
+## E106. The dashboard's "Other" bucket was 58% because the engine reported attention and head as literal zeros
+
+Raised from the web UI: the Profiling tab attributed **58% of a turn to "Other"** (72.4 s of 125.7 s),
+which reads as unexplained overhead.
+
+### Cause — not overhead, a hardcoded format string
+`c/deepseek_v4.c`, `v4_prof_emit`:
+```c
+printf("PROF %.3f %d %d %.3f 0.000 %.3f 0.000 0.000 0\n",
+       wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s);
+```
+The function took only five values. `expert_wait`, **`attention`** and **`lm_head`** were **literal
+`0.000`** in the format string, and `openai_server.py` parses those positions
+(`:1571-1573`) straight into the dashboard. The UI computes
+`other = wall - (io_wait + expert_matmul + attention + lm_head)`, so "Other" silently absorbed
+every phase the engine declined to report.
+
+Cross-check that it was mislabelling rather than waste: E102's direct engine profile gives
+attention 38.7% + head 5.1% + router 4.7% + shared_expert 5.8% + norms/indexer/compressor 8.3%
+= **62%**, against the 58% observed in "Other". They agree.
+
+### Fix
+- Added `coli_v4_profile_phase_ns(phase)` to read the existing (already-populated) phase
+  accumulators.
+- Widened `v4_prof_emit` to carry expert_wait, attention and lm_head, snapshotting the counters
+  before/after each turn — the same delta trick the expert store already uses for disk and matmul.
+- Serve mode now calls `coli_v4_profile_force_enable()`, because those counters are gated behind
+  `COLI_V4_PROFILE=1` and were therefore dead in the server. **Cost is nil:** E102 measured a
+  profiled run at 1.41 tok/s against 1.4285 for the unprofiled arm — inside the noise floor.
+
+### Result, same workload
+| | before | after |
+|---|---|---|
+| expert matmul | 42% | 45% |
+| **attention** | **0.00 s (unreported)** | **17.8 s — 26%** |
+| lm head | 0.00 s | 0.80 s |
+| I/O wait | 0.00 s | 0.60 s |
+| **Other** | **58%** | **27%** |
+
+31 percentage points moved out of "Other" into the phases that actually consumed them.
+
+### Can "Other" be reduced on this hardware?
+The honest answer is **mostly no, and the remaining 27% is not waste either.** What is left is
+router, shared_expert, hc_norm, indexer, compressor, embed/rope and per-turn scheduling and
+tokenisation — none individually large (E102 puts them at ~19% of decode combined).
+
+The two big items that WERE hiding in "Other" are already at their limits on this host:
+- **attention** is the largest decode phase (38.7%, E102). `COLI_V4_KERNELS=all` already accelerates
+  its two biggest components (`attn_sparse` + `router`) and is what delivers the +17.11% in E105 —
+  it was already enabled in this server.
+- the **FP8 projections** underneath it are at the machine's gather limit (E104): a bit-exact NEON
+  kernel measures 1.00x, and beating the LUT requires an order change that is not bit-exact.
+
+So the actionable outcome here was instrumentation, not optimisation: the chart now tells the truth
+about where the time goes, and where it goes is where this session already established the limits.

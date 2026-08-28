@@ -9377,6 +9377,20 @@ void coli_v4_profile_add(int phase, uint64_t elapsed_ns) {
     coli_v4_profile[phase].calls++;
 }
 
+/* Read a phase's accumulated nanoseconds. The serve loop snapshots this before and after a turn
+ * to report per-turn phase timings, the same delta trick the expert store already uses for its
+ * disk and matmul counters. */
+uint64_t coli_v4_profile_phase_ns(int phase) {
+    if (phase < 0 || phase >= COLI_V4_PROFILE_COUNT) return 0;
+    return coli_v4_profile[phase].elapsed_ns;
+}
+
+/* Serve mode turns phase timing on unconditionally so the dashboard's per-turn breakdown has
+ * real attention and head numbers instead of the zeros that made "Other" absorb them. The cost is
+ * a clock read per phase per layer; E102 measured a profiled run at 1.41 tok/s against 1.4285 for
+ * the unprofiled arm, i.e. inside the noise floor. */
+void coli_v4_profile_force_enable(void) { coli_v4_profile_env = 1; coli_v4_profile_on = 1; }
+
 static void coli_v4_profile_reset_decode(void) {
     if (coli_v4_profile_env < 0) {
         const char *setting = getenv("COLI_V4_PROFILE");
@@ -11289,10 +11303,18 @@ static void v4_hwinfo_emit(void) {
     fflush(stdout);
 }
 
+/* PROF carries the per-turn phase breakdown the dashboard stacks. attention, lm_head and
+ * expert_wait used to be LITERAL ZEROS in this format string, so the UI's "Other" bucket silently
+ * absorbed them -- 58% of a turn on this host, which reads as unexplained overhead when it is in
+ * fact attention (the largest decode phase, 38.7% per experiments E102) plus the head, router,
+ * shared expert, norms and prefill. Reporting them is what makes that chart honest. */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
-                         double expert_disk_s, double expert_matmul_s) {
-    printf("PROF %.3f %d %d %.3f 0.000 %.3f 0.000 0.000 0\n",
-           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s);
+                         double expert_disk_s, double expert_wait_s,
+                         double expert_matmul_s, double attention_s,
+                         double lm_head_s) {
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f 0\n",
+           wall_s, prompt_tokens, completion, expert_disk_s, expert_wait_s,
+           expert_matmul_s, attention_s, lm_head_s);
     fflush(stdout);
 }
 
@@ -11457,6 +11479,10 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     double matmul_before =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
+    /* Phase counters are cumulative; snapshot them so the turn reports its own delta. */
+    uint64_t attn_ns_before = coli_v4_profile_phase_ns(COLI_V4_PROFILE_ATTENTION);
+    uint64_t head_ns_before = coli_v4_profile_phase_ns(COLI_V4_PROFILE_HEAD);
+    uint64_t wait_ns_before = coli_v4_profile_phase_ns(COLI_V4_PROFILE_EXPERT_WAIT);
     V4ServeStream stream = {session, request->id, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
@@ -11506,7 +11532,11 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
         : 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
-                 expert_disk_s, expert_matmul_s);
+                 expert_disk_s,
+                 (coli_v4_profile_phase_ns(COLI_V4_PROFILE_EXPERT_WAIT) - wait_ns_before) / 1e9,
+                 expert_matmul_s,
+                 (coli_v4_profile_phase_ns(COLI_V4_PROFILE_ATTENTION) - attn_ns_before) / 1e9,
+                 (coli_v4_profile_phase_ns(COLI_V4_PROFILE_HEAD) - head_ns_before) / 1e9);
     coli_v4_expert_store_emit_hits(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
     coli_v4_expert_store_emit_tiers(engine->experts);
@@ -11564,6 +11594,7 @@ static int v4_serve_main(void) {
         return 1;
     }
 
+    coli_v4_profile_force_enable();     /* per-turn phase timings for the dashboard */
     coli_serve_binary_mode();
     setvbuf(stdin, NULL, _IONBF, 0);
     fputs("\x01\x01READY\x01\x01\n", stdout);
