@@ -5301,3 +5301,56 @@ The 4-row unroll suggests a lane-per-row layout (the same trick that made `simd_
 but the rows are strided by I bytes so the four byte-loads are not contiguous — that is the design
 problem to solve, and it should be prototyped in `validation/` against `matmul_fp8` before any
 engine is touched.
+
+## E104. The FP8 scalar kernel is NOT leaving easy SIMD on the table — E103's premise refuted
+
+E103 observed that `matmul_fp8` (`c/quant.h:502`) has no arm64 SIMD path — only a dead
+`#ifdef __AVX2__` — and inferred a large win was available across ~29% of decode. `validation/fp8_neon_probe.c`
+tests that directly against the scalar reference, single-threaded, on the real projection shapes.
+It cost minutes and required no engine change.
+
+| shape | ref | A: lane-per-row (row-major) | B: rows4-packed + arithmetic decode |
+|---|---|---|---|
+| wo_b 4096->4096 | 4.100 ms | 4.091 ms — **1.00x**, BIT-EXACT | 7.231 ms — **0.57x**, not bit-exact |
+| wo_a 2048->1024 | 0.509 ms | 0.508 ms — 1.00x, BIT-EXACT | 0.892 ms — 0.57x |
+| wq_b 1536->4096 | 1.543 ms | 1.532 ms — 1.01x, BIT-EXACT | 2.688 ms — 0.57x |
+| wkv 4096->576 | 0.576 ms | 0.569 ms — 1.01x, BIT-EXACT | 1.006 ms — 0.57x |
+
+### Candidate A is bit-exact and buys NOTHING
+Putting the four unrolled output rows into one `float32x4`, each lane accumulating its own row
+serially, reproduces the reference exactly (0 mismatches on every shape) and is **1.00x**. The
+scalar loop is already getting this: the compiler auto-vectorises the existing 4-row unroll. There
+is no free lunch in hand-writing what `-O3` already emits.
+
+### Candidate B is slower, and WHY is the useful part
+Arithmetic E4M3 decode (~10 NEON ops per 4 values = 2.5 ops/value) replaces one LUT gather per
+value. Measured 0.57x — almost exactly the op-count ratio. **The 256-entry LUT gather is not a
+bottleneck on this machine; it retires at roughly one per cycle out of L1.** wo_b reads 16.7 MB of
+weights in 4.1 ms single-threaded, i.e. ~4.1 G lookups/s ≈ 1/cycle. The kernel is gather-throughput
+bound and the gather is already optimal.
+
+(B is also not bit-exact — a bug in the vectorised decode. Not chased: at 0.57x it cannot win even
+if corrected.)
+
+### The real trade, stated precisely
+- **Bit-exact** requires lane-per-row (each lane owns one output row, serial over columns), which
+  decodes only **4** weights per vector step — at which width arithmetic decode loses to the LUT.
+- **Beating the LUT** requires decoding **16** weights at once (`vmovl_u8` chains, ~0.75 ops/value),
+  which requires vectorising ACROSS columns within one row — which changes the summation order and
+  is therefore **not bit-exact**.
+
+These are mutually exclusive. There is no bit-exact arm64 kernel that beats the current scalar code.
+
+### Status
+E103's "at least 29% of decode runs a scalar dot product on a NEON machine" is **factually true and
+practically irrelevant** — the scalar code is already at the machine's gather limit. E103's
+recommendation is **withdrawn**; no engine change was made and `c/quant.h` was not touched.
+
+What remains open is only the non-bit-exact route (decode-16 across columns), which would need the
+task-level capability gate rather than golden, and whose ceiling is bounded by the ~0.75-vs-1.0
+ops/value ratio — i.e. well under 2x on a phase worth 29% of decode. It is recorded here rather
+than attempted, because the measured ceiling does not obviously justify the numerics risk.
+
+**Method note:** the prototype cost minutes and killed a plausible multi-day direction before any
+shared header was touched. `c/quant.h` is included by all five engines; prototyping in
+`validation/` first is what kept that blast radius at zero.
