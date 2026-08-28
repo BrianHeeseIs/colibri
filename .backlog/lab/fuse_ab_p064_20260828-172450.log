@@ -1,0 +1,12 @@
+tok/s A/B  tokens=60  N=3  prompt=p064.txt
+  run1 fuse_off               ttft=  47.173s decode=  45.734s tok/s=1.2901   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run1 fuse_on                ttft=  55.694s decode=  48.651s tok/s=1.2127   md5=b39fba3355d2b0fdc6c1ea8913344ae5
+  run2 fuse_off               ttft=  46.316s decode=  45.134s tok/s=1.3072   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run2 fuse_on                ttft=  55.653s decode=  48.703s tok/s=1.2114   md5=b39fba3355d2b0fdc6c1ea8913344ae5
+  run3 fuse_off               ttft=  46.743s decode=  44.858s tok/s=1.3153   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run3 fuse_on                ttft=  55.636s decode=  48.835s tok/s=1.2081   md5=b39fba3355d2b0fdc6c1ea8913344ae5
+
+SUMMARY (median tok/s)
+  fuse_off                 1.3072 tok/s  baseline            deterministic  md5=d7e11251b80b1a4b36fbd1ecd2382bb0 
+  fuse_on                  1.2114 tok/s  -7.33% tok/s        deterministic  md5=b39fba3355d2b0fdc6c1ea8913344ae5 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.eyalge

@@ -5101,3 +5101,57 @@ command-buffer level is a different and much safer change.
 
 Secondary: the prefill chunk is hardcoded (`c/deepseek_v4.c:9944`, `if (chunk > 64) chunk = 64;`).
 Making it tunable would raise per-expert group sizes in prefill and is a one-line experiment.
+
+## E100. Fusing the top-k fan-out into one command buffer — BUILT, MEASURED, **SLOWER**. And E99's 76% figure was an artefact of the profiler.
+
+### The result
+`COLI_V4_METAL_FUSE=1` encodes the whole top-k expert fan-out into ONE command buffer with a
+single commit+wait, stage-major (all gate matmuls, then all up matmuls, ...) so the fan-out has
+n-way GPU concurrency between barriers. It works, it is correct, and it **loses**.
+
+p064, N=3, 60 tokens, on top of `COLI_V4_METAL=1 COLI_V4_MOE_BATCHED=1 simd_exact_cold`:
+
+| arm | tok/s | TTFT |
+|---|---|---|
+| fuse_off | **1.3072** | 46.74 s |
+| fuse_on | 1.2114 (**-7.33%**) | 55.65 s (**+19%**) |
+
+Both deterministic. Answer quality unaffected — the transcripts differ only in phrasing
+("工程上的考量" vs "延伸思考"), the usual near-tie divergence, meaning fully retained.
+
+### Why it lost — two independent reasons, both instructive
+**1. The fan-out rarely qualifies.** Fusion needs EVERY expert in the fan-out to be cold
+(`block_rows==1`); one pinned rows16 expert aborts the whole group. Measured on an 8-token run:
+`v4_metal_fused batches=63 experts=378 bailouts=0` against ~344 layer-visits — fusion fired on
+only **~18%** of fan-outs. It removed ~15% of the round-trips, not 5/6 of them.
+
+**2. It sacrifices the async loader, which is worth more.** The expert loop pre-starts
+`profiled_expert_load_start` for the next expert and overlaps that I/O with compute. A fused
+fan-out must hold all n leases at once, so it cannot use that pipeline and instead performs n
+synchronous lookups. TTFT +19% is that loss, and it dwarfs the round-trip saving.
+
+### The correction that matters most: E99's "76% submit+wait" was an instrument artefact
+E99 reported `command-buffer submit+wait = 76.49%` of the expert path and this entire experiment
+was built on it. That number came from a run with `COLI_V4_METAL_PROFILE=1` — and the
+`COLI_V4_PROFILE_FLUSH` macro **ends the encoder, commits, waits and opens a NEW command buffer
+after every stage**. Profiling therefore measures ~9 round-trips per expert where production has
+exactly **one**. The production share is on the order of 76/9 ≈ 8-20%, not 76%.
+
+E99's caveat did say the figure was "INFLATED versus production", but the experiment was scoped as
+if the headline number were real. **A profiler that changes the thing it measures by an order of
+magnitude cannot size the optimisation that targets it.** The honest way to size this was to
+compare total wall against `metal_dispatches` with profiling OFF.
+
+### A deadlock worth recording
+The first implementation hung with the engine at 0% CPU. Cause: the per-expert loop pre-starts a
+background loader thread that is *already* performing `coli_expert_lookup`, and the fused block
+then called `coli_expert_lookup` on the same store from the main thread. `c/expert_store.h:50-52`
+states callers must not assume concurrent lookup/release on one store is safe. **Any future
+batching of expert acquisition must run BEFORE the loader is started, or consume it.**
+
+### Status
+**REVERTED** (repo precedent: `f8aef6b`). The seam entry, the flag, and the caller wiring are all
+removed. What survives is this entry, and the conclusion that the expert path is NOT dominated by
+command-buffer overhead in production — which retires the largest remaining hypothesis about why
+Metal loses to the CPU here, and redirects attention to the ~45% of experts that never reach the
+GPU at all (E97) and to prefill/streaming, which is ~70% of the wall.

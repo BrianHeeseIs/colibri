@@ -1,0 +1,28 @@
+v4_kernels active=none
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_cli mode=chat memory=limited target_only=1
+v4_dense_resident layers=43 bytes=6.267GiB
+17 times 23 equals **391**.
+
+
+v4_tokens prompt=12 generated=8 total=20 expert_requests=9426 hits=7511 misses=1915 hit_rate=79.684 bytes=25602293760 target_only=1
+generated_text=17 times 23 equals **391**.
+
+
+timing time_to_first_token=13.364s after_first=6.107s
+v4_rows16 packed_slots=624
+v4_direct reads=1915 flock_reads=0 fallbacks=0 payload_bytes=24096276480
+metal_dispatches=2077
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=0 metal_fp8_upload_mb=0.0
+metal_fp8_ms total=0.0 memcpy_in=0.0 dispatch_wait=0.0 memcpy_out=0.0
+fp8_qdq_ms=223.4 fp8_qdq_melems=25.9
+v4_metal_reject variant=0 init=0 queue=0 dims=0 layout=3201 pipelines=0 ok=2455
+v4_metal_simd_exact matmuls=7365 rows16_fallbacks=0
+v4_metal_fused batches=63 experts=378 bailouts=0
+v4_metal_single_entry rows_rejects=2447 last_block_rows=16
+v4_metal_layout tensor_gate=0 tensor_up=0 tensor_down=0 format=0 pointers=0 rows=0 columns=0 row_bytes=0 groups=0 block_dims=0
+v4_metal_library kind=metallib
