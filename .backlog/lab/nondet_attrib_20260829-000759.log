@@ -1,0 +1,10 @@
+tok/s A/B  tokens=60  N=2  prompt=p064.txt
+  run1 cpu_nokernels          ttft=  45.757s decode=  41.978s tok/s=1.4055   md5=6b06510597df9c6170c6726b7d7a4747
+  run1 grouped_nokernels      ttft=  38.520s decode=  41.413s tok/s=1.4247   md5=e0db0365782f191a338cfda3f492a2e8
+  run2 cpu_nokernels          ttft=  43.207s decode=  41.391s tok/s=1.4254   md5=6b06510597df9c6170c6726b7d7a4747
+  run2 grouped_nokernels      ttft=  38.114s decode=  42.000s tok/s=1.4048   md5=e0db0365782f191a338cfda3f492a2e8
+
+SUMMARY (median tok/s)
+  cpu_nokernels           1.41545 tok/s  baseline            deterministic  md5=6b06510597df9c6170c6726b7d7a4747 
+  grouped_nokernels       1.41475 tok/s  -0.05% tok/s        deterministic  md5=e0db0365782f191a338cfda3f492a2e8 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.STprAu

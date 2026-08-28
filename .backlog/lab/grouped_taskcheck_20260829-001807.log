@@ -1,0 +1,9 @@
+task-level correctness gate  tokens=120  N=1  checks=5
+  run1 cpu            correctness=11111 (5/5)
+  run1 grouped        correctness=11111 (5/5)
+
+VERDICT
+  cpu            vectors=11111          stable=1/1
+  grouped        vectors=11111          stable=1/1
+  PASS - capability identical across arms (vector 11111)
+  transcripts: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//taskcheck.zubUOh

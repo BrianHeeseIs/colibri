@@ -5698,3 +5698,52 @@ It is NOT adoptable until the nondeterminism is attributed and either explained 
 Next steps, in order: (1) the KERNELS-unset control above; (2) if grouping is the source, a
 multi-chunk p256 text differential plus taskcheck to establish whether meaning survives; (3) only
 then a resolution-grade N>=5 TTFT measurement with a clean baseline.
+
+## E111. Nondeterminism ATTRIBUTED — the grouped lane is clean; `KERNELS=all` was the source
+
+E110 flagged both grouped arms as nondeterministic and could not attribute it, because
+`COLI_V4_KERNELS=all` (itself recorded as producing two variants over eight runs) was present in
+every arm. The discriminating control, run with **`COLI_V4_KERNELS` unset**, p064, 60 tokens, N=2:
+
+| arm | tok/s | TTFT run1 / run2 | md5 | verdict |
+|---|---|---|---|---|
+| `cpu_nokernels` | 1.41545 | 45.757 / 43.207 | `6b06510597...` both runs | deterministic |
+| `grouped_nokernels` | 1.41475 | **38.520 / 38.114** | `e0db0365...` **both runs** | **deterministic** |
+
+**The grouped Metal prefill lane is deterministic on its own.** The E110 nondeterminism is
+attributable to `COLI_V4_KERNELS=all`; at N=2 the CPU arm happened to land on the same variant
+twice while the grouped arms landed on different ones. The lane is exonerated and unblocked.
+
+### The clean measurement (no poisoned baseline this time)
+- **TTFT 44.48 -> 38.32 s median, -13.9%.** Ranges do not overlap (45.757/43.207 vs 38.520/38.114)
+  and the effect is ~17x the recorded 0.6-0.8% TTFT noise floor.
+- **decode 1.41545 -> 1.41475 tok/s, -0.05% — flat**, exactly as pre-registered for a prefill-only
+  lever. This independently reproduces E110's direction without its 36% intra-arm outlier.
+
+### Correctness gates, both passed
+Output differs from CPU deterministically (`e0db0365...` vs `6b06510597...`), so per the rules the
+TEXT was read rather than the hash judged:
+```
+CPU     : ...关于"条件稀疏性"的精确含义** ... 你提到的"条件稀疏性"是MoE的灵魂
+GROUPED : ...关于"条件稀疏"的精确含义**   ... 你提到的"条件稀疏"是MoE的关键。它
+```
+A morphological variant of the same term (条件稀疏性 / 条件稀疏) and a rhetorical choice
+(灵魂 "soul" / 关键 "key"). Both coherent, both correct. **Meaning fully retained.**
+
+`.backlog/lab/taskcheck.sh`, 120 tokens: **cpu 5/5, grouped 5/5, PASS — capability identical
+across arms (vector 11111)**, both stable.
+
+### Status: this is the first adoptable improvement to the shipped configuration since `KERNELS=all`
+```bash
+COLI_V4_METAL=0 COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 \
+  COLI_V4_METAL_VARIANT=simd_exact_cold
+```
+Decode experts stay on the CPU (the E105 winner); the independently gated grouped prefill seam
+dispatches Metal, where E109 measured it at ~0.4 ms/row against the CPU path's ~0.7. Deterministic,
+capability-identical, -13.9% TTFT, decode flat.
+
+**Remaining before it becomes the documented default:** a multi-chunk p256 differential (p064 is a
+single 64-token chunk, and AGENTS.md is explicit that one-chunk equality is not multi-chunk proof),
+and a resolution-grade TTFT confirmation. Its composition with `KERNELS=all` also needs a clean
+re-run, since E110's attempt had the corrupted baseline point — and that composition is what the
+shipped default would actually be.
