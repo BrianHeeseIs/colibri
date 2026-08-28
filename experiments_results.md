@@ -5648,3 +5648,53 @@ per-expert decode path, this measures grouped prefill with 8.8 rows/group averag
 The histogram shows **3811 groups (1+2+3 rows) currently below the gate**, all handed to the slower
 CPU path. MIN_N=4 was tuned against the ordered kernel; `simd_exact` moved that crossover, exactly
 as the review predicted.
+
+## E110. Grouped Metal prefill on the CPU champion — **TTFT wins, decode flat, but the lane is NONDETERMINISTIC**
+
+The composition E109 reopened, and the review's top candidate. All arms keep `COLI_V4_METAL=0`, so
+single-token DECODE experts stay on the CPU (the E105 winner) while the grouped prefill seam —
+gated independently — still dispatches Metal. p064, 60 tokens, N=2.
+
+| arm | TTFT run1 / run2 | decode tok/s | determinism |
+|---|---|---|---|
+| `cpu_champion` (`KERNELS=all`) | 53.718 / **39.535** | 1.129 / **1.672** | deterministic |
+| `grouped_minn4` (+GROUPED+BATCHED+simd_exact) | 36.642 / **34.343** | 1.639 / 1.638 | **NONDETERMINISTIC** |
+| `grouped_minn1` (+`MIN_N=1`) | 34.630 / **33.311** | 1.645 / 1.640 | **NONDETERMINISTIC** |
+
+### Read this table carefully — the baseline has an intra-arm outlier
+`cpu_champion` run1 took 53.7 s TTFT against its own run2 at 39.5 s: a **36% spread inside one
+arm**, far outside the 0.6-0.8% TTFT noise floor. Its median (and therefore the headline "+16.96%
+tok/s" the harness printed for the grouped arms) is poisoned by that single run. **The harness
+summary must not be quoted for this experiment.**
+
+Comparing the clean run2 points only:
+- TTFT **39.535 -> 34.343 s (-13.1%)** for grouped, **-> 33.311 s (-15.7%)** at MIN_N=1.
+- decode **1.672 -> 1.638 / 1.640 tok/s**, i.e. **flat to very slightly down**, exactly as
+  pre-registered (grouping is prefill-only; it cannot help S=1 decode).
+
+Direction is consistent with E84's historical -10.79%/-11.70% incremental TTFT for batched MoE, and
+with E109's counter finding that Metal costs ~0.4 ms/row against the CPU path's ~0.7.
+**Magnitude is provisional**: N=2 with a corrupted baseline point.
+
+### The blocker: both grouped arms are nondeterministic
+`grouped_minn4` produced md5 `06419013...` and `e0db0365...`; `grouped_minn1` produced
+`6b06510597...` and `e0db0365...` — different output on repeat runs of the SAME configuration.
+The `cpu_champion` arm was deterministic across its two runs (`4e242afd...` both times).
+
+Under AGENTS.md this is not a capability failure — reproducibility is a separate property from the
+task-level bar — but it **must be stated, not buried**, and it blocks adoption as a default. It also
+echoes E90, where single-dispatch expert fusion produced three md5s from three runs and was
+diagnosed as a real race in threadgroup accumulation.
+
+**Not yet attributed.** `COLI_V4_KERNELS=all` is itself recorded as nondeterministic at short
+prompts (two variants over eight runs), and it is present in every arm here, so the grouped lane is
+not proven to be the source. The discriminating control is one cheap run pair: grouped +
+`simd_exact` with `COLI_V4_KERNELS` UNSET, same arm twice. That has not been run.
+
+### Status
+The lane is a **real TTFT win of roughly 13-16% on top of the current champion, with decode
+unchanged** — the first genuine improvement to the shipped configuration found since `KERNELS=all`.
+It is NOT adoptable until the nondeterminism is attributed and either explained or eliminated.
+Next steps, in order: (1) the KERNELS-unset control above; (2) if grouping is the source, a
+multi-chunk p256 text differential plus taskcheck to establish whether meaning survives; (3) only
+then a resolution-grade N>=5 TTFT measurement with a clean baseline.

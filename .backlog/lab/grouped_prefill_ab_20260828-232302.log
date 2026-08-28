@@ -1,0 +1,13 @@
+tok/s A/B  tokens=60  N=2  prompt=p064.txt
+  run1 cpu_champion           ttft=  53.718s decode=  52.241s tok/s=1.1294   md5=4e242afd4c9bf934c24a880c5d958643
+  run1 grouped_minn4          ttft=  36.642s decode=  36.006s tok/s=1.6386   md5=e0db0365782f191a338cfda3f492a2e8
+  run1 grouped_minn1          ttft=  34.630s decode=  35.857s tok/s=1.6454   md5=6b06510597df9c6170c6726b7d7a4747
+  run2 cpu_champion           ttft=  39.535s decode=  35.287s tok/s=1.6720   md5=4e242afd4c9bf934c24a880c5d958643
+  run2 grouped_minn4          ttft=  34.343s decode=  36.025s tok/s=1.6378   md5=06419013dd8e568faf07c4e84fa45906
+  run2 grouped_minn1          ttft=  33.311s decode=  35.968s tok/s=1.6403   md5=e0db0365782f191a338cfda3f492a2e8
+
+SUMMARY (median tok/s)
+  cpu_champion             1.4007 tok/s  baseline            deterministic  md5=4e242afd4c9bf934c24a880c5d958643 
+  grouped_minn4            1.6382 tok/s  +16.96% tok/s       NONDETERMINISTIC  md5=06419013dd8e568faf07c4e84fa45906 e0db0365782f191a338cfda3f492a2e8 
+  grouped_minn1           1.64285 tok/s  +17.29% tok/s       NONDETERMINISTIC  md5=6b06510597df9c6170c6726b7d7a4747 e0db0365782f191a338cfda3f492a2e8 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.rIGK3R
