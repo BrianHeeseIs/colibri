@@ -5036,3 +5036,68 @@ Suggested first experiment (cheap, before any engine work): re-measure the `MIN_
 `simd_exact` enabled. If the optimum moves from 4 down to 2 or 1, that alone converts part of
 prefill's small-group population to the GPU with no concurrency work at all, and it sizes the prize
 for the concurrency lane.
+
+## E99. The CPU arm settles it — and the GPU is idle most of the expert path
+
+### 1. CPU arm, finally measured (p064, N=5, all arms deterministic)
+The comparison every prior Metal number in this project was missing.
+
+| arm | tok/s | vs CPU | TTFT |
+|---|---|---|---|
+| **cpu** (`COLI_V4_METAL=0`) | **1.4285** | baseline | **43.38 s** |
+| `metal_ord` | 1.0972 | **-23.19%** | 55.78 s |
+| `metal_simd` (`simd_exact_cold`) | 1.3239 | **-7.32%** | 45.03 s |
+
+`simd_exact` recovers **68% of Metal's deficit** (-23.19% -> -7.32%) but **does not overtake the
+CPU**, on either axis. E95's pre-registered rule therefore lands on its third branch — *keep as a
+documented opt-in, default OFF* — which is what shipped. The pre-registration held.
+
+Also note `metal_ord` and `metal_simd` share md5 `d7e11251b8...` (my kernel is bit-exact in situ)
+while `cpu` is `6b06510597...`. **Metal-vs-CPU divergence at p064 is pre-existing**, not introduced
+by simd_exact, and it exists despite golden passing — another instance of golden being necessary
+but not sufficient.
+
+### 2. WHY Metal still loses: it is not compute-bound, it is round-trip-bound
+`COLI_V4_METAL_PROFILE=1`, p064, 24 tokens:
+```
+stage=matmul gate           ms_per_expert=0.2338   9.97%
+stage=matmul up             ms_per_expert=0.0176   0.75%
+stage=matmul down           ms_per_expert=0.2232   9.52%
+stage=fp8_qdq/swiglu/bf16/weighted  (six stages)   ~2.7% combined
+stage=command-buffer submit+wait  ms_per_expert=1.7935  **76.49%**
+metal_dispatches=13726
+```
+**Three quarters of the expert path is command-buffer submit + blocking wait.** The compute the
+GPU was bought for is ~23%.
+
+Two readings needed for honesty:
+- PROFILE mode injects a commit/wait per stage, so 76.49% is INFLATED versus production, which
+  issues one commit+wait per expert. The direction is not in doubt; the exact share is.
+- The `gate` 0.2338 vs `up` 0.0176 asymmetry on an IDENTICAL dispatch shape is the first-touch
+  page-mapping cost already documented in `docs/metal-retest.md`, not a kernel difference. True
+  per-matmul compute is the `up` figure, ~0.018 ms — which makes the imbalance worse, not better:
+  real GPU compute per expert is ~0.12 ms against a round-trip of the same order or larger.
+
+`c/backend_metal_v4.mm:1052-1053` is the mechanism: every expert call ends in
+`[command_buffer commit]; [command_buffer waitUntilCompleted];`. Decode routes top-6 experts across
+43 layers, so a single token performs on the order of **250 blocking GPU round-trips**, each to do
+~0.12 ms of work.
+
+### 3. Why bigger prompts CANNOT fix this
+MoE routing fragments the batch by construction. A 64-token prefill chunk at top-6 over 256 experts
+averages **1.5 rows per expert**. Prompt length raises the token dimension; it does not raise the
+per-expert dimension, which is what a dispatch actually sees. And decode is S=1 permanently.
+
+So the parallelism that is being left on the table is across the **expert dimension**, not the token
+dimension — and it is available at every prompt size, including the shortest.
+
+### 4. The lever this implies
+Batch the top-6 fan-out into ONE command buffer instead of six, keeping the per-expert dispatches
+unchanged inside it. That is a **scheduling change, not a numerics change** — the same kernels run
+on the same data in the same order, so it should be bit-exact — and it removes 5 of every 6
+round-trips. E90's attempt to fuse the experts into a single *kernel* was racy and slower, but it
+fused at the wrong level and was built on the pre-`simd_exact` matmul; batching at the
+command-buffer level is a different and much safer change.
+
+Secondary: the prefill chunk is hardcoded (`c/deepseek_v4.c:9944`, `if (chunk > 64) chunk = 64;`).
+Making it tunable would raise per-expert group sizes in prefill and is a one-line experiment.

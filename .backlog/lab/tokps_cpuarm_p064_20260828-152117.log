@@ -1,0 +1,22 @@
+tok/s A/B  tokens=60  N=5  prompt=p064.txt
+  run1 cpu                    ttft=  43.475s decode=  41.470s tok/s=1.4227   md5=6b06510597df9c6170c6726b7d7a4747
+  run1 metal_ord              ttft=  56.585s decode=  62.258s tok/s=0.9477   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run1 metal_simd             ttft=  47.008s decode=  45.299s tok/s=1.3025   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run2 cpu                    ttft=  43.381s decode=  41.379s tok/s=1.4258   md5=6b06510597df9c6170c6726b7d7a4747
+  run2 metal_ord              ttft=  57.222s decode=  57.443s tok/s=1.0271   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run2 metal_simd             ttft=  47.058s decode=  45.008s tok/s=1.3109   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run3 cpu                    ttft=  43.467s decode=  41.301s tok/s=1.4285   md5=6b06510597df9c6170c6726b7d7a4747
+  run3 metal_ord              ttft=  55.776s decode=  53.601s tok/s=1.1007   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run3 metal_simd             ttft=  45.030s decode=  44.522s tok/s=1.3252   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run4 cpu                    ttft=  42.864s decode=  40.635s tok/s=1.4520   md5=6b06510597df9c6170c6726b7d7a4747
+  run4 metal_ord              ttft=  52.391s decode=  53.771s tok/s=1.0972   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run4 metal_simd             ttft=  44.844s decode=  44.534s tok/s=1.3248   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run5 cpu                    ttft=  42.763s decode=  40.576s tok/s=1.4541   md5=6b06510597df9c6170c6726b7d7a4747
+  run5 metal_ord              ttft=  52.329s decode=  52.898s tok/s=1.1154   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run5 metal_simd             ttft=  44.957s decode=  44.565s tok/s=1.3239   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+
+SUMMARY (median tok/s)
+  cpu                      1.4285 tok/s  baseline            deterministic  md5=6b06510597df9c6170c6726b7d7a4747 
+  metal_ord                1.0972 tok/s  -23.19% tok/s       deterministic  md5=d7e11251b80b1a4b36fbd1ecd2382bb0 
+  metal_simd               1.3239 tok/s  -7.32% tok/s        deterministic  md5=d7e11251b80b1a4b36fbd1ecd2382bb0 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.4IWYwF
