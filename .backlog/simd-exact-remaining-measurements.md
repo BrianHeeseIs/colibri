@@ -142,6 +142,16 @@ per expert, so no group reaches any threshold. Re-test **only** at p512+, and **
 chunk width matters** — bigger chunks are what create the group sizes MIN_N gates on. Drop MIN_N=8,
 already recorded as known-losing. Two arms (4 vs 2) at N=2 is enough for a first read.
 
+## CLOSED since this file was written
+- **Residency / `--memory-gb` sweep — DONE, FLAT (E108).** 48/72/96 GB are within 1.2% on both axes
+  with identical md5s. Do not re-run for this working set. Open only for the *interactive* regime,
+  where a mismatched `.coli_usage` produced 3-11 s of `expert_disk_s` per turn in the web UI.
+- **Prefill chunk width — CLOSED BY CONTRACT (E108).** `batch > 64` is rejected at four entry
+  points; a wider chunk fails prefill rather than running slower. The knob is clamped to 64.
+  Lifting it means changing all four guards and auditing every per-batch buffer.
+- **CPU arm — DONE (E99/E105).** CPU beats Metal; `KERNELS=all` + Metal OFF is the ceiling at
+  1.67 tok/s.
+
 ## Follow-on work these measurements would unlock
 - **THE 45% CEILING — now the biggest lever, and bounded (E97).** `v4_metal_single_entry
   rows_rejects=2218` of 4902 decode expert calls: pinned hot (rows16) experts are refused by
