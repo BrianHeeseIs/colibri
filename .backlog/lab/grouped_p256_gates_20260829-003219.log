@@ -1,0 +1,16 @@
+tok/s A/B  tokens=40  N=2  prompt=p256.txt
+  run1 cpu_kall               ttft=  94.663s decode=  22.774s tok/s=1.7125   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run1 grouped_kall           ttft=  82.781s decode=  23.550s tok/s=1.6561   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run1 cpu_nokall             ttft= 112.704s decode=  27.906s tok/s=1.3975   md5=fedd5e192e75de75c53579e93df6fab1
+  run1 grouped_nokall         ttft=  99.740s decode=  28.719s tok/s=1.3580   md5=8e057c7a10a04097e104213b966f0699
+  run2 cpu_kall               ttft=  96.041s decode=  22.624s tok/s=1.7238   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run2 grouped_kall           ttft=  81.507s decode=  23.376s tok/s=1.6684   md5=80628ddafca14a2399c6e7d16e95a562
+  run2 cpu_nokall             ttft= 113.637s decode=  27.930s tok/s=1.3963   md5=fedd5e192e75de75c53579e93df6fab1
+  run2 grouped_nokall         ttft=  99.342s decode=  28.750s tok/s=1.3565   md5=8e057c7a10a04097e104213b966f0699
+
+SUMMARY (median tok/s)
+  cpu_kall                1.71815 tok/s  baseline            deterministic  md5=cd2823d9de2f61ed4a9ba124f5e070f0 
+  grouped_kall            1.66225 tok/s  -3.25% tok/s        NONDETERMINISTIC  md5=80628ddafca14a2399c6e7d16e95a562 9a5cb00223b4beaad728e0e7e46f8173 
+  cpu_nokall               1.3969 tok/s  -18.70% tok/s       deterministic  md5=fedd5e192e75de75c53579e93df6fab1 
+  grouped_nokall          1.35725 tok/s  -21.01% tok/s       deterministic  md5=8e057c7a10a04097e104213b966f0699 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.ppHrXH

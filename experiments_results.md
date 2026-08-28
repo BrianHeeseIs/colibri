@@ -5747,3 +5747,64 @@ single 64-token chunk, and AGENTS.md is explicit that one-chunk equality is not 
 and a resolution-grade TTFT confirmation. Its composition with `KERNELS=all` also needs a clean
 re-run, since E110's attempt had the corrupted baseline point — and that composition is what the
 shipped default would actually be.
+
+## E112. Grouped prefill at MULTI-CHUNK: TTFT win confirmed, and a decode cost nobody had seen
+
+Both gates E111 left open, run as one p256 sweep (184 tokens = 3 chunks at width 64), 40 tokens,
+N=2, 8 runs.
+
+| arm | TTFT median | decode s | tok/s | determinism |
+|---|---|---|---|---|
+| `cpu_kall` (shipped default) | 95.35 | 22.70 | 1.71815 | deterministic `cd2823d9...` |
+| `grouped_kall` | **82.14 (-13.9%)** | 23.46 (**+3.4%**) | 1.66225 (-3.25%) | **NONDETERMINISTIC** (2 variants / 2 runs) |
+| `cpu_nokall` | 113.17 | 27.92 | 1.3969 | deterministic `fedd5e19...` |
+| `grouped_nokall` | **99.54 (-12.0%)** | 28.73 (**+2.9%**) | 1.35725 | **deterministic** `8e057c7a...` |
+
+### GATE A — multi-chunk determinism and meaning: PASS
+`grouped_nokall` reproduces `8e057c7a...` across both runs **at p256, three chunks**. E111's
+single-chunk determinism was not a p064 artefact. Text differs from CPU but is plainly equivalent:
+```
+CPU     : ...core mechanics of Mixture of Experts (MoE) within the Transformer architecture, and
+          you've pinpointed the exact optimization challenge that occurs during the prefill phase.
+GROUPED : ...core mechanics of a Mixture of Experts (MoE) layer within a transformer, and you've
+          correctly identified the key optimization opportunity during prefill: **token grouping...
+```
+Same content, different wording; both fluent and correct. Combined with E111's taskcheck 5/5, the
+capability bar holds at multi-chunk.
+
+### GATE B — the composition works on TTFT, but grouping is NOT free on decode
+**TTFT -13.9% on top of `KERNELS=all`** — the p064 figure reproduces at p256, and the two arms'
+ranges do not overlap (94.663/96.041 vs 82.781/81.507).
+
+**But decode is consistently SLOWER: +3.4% with `KERNELS=all`, +2.9% without.** This is a new
+result. E111 measured decode flat at p064 (-0.05%) and pre-registered it as flat "because grouping
+is prefill-only". That reasoning was incomplete: enabling the grouped lane initialises the Metal
+device, pipelines and scratch, and changes the expert-cache eviction pattern left behind by
+prefill — both of which can follow into decode. The effect reproduces in BOTH pairs at the same
+magnitude, so it is not noise.
+
+### The trade, quantified
+| | TTFT saved | decode penalty | net wall @40 tok | break-even |
+|---|---|---|---|---|
+| with `KERNELS=all` | 13.21 s | 19.6 ms/token | **-10.5%** | **674 generated tokens** |
+| without | 13.63 s | 20.9 ms/token | -9.1% | 651 generated tokens |
+
+**Grouped prefill is a net win for any generation under ~650-675 tokens**, which covers essentially
+all interactive chat turns, and a net loss beyond it. That is a prompt-shape-dependent default, not
+a universal one — and it is the first lever in this ledger whose sign flips with output length.
+
+### Determinism, refined from E111
+`grouped_nokall` is deterministic at p064 AND p256. `cpu_kall` was deterministic here at N=2.
+Only the COMBINATION `grouped_kall` produced two variants in two runs. E111's attribution
+("`KERNELS=all` is the source") is therefore too strong: `KERNELS=all` alone is recorded at two
+variants over eight runs, and seeing two in two here is a higher rate — but **N=2 cannot
+distinguish amplification from chance**, and this is stated as unresolved rather than concluded.
+
+### Recommendation
+Adoptable as an opt-in for interactive use, with the length caveat recorded:
+```bash
+COLI_V4_METAL=0 COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold
+```
+NOT yet a default: the decode regression and the combination's determinism both need N>=5 before
+the shipped configuration changes. The TTFT direction is settled; the net-wall verdict depends on
+how long the answers are.
