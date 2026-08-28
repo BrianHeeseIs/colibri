@@ -90,6 +90,30 @@ Operator-approved bar: capability must be identical (verifiable arithmetic / fac
 answers stay correct); token identity is not required. Harness `.backlog/lab/taskcheck.sh`.
 Reproducibility is a SEPARATE property this bar does not cover — state it explicitly when it fails.
 
+### NEVER conclude an approach is wrong from a CHANGED MD5. READ THE TEXT FIRST.
+A golden FAIL means "the output is not token-identical". It does **not** mean the output is wrong,
+and it is **not** grounds to reject, revert, or write off an approach. **Slight variations with the
+meaning retained are fully acceptable for this project's goal.**
+
+Before calling any approach broken, you MUST:
+1. Extract the generated text from BOTH arms and **diff it**. Report what actually changed.
+2. Run `.backlog/lab/taskcheck.sh` — the capability gate.
+3. Run the arm against itself once to separate a *difference* from *nondeterminism*.
+
+Only after those three may you use the words "fails" or "breaks".
+
+This was learned the expensive way in E97. Widening the Metal expert path to rows16 was reported as
+"BREAKS GOLDEN" and reverted on the strength of an md5 alone. The text was then compared and the
+ENTIRE divergence was one token in sixty — `FFN layers.` versus `FFN layer.` — deterministic, with
+`taskcheck` scoring 5/5 on both arms and byte-identical output on its prompt. The approach was
+sound; a 45%-of-expert-calls speedup had been discarded because nobody looked at the words.
+`bench/golden.sh` deletes its run directory on exit (`trap cleanup EXIT`), so capture the text
+yourself — run the engine directly, or use `.backlog/lab/tokps.sh`/`taskcheck.sh`, which keep
+transcripts.
+
+Corollary for the ledger: "fails golden" is never a sufficient experiment write-up. Record WHICH
+tokens changed and whether capability survived, or the entry will mislead the next session.
+
 ## Re-measure every upstream claim before adopting it
 Three upstream performance claims in a row failed to reproduce on this host: #1097 loader lanes
 ("1.41x decode"), `V4_NGRAM` ("+18.5 %"), and `e36a1c7` hot-pack ("~6.9 s TTFT"). Upstream numbers
