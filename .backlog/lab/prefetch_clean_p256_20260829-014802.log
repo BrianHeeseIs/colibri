@@ -1,0 +1,10 @@
+tok/s A/B  tokens=40  N=2  prompt=p256.txt
+  run1 cpu_kall               ttft=  95.353s decode=  22.655s tok/s=1.7215   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run1 cpu_kall_prefetch      ttft=  91.492s decode=  23.075s tok/s=1.6901   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run2 cpu_kall               ttft=  94.285s decode=  22.871s tok/s=1.7052   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run2 cpu_kall_prefetch      ttft=  92.136s decode=  23.092s tok/s=1.6889   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+
+SUMMARY (median tok/s)
+  cpu_kall                1.71335 tok/s  baseline            deterministic  md5=cd2823d9de2f61ed4a9ba124f5e070f0 
+  cpu_kall_prefetch        1.6895 tok/s  -1.39% tok/s        deterministic  md5=cd2823d9de2f61ed4a9ba124f5e070f0 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.QSLttH

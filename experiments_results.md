@@ -5808,3 +5808,45 @@ COLI_V4_METAL=0 COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIAN
 NOT yet a default: the decode regression and the combination's determinism both need N>=5 before
 the shipped configuration changes. The TTFT direction is settled; the net-wall verdict depends on
 how long the answers are.
+
+## E113. `COLI_V4_PREFILL_PREFETCH` — small TTFT gain, small decode cost, and it **DEADLOCKS with grouped MoE**
+
+Report candidate #5, measured on the current stack. Engagement proven first, because that is what
+invalidated E101: `--max-tokens 1` at p256 emits **129** `v4_prefill_routeahead active` lines with
+the flag on and **0** with it off (43 layers x 3 chunks).
+
+p256, 40 tokens, N=2, on top of `COLI_V4_KERNELS=all`:
+
+| arm | TTFT | decode s | tok/s | md5 |
+|---|---|---|---|---|
+| `cpu_kall` | 95.353 / 94.285 | 22.655 / 22.871 | 1.71335 | `cd2823d9...` |
+| `cpu_kall_prefetch` | **91.492 / 92.136** | 23.075 / 23.092 | 1.6895 | `cd2823d9...` |
+| delta | **-3.0% TTFT** | **+1.4%** | **-1.39%** | **byte-identical** |
+
+**Output is byte-identical** — confirmed by direct text diff, not just the hash. That reproduces
+E56's historical equality finding on the current binary, and it is expected: prefetch changes I/O
+scheduling, not arithmetic.
+
+### Verdict: marginal, and it does not pay
+TTFT -3.0% is above the 0.6-0.8% noise floor with non-overlapping ranges, and it lands almost
+exactly on E55's historical **-2.70% at p256**. But decode is **+1.4% slower** (tok/s -1.39%),
+consistent across both runs. Net wall at 40 tokens: 118.01 -> 114.60 s, **-2.9%**.
+
+That is roughly a quarter of the grouped lane's -10.5% (E112) for the same class of risk, and
+unlike grouped it also carries a decode cost with no compensating structural benefit. **Not
+recommended for adoption on its own**; the TTFT direction is real but small.
+
+### The blocking finding: grouped + prefetch DEADLOCKS
+The third arm, `COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold`
+**plus** `COLI_V4_PREFILL_PREFETCH=1`, hung with the engine at **0.0% CPU for 23 minutes** and had
+to be killed. Both arms individually complete normally; only the combination hangs.
+
+Same signature and same suspected mechanism as the E100 fused-fan-out deadlock: the route-ahead
+loader issues expert lookups from a background thread while the grouped scheduler gathers experts
+for a wave, and `c/expert_store.h:50-52` states callers must not assume concurrent
+lookup/release on one store is safe. **Two features that are each safe alone are not composable.**
+
+Observed once, so it is recorded as a hazard rather than a fully characterised bug — but 0% CPU for
+23 minutes is unambiguous, and the mechanism is the one this repo has already been bitten by.
+**Do not enable both flags together**, and treat any future concurrent-expert-acquisition work as
+requiring the store's threading contract to be settled first.

@@ -1,0 +1,3 @@
+tok/s A/B  tokens=40  N=2  prompt=p256.txt
+  run1 cpu_kall               ttft=  95.599s decode=  22.804s tok/s=1.7102   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run1 cpu_kall_prefetch      ttft=  91.771s decode=  22.945s tok/s=1.6997   md5=cd2823d9de2f61ed4a9ba124f5e070f0
