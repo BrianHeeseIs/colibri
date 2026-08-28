@@ -1,0 +1,13 @@
+tok/s A/B  tokens=60  N=2  prompt=p064.txt
+  run1 cpu_base               ttft=  43.294s decode=  41.269s tok/s=1.4296   md5=6b06510597df9c6170c6726b7d7a4747
+  run1 cpu_kall               ttft=  39.488s decode=  35.100s tok/s=1.6809   md5=4e242afd4c9bf934c24a880c5d958643
+  run1 metal_simd_kall        ttft=  42.231s decode=  38.643s tok/s=1.5268   md5=ad1b3d345f966b61d8b8488d6cfc6b94
+  run2 cpu_base               ttft=  43.553s decode=  41.600s tok/s=1.4183   md5=6b06510597df9c6170c6726b7d7a4747
+  run2 cpu_kall               ttft=  39.667s decode=  35.667s tok/s=1.6542   md5=4e242afd4c9bf934c24a880c5d958643
+  run2 metal_simd_kall        ttft=  42.567s decode=  38.188s tok/s=1.5450   md5=ad1b3d345f966b61d8b8488d6cfc6b94
+
+SUMMARY (median tok/s)
+  cpu_base                1.42395 tok/s  baseline            deterministic  md5=6b06510597df9c6170c6726b7d7a4747 
+  cpu_kall                1.66755 tok/s  +17.11% tok/s       deterministic  md5=4e242afd4c9bf934c24a880c5d958643 
+  metal_simd_kall          1.5359 tok/s  +7.86% tok/s        deterministic  md5=ad1b3d345f966b61d8b8488d6cfc6b94 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.J5SBRD

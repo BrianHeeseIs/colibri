@@ -5354,3 +5354,50 @@ than attempted, because the measured ceiling does not obviously justify the nume
 **Method note:** the prototype cost minutes and killed a plausible multi-day direction before any
 shared header was touched. `c/quant.h` is included by all five engines; prototyping in
 `validation/` first is what kept that blast radius at zero.
+
+## E105. The combined stack — **CPU + `KERNELS=all` is the fastest configuration measured on this host**
+
+p064, N=2, 60 tokens, all arms deterministic. The FP8 thread-local scratch (E103) is the shipped
+default and therefore present in every arm.
+
+| arm | tok/s | vs base | TTFT | total wall (60 tok) |
+|---|---|---|---|---|
+| `cpu_base` (`COLI_V4_METAL=0`) | 1.42395 | — | 43.42 s | 84.86 s |
+| **`cpu_kall`** (`+ COLI_V4_KERNELS=all`) | **1.66755** | **+17.11%** | **39.58 s** | **74.96 s (-11.7%)** |
+| `metal_simd_kall` (`METAL=1 + simd_exact_cold + KERNELS=all`) | 1.5359 | +7.86% | 42.40 s | 80.81 s |
+
+Pre-registered prediction was `cpu_kall` ~1.67 and `metal_simd_kall` ~1.55 with the ranking
+preserved. Measured 1.6676 and 1.5359. The prediction held.
+
+### What composes, and what does not
+- **`KERNELS=all` composes cleanly with everything.** It is +17.11% on the CPU arm and lifts the
+  Metal arm from 1.3239 (E99) to 1.5359, +16.0% — essentially the same multiplier on both
+  backends, which is expected since it accelerates `attn_sparse` + `router`, both CPU-side in
+  either configuration. This is the first time it has been measured in combination with anything.
+- **`simd_exact` does not rescue the Metal path.** With `KERNELS=all` on both, CPU still beats
+  Metal by **8.6%** (1.6676 vs 1.5359). `simd_exact` is a genuine +20-34% *within* the Metal path
+  and is bit-exact, but the path it improves starts far enough behind that improving it is not
+  enough.
+- It also moved TTFT: `cpu_kall` is **-8.8%** on TTFT, so this is a both-axes win, not a decode-only
+  one.
+
+### The honest bottom line of the whole simd/Metal line of work
+The fastest configuration on this machine is **`COLI_V4_KERNELS=all` with Metal OFF** — which was
+already the recorded recommendation before any of E95-E104 was done. This session:
+- built a bit-exact simdgroup Metal matmul that is 5.3x the production kernel at S=1 (E96),
+- and then measured that the whole Metal expert path still loses to the CPU (E99),
+- fused the expert fan-out and measured it slower (E100),
+- found ~45% of experts never reach the GPU (E97),
+- corrected the decode profile, which had attention and expert_forward the wrong way round (E102),
+- and refuted its own FP8-SIMD hypothesis with a prototype before touching a shared header (E104).
+
+The net *shippable* gain to the default configuration is the FP8 scratch, which is inside the noise
+floor. Everything else is knowledge: several confidently-held beliefs in this ledger were wrong, and
+they are now measured rather than assumed.
+
+**Recommended setting, unchanged and now confirmed in combination:**
+```
+COLI_V4_KERNELS=all        # Metal OFF
+```
+`COLI_V4_METAL_VARIANT=simd_exact_cold` remains a documented opt-in for anyone whose configuration
+does favour the Metal path; it is bit-exact and it is the best Metal expert kernel available.
