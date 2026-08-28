@@ -95,6 +95,23 @@ grep '^AB ' .backlog/lab/ab_simdexact_*.log
 
 ---
 
+## Known gap in the EVIDENCE TRAIL (not in the result)
+The `bench/golden.sh` x3 gate (cpu / metal+ordered / metal+simd_exact) **was run and all three
+PASSED `5d04890413ff539e802985ce8c727814`**, and the execution-counter proof (`matmuls=` 0 without
+the flag, 11544 with it) was likewise observed directly. Neither was `tee`d to a file, so E96
+asserts them in prose without a committed artifact — unlike the p256 differential, whose log is at
+`.backlog/lab/differential_p256_20260826-231236.log`.
+
+The gate is not in doubt; only its receipt is missing. It was deliberately NOT re-run, because
+re-running a gate that already passed buys a log file and no new information. If a future session
+wants the artifact, capture it while doing item 1 or 2 anyway:
+```bash
+for arm in "" "COLI_V4_METAL=1" "COLI_V4_METAL=1 COLI_V4_METAL_VARIANT=simd_exact_cold"; do
+  cp .backlog/lab/coli_usage.snapshot /tmp/coli_usage.snapshot
+  EXTRA_ENV="$arm" ./bench/golden.sh ./c/deepseek_v4
+done 2>&1 | tee .backlog/lab/golden_simdexact_$(date +%Y%m%d-%H%M%S).log
+```
+
 ## Follow-on work these measurements would unlock
 - **A rows16/hot `simd_exact` kernel.** Today `simd_exact` covers only the cold (`block_rows==1`)
   layout; rows16 experts fall back to `ordered_hot_xcache`, counted as
