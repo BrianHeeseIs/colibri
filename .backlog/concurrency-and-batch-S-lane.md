@@ -62,5 +62,6 @@ Run it in the `colibri-lab` tmux window with `.backlog/lab/lab_monitor.sh` in a 
 ## Then, if the slope justifies it
 1. KV slot management for N concurrent sequences.
 2. A batching scheduler that forms a forward from the in-flight set.
-3. Report **aggregate** tok/s AND single-request latency, separately, at 1/2/4/8 concurrency.
+3. Report **aggregate** tok/s AND single-request tok/s AND TTFT, separately, at 1/2/4/8
+   concurrency. Never TTFT alone -- see the mandatory both-axes rule in AGENTS.md.
 4. Gate on `.backlog/lab/taskcheck.sh` per stream — batching must not change any stream's answer.

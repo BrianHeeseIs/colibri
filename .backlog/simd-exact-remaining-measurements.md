@@ -12,6 +12,11 @@ positive and the correctness gates were green; the remaining runs tighten the st
 the one comparison that the ship decision actually turns on — **versus CPU**, not versus the
 other Metal arm.
 
+## REPORT BOTH AXES (mandatory)
+Every run below that generates tokens must report **tok/s alongside TTFT**, with its N and prompt
+length. `bench/ab.sh` (item 4) is TTFT-only by construction — `--max-tokens 1` — so it must be
+paired with a `tokps.sh` arm for the same configuration, never quoted on its own.
+
 ## Run hygiene (mandatory, from AGENTS.md)
 ```bash
 cd /Users/cptn/workbench/ai/colibri

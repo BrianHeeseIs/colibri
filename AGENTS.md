@@ -73,6 +73,25 @@ They do not move together. `COLI_V4_METAL_ATTN=1` is -15.9 % TTFT but trends *ne
 delta under ~10 % cannot be resolved at n=3, and several apparent effects here reversed when a
 third or fifth point was added.
 
+### MANDATORY: if an experiment generates tokens, it MUST report tok/s — not TTFT alone
+Operator rule, binding on every experiment and every ledger entry.
+
+- **Report BOTH axes whenever tokens are produced.** A TTFT-only result is incomplete and will be
+  read as a general "speedup" by the next session. State tok/s with its N, or state explicitly why
+  no tokens were generated.
+- **`bench/ab.sh` CANNOT satisfy this on its own.** It runs `--max-tokens 1` and parses only
+  `time_to_first_token`, so decode is excluded by construction. Using it alone for anything that
+  can touch decode is a measurement error, not a shortcut.
+- **Default to `.backlog/lab/tokps.sh`**, which reports TTFT *and* tok/s *and* the per-arm md5 *and*
+  a determinism verdict from the same runs, and verifies the seed hash. Reach for `ab.sh` only when
+  the change is prefill-only, and say so.
+- Quote the prompt length and N next to every number. TTFT and tok/s do not move together, and on
+  this host they have moved in OPPOSITE directions (`COLI_V4_METAL_ATTN=1`).
+
+Why this is a rule: roughly 97 of the ~100 entries in `experiments_results.md` optimise TTFT
+because `ab.sh` was the only harness, and tok/s had never once been A/B'd before E87. Several of
+those entries read like general speedups and are not.
+
 ## Seed: the harnesses check existence, not correctness
 `bench/ab.sh` and `bench/golden.sh` only test that `/tmp/coli_usage.snapshot` EXISTS. A
 present-but-wrong seed corrupts results silently. Sync from the durable copy before every run:
