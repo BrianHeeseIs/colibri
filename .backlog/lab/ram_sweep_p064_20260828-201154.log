@@ -1,0 +1,13 @@
+tok/s A/B  tokens=60  N=2  prompt=p064.txt
+  run1 ram96_default          ttft=  39.561s decode=  35.469s tok/s=1.6634   md5=4e242afd4c9bf934c24a880c5d958643
+  run1 ram72                  ttft=  40.240s decode=  35.399s tok/s=1.6667   md5=4e242afd4c9bf934c24a880c5d958643
+  run1 ram48                  ttft=  39.234s decode=  35.550s tok/s=1.6596   md5=4e242afd4c9bf934c24a880c5d958643
+  run2 ram96_default          ttft=  39.613s decode=  35.601s tok/s=1.6573   md5=4e242afd4c9bf934c24a880c5d958643
+  run2 ram72                  ttft=  39.607s decode=  35.028s tok/s=1.6844   md5=4e242afd4c9bf934c24a880c5d958643
+  run2 ram48                  ttft=  39.329s decode=  35.677s tok/s=1.6537   md5=4e242afd4c9bf934c24a880c5d958643
+
+SUMMARY (median tok/s)
+  ram96_default           1.66035 tok/s  baseline            deterministic  md5=4e242afd4c9bf934c24a880c5d958643 
+  ram72                   1.67555 tok/s  +0.92% tok/s        deterministic  md5=4e242afd4c9bf934c24a880c5d958643 
+  ram48                   1.65665 tok/s  -0.22% tok/s        deterministic  md5=4e242afd4c9bf934c24a880c5d958643 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.zOwM2G

@@ -9955,7 +9955,15 @@ static int coli_v4_prefill_chunk_width(void) {
         const char *v = getenv("COLI_V4_PREFILL_CHUNK");
         int n = v ? atoi(v) : 64;
         if (n < 1) n = 64;
-        if (n > 512) n = 512;          /* bound the per-chunk scratch growth */
+        /* HARD CAP 64. Not arbitrary and not a scratch bound: the batched kernels validate
+         * `batch < 1 || batch > 64` as an API contract at FOUR entry points --
+         * coli_v4_attention_window_batch_ref (:2602), coli_v4_block_window_batch_ref (:5729),
+         * coli_fp8_matmul_batch_ref (:13641) and coli_fp4_matmul_batch_ref (:13744). A wider
+         * chunk does not run slower, it FAILS: "target prefill failed layer=0 offset=0 batch=128"
+         * (experiments E108). Clamping here keeps the knob from producing a broken engine.
+         * Widening prefill therefore means lifting that contract in all four places and auditing
+         * every per-batch buffer behind them -- a real change, not a knob. */
+        if (n > 64) n = 64;
         cached = n;
     }
     return cached;

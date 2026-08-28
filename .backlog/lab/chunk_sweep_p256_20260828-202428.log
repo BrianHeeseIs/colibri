@@ -1,0 +1,31 @@
+tok/s A/B  tokens=24  N=2  prompt=p256.txt
+  run1 chunk64_default        ttft=  95.446s decode=  13.626s tok/s=1.6879   md5=2b4040ad97ba03233f24c58462e90c39
+  ENGINE FAILED rc=1 arm=chunk128 log=/var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.Kvj6zk/chunk128_1.log
+v4_direct reads=0 flock_reads=0 fallbacks=0 payload_bytes=0
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=0 metal_fp8_upload_mb=0.0
+metal_fp8_ms total=0.0 memcpy_in=0.0 dispatch_wait=0.0 memcpy_out=0.0
+fp8_qdq_ms=0.0 fp8_qdq_melems=0.0
+  ENGINE FAILED rc=1 arm=chunk256 log=/var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.Kvj6zk/chunk256_1.log
+v4_direct reads=0 flock_reads=0 fallbacks=0 payload_bytes=0
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=0 metal_fp8_upload_mb=0.0
+metal_fp8_ms total=0.0 memcpy_in=0.0 dispatch_wait=0.0 memcpy_out=0.0
+fp8_qdq_ms=0.0 fp8_qdq_melems=0.0
+  run2 chunk64_default        ttft=  96.208s decode=  13.734s tok/s=1.6747   md5=2b4040ad97ba03233f24c58462e90c39
+  ENGINE FAILED rc=1 arm=chunk128 log=/var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.Kvj6zk/chunk128_2.log
+v4_direct reads=0 flock_reads=0 fallbacks=0 payload_bytes=0
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=0 metal_fp8_upload_mb=0.0
+metal_fp8_ms total=0.0 memcpy_in=0.0 dispatch_wait=0.0 memcpy_out=0.0
+fp8_qdq_ms=0.0 fp8_qdq_melems=0.0
+  ENGINE FAILED rc=1 arm=chunk256 log=/var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.Kvj6zk/chunk256_2.log
+v4_direct reads=0 flock_reads=0 fallbacks=0 payload_bytes=0
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=0 metal_fp8_upload_mb=0.0
+metal_fp8_ms total=0.0 memcpy_in=0.0 dispatch_wait=0.0 memcpy_out=0.0
+fp8_qdq_ms=0.0 fp8_qdq_melems=0.0
+
+SUMMARY (median tok/s)
+  chunk64_default          1.6813 tok/s  baseline            deterministic  md5=2b4040ad97ba03233f24c58462e90c39 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.Kvj6zk

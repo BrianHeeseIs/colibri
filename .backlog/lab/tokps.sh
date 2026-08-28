@@ -19,6 +19,7 @@ BIN=${BIN:-./c/deepseek_v4}
 TOKENS=${TOKENS:-60}
 N=${N:-2}
 PROMPT_FILE=${PROMPT_FILE:-.backlog/prefill_prompts/p064.txt}
+MEMGB=${MEMGB:-96}      # default residency; per-arm MEMGB=<n> overrides
 
 [[ -f $DURABLE ]] || { echo "FATAL: durable seed missing: $DURABLE" >&2; exit 2; }
 got=$(md5 -q "$DURABLE")
@@ -38,9 +39,17 @@ for r in $(seq 1 "$N"); do
   for i in "${!NAMES[@]}"; do
     cp "$DURABLE" /tmp/coli_usage.snapshot; cp "$DURABLE" "$MODEL/.coli_usage"
     log="$WORK/${NAMES[$i]}_$r.log"
+    # --memory-gb was hardcoded to 96, so an arm could not vary residency and a sweep would
+    # silently compare three identical configurations. An arm may now carry MEMGB=<n> in its env
+    # string; it is stripped from the child env and turned into the CLI flag it actually needs.
+    arm_env="${ENVS[$i]}"; arm_mem=$MEMGB
+    if [[ $arm_env =~ (^|[[:space:]])MEMGB=([0-9]+) ]]; then
+      arm_mem=${BASH_REMATCH[2]}
+      arm_env=$(sed -E 's/(^|[[:space:]])MEMGB=[0-9]+//' <<<"$arm_env")
+    fi
     # shellcheck disable=SC2086
-    env ${ENVS[$i]} COLI_V4_SAVE_USAGE=0 "$BIN" "$MODEL" "$PROMPT" \
-        --max-tokens "$TOKENS" --memory-gb 96 >"$log" 2>&1
+    env $arm_env COLI_V4_SAVE_USAGE=0 "$BIN" "$MODEL" "$PROMPT" \
+        --max-tokens "$TOKENS" --memory-gb "$arm_mem" >"$log" 2>&1
     rc=$?
     if (( rc != 0 )); then echo "  ENGINE FAILED rc=$rc arm=${NAMES[$i]} log=$log" >&2; tail -5 "$log" >&2; continue; fi
     line=$(grep -m1 '^timing ' "$log")

@@ -5539,3 +5539,57 @@ made this measurable; the cap raise is behaviour-neutral by construction.
   limit (E104) bit-exactly. The one open lever is the NON-bit-exact decode-16 FP8 kernel, ceiling
   well under 2x on ~29% of decode (~+10-15% tok/s best case), needing the taskcheck gate.
   Backlogged, not attempted — the numerics risk per point of gain is the worst of any open item.
+
+## E108. The two "misses" levers: residency is FLAT, and prefill chunk width is CAPPED BY CONTRACT
+
+E107 ended by naming these as what remained. Both are now measured, and both close.
+
+### 1. Residency (`--memory-gb`) — flat, so it is not the lever
+`tokps.sh` hardcoded `--memory-gb 96`, so a residency sweep would have compared three IDENTICAL
+configurations and reported noise as a result. Fixed first: an arm may now carry `MEMGB=<n>`, which
+is stripped from the child env and turned into the CLI flag (`.backlog/lab/tokps.sh`).
+
+p064, N=2, `COLI_V4_KERNELS=all`, all arms deterministic with **identical md5**:
+
+| arm | tok/s | vs 96 GB | TTFT |
+|---|---|---|---|
+| ram96 (default) | 1.66035 | — | 39.59 s |
+| ram72 | 1.67555 | +0.92% | 39.92 s |
+| ram48 | 1.65665 | -0.22% | 39.28 s |
+
+**Halving the RAM budget from 96 GB to 48 GB costs nothing.** Spread 1.2%, inside noise, on both
+axes. With the seeded `.coli_usage`, this prompt's working set fits comfortably at 48 GB, so extra
+residency buys no hit rate. Pushing ABOVE 96 GB was deliberately not attempted: the slope is flat
+below it, and AGENTS.md caps engine+system at ~100 GB (swap was already at 11 GB from other apps).
+
+**Important scope limit:** this says residency is flat *for this benchmark's working set*. The web
+UI showed `expert_disk_s` of 3-11 s per turn on heterogeneous chat prompts, so interactive use with
+a mismatched `.coli_usage` is a different regime that this run does not cover.
+
+### 2. Prefill chunk width — cannot exceed 64 without lifting an engine-wide contract
+The sweep FAILED, and the failure is the finding:
+```
+ENGINE FAILED rc=1 arm=chunk128
+target prefill failed layer=0 offset=0 batch=128
+```
+`batch < 1 || batch > 64` is validated as an API contract at FOUR entry points —
+`coli_v4_attention_window_batch_ref` (`:2602`), `coli_v4_block_window_batch_ref` (`:5729`),
+`coli_fp8_matmul_batch_ref` (`:13641`), `coli_fp4_matmul_batch_ref` (`:13744`). The hardcoded 64 in
+the prefill loop was **not arbitrary**; it matches that contract. E99's characterisation of this as
+"one line at `deepseek_v4.c:9944`" was wrong.
+
+`COLI_V4_PREFILL_CHUNK` is therefore clamped to 64, with the reason recorded at the clamp. Before
+the clamp the knob was a **footgun**: setting it above 64 produced a runtime prefill failure rather
+than a rejected setting. Verified: `COLI_V4_PREFILL_CHUNK=128` now runs and answers correctly
+(`generated_text=391`), and golden still PASSES.
+
+Widening prefill genuinely means lifting the contract in all four places and auditing every
+per-batch buffer behind them. That is a scoped project with real corruption risk, not a knob, and
+it is recorded as such rather than attempted.
+
+### Consequence for the tok/s story
+Both remaining "misses" levers are closed on this host. Combined with E104 (FP8 at the gather
+limit), E107 (NEON coverage and OMP threads both refuted), and E105 (Metal loses fully stacked),
+**1.67 tok/s under `COLI_V4_KERNELS=all` with Metal OFF stands as the measured ceiling**, and the
+only open item with a plausible mechanism is the non-bit-exact decode-16 FP8 kernel — ceiling well
+under 2x on ~29% of decode, gated on taskcheck rather than golden.
