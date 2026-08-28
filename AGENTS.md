@@ -122,10 +122,16 @@ present-but-wrong seed corrupts results silently. Sync from the durable copy bef
 `.backlog/lab/tokps.sh` and `.backlog/lab/taskcheck.sh` verify the md5 and abort loudly.
 
 ## Fastest known setting
-**`COLI_V4_KERNELS=all`** — measured -10.4 / -18.0 / -20.2 % TTFT and +16.7 / +12.1 / +20.1 % tok/s
-at p064 / p256 / p512. Keep it **OFF** for golden, bit-exactness differentials, and regression
-triage: its output is nondeterministic at short prompts (two variants over eight runs) though
-bit-exact at p512.
+**`COLI_V4_KERNELS=all`, with Metal OFF** — measured -10.4 / -18.0 / -20.2 % TTFT and
++16.7 / +12.1 / +20.1 % tok/s at p064 / p256 / p512. Keep it **OFF** for golden, bit-exactness
+differentials, and regression triage: its output is nondeterministic at short prompts (two variants
+over eight runs) though bit-exact at p512.
+
+**Confirmed in combination (E105).** At p064 it is +17.11 % tok/s and -8.8 % TTFT over the CPU arm
+(1.42395 -> 1.66755), and it composes cleanly with the Metal path too (same ~16 % multiplier).
+**The CPU arm still wins**: fully stacked, CPU+KERNELS=all beats Metal+simd_exact+KERNELS=all by
+8.6 %. Do not assume the Metal expert path is faster here — it is not (E99), and the only reason
+to enable it is a configuration that differs from this host.
 
 ## Non-bit-exact changes are gated on TASK-LEVEL correctness
 Operator-approved bar: capability must be identical (verifiable arithmetic / factual / code / logic
