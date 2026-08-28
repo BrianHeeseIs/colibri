@@ -5593,3 +5593,58 @@ limit), E107 (NEON coverage and OMP threads both refuted), and E105 (Metal loses
 **1.67 tok/s under `COLI_V4_KERNELS=all` with Metal OFF stands as the measured ceiling**, and the
 only open item with a plausible mechanism is the non-bit-exact decode-16 FP8 kernel — ceiling well
 under 2x on ~29% of decode, gated on taskcheck rather than golden.
+
+## E109. **RETRACTION of E101** — the MIN_N sweep measured nothing, and the grouped prefill lane is real
+
+Prompted by a review of `.backlog/m3-max-performance-candidates-2026-08-28.md`, which flagged E101
+as engagement-unproven. The flag is correct and E101 is **RETRACTED**.
+
+### The defect
+`coli_v4_moe_grouped_batch` — which contains BOTH the `MIN_N` gate and the Metal batched dispatch —
+is reachable only from `c/deepseek_v4.c:5908`, guarded by `if (!result && grouped_moe)`, where
+`grouped_moe = coli_v4_moe_grouped_enabled()` (`:5731`) reads **`COLI_V4_MOE_GROUPED`**. The
+mirror-image branch at `:5855` (`if (!grouped_moe)`) runs the per-item CPU path instead.
+
+E101's four arms set `COLI_V4_MOE_BATCHED=1` and `COLI_V4_MOE_BATCHED_MIN_N=N` but **never set
+`COLI_V4_MOE_GROUPED=1`**. The grouped path never executed, `MIN_N` was never consulted, and all
+four arms were byte-identical configurations. The 0.6% TTFT spread and four matching md5s were not
+evidence that MIN_N is inert — they were evidence that **the same configuration was measured four
+times.** "MIN_N is inert at p064" is withdrawn; the question is reopened.
+
+Same correction applies to the arm LABELS in E96/E99/E105, which also carried
+`COLI_V4_MOE_BATCHED=1` without `COLI_V4_MOE_GROUPED=1`. That flag was decorative in those runs.
+Their headline claims are unaffected — they compared the SINGLE-expert decode path gated by
+`COLI_V4_METAL`, which was set — but "MOE_BATCHED" in those arm names described nothing.
+
+### Engagement, now proven (p064, `--max-tokens 1`, no tokens generated)
+`COLI_V4_MOE_GROUPED_STATS=1` (writes to stderr; it is emitted from the one-shot report at `:11205`):
+```
+moe_batched min_n=4 groups=1013 rows=8963 ms=3437.6 rejects=0 | cpu_rows=9097 cpu_ms=6631.4 | metal_row_share=49.6%
+moe_group_hist 1:2269 2:1003 3:539 4:337 5:223 6:141 7:106 8:76 ... 32:56
+moe_waves=89 moe_groups=5074
+```
+Turning `GROUPED=1` on also collapses Metal expert calls from `ok=11295` to `ok=1522` — 7.4x fewer,
+larger dispatches. The lane engages, and it had never been exercised in this session.
+
+### The finding that matters: in the GROUPED PREFILL lane, Metal BEATS the CPU
+Per-row cost from the counters, `--max-tokens 1` (prefill only; **no tokens generated, so no tok/s
+is reported for this table** — the threshold it examines is prefill-only by construction):
+
+| MIN_N | groups | metal rows | metal ms/row | cpu rows | cpu ms/row | metal row share |
+|---|---|---|---|---|---|---|
+| 4 (default) | 1013 | 8969 | **0.3780** | 9091 | 0.7303 | 49.7% |
+| 3 | 1456 | 10300 | 0.4442 | 7760 | 1.7380* | 57.0% |
+| 2 | 2236 | 11836 | 0.4051 | 6224 | 0.8148 | 65.5% |
+| 1 | 4215 | 13817 | **0.4136** | 4243 | 0.6886 | **76.5%** |
+
+\* single-run outlier; these are N=1 counter reads, so the CPU column is noisy. The **Metal column
+is stable** (0.378-0.444) and is what the conclusion rests on.
+
+**Metal is ~1.8x cheaper per row than the CPU path here, at EVERY threshold**, and its per-row cost
+barely degrades as groups shrink — because `simd_exact` is fast even at small S. That is the exact
+opposite of the S=1 single-token decode result in E99/E105, and it is consistent: E105 measured the
+per-expert decode path, this measures grouped prefill with 8.8 rows/group average.
+
+The histogram shows **3811 groups (1+2+3 rows) currently below the gate**, all handed to the slower
+CPU path. MIN_N=4 was tuned against the ordered kernel; `simd_exact` moved that crossover, exactly
+as the review predicted.
