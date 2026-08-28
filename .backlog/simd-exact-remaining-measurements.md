@@ -113,14 +113,35 @@ done 2>&1 | tee .backlog/lab/golden_simdexact_$(date +%Y%m%d-%H%M%S).log
 ```
 
 ## Follow-on work these measurements would unlock
-- **A rows16/hot `simd_exact` kernel.** Today `simd_exact` covers only the cold (`block_rows==1`)
-  layout; rows16 experts fall back to `ordered_hot_xcache`, counted as
-  `v4_metal_simd_exact rows16_fallbacks=`. In the measured decode configuration that counter was
-  **0**, so nothing was lost there — but `v4_metal_reject layout=3104` in the same run shows
-  ~3.1k expert calls being refused by the seam on layout grounds and sent to the CPU. Covering
-  rows16 would bring those onto the GPU too. Note the hot kernel applies its scale PER COLUMN to
+- **THE 45% CEILING — now the biggest lever, and bounded (E97).** `v4_metal_single_entry
+  rows_rejects=2218` of 4902 decode expert calls: pinned hot (rows16) experts are refused by
+  `coli_v4_metal_expert_forward` before any pipeline is chosen, so E96's +33.9% was measured on the
+  cold-layout 55% only. Widening was re-tested and still FAILS golden
+  (`actual=e5e7aeb4d9909d4b6c216fa9859075be`), so it is reverted.
+
+  **Do not start by suspecting the matmul — it has been cleared.**
+  `./validation/metal/probe_rows16_parity` (seconds, no engine) shows `ordered_hot_xcache` is
+  bit-exact to the rows16 NEON reference and `ordered_hot` to the cold reference, across normal,
+  denormal-producing and wide UE8M0 scale bands. FMA contraction and denormal flush-to-zero were
+  both hypothesised and both refuted.
+
+  **Cheapest next discriminator** (one golden run, no sweep). If the defect is the zero-copy hot
+  slab being read while lazily packed rather than anything arithmetic, fully staging the hot
+  experts first should change the outcome:
+  ```bash
+  # re-apply the widening (see the reverted hunk in commit 976943d), rebuild, then:
+  cp .backlog/lab/coli_usage.snapshot /tmp/coli_usage.snapshot
+  EXTRA_ENV="COLI_V4_METAL=1 COLI_V4_METAL_ROWS16=1 COLI_V4_PREWARM=1" ./bench/golden.sh ./c/deepseek_v4
+  ```
+  PASS => the defect is staging/synchronisation, not the expert path, and the fix is a barrier
+  between packing and dispatch. FAIL => the slab theory is wrong too; next look at
+  `COLI_V4_HOT_PACK_UNLOCKED` interactions and at whether `hot_fill_view` can hand out a view whose
+  `data` is repacked underneath a queued command buffer.
+
+  A rows16/hot `simd_exact` kernel is only worth building AFTER that question is settled — rows16
+  experts cannot reach the GPU at all today. Note the hot kernel applies its scale PER COLUMN to
   match the rows16 NEON loop, a DIFFERENT reference than the cold scalar path, so a hot
-  `simd_exact` must reproduce THAT form, not this one.
+  `simd_exact` must reproduce THAT form, not the cold one.
 - **Dispatch fusion across the top-6 fan-out.** E90 buried this on a premise E94 withdrew. With a
   matmul that is now ~5x cheaper at S=1, per-call submit+wait is a correspondingly larger share of
   the expert chain, so fusion is worth re-sizing against the new baseline.
