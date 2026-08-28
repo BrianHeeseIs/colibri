@@ -13310,6 +13310,33 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
     return 0;
 }
 
+/* Per-call malloc removal for the FP8 matvec (experiments E103).
+ *
+ * coli_fp8_matvec_ref allocated and freed TWO buffers on every call. It is the workhorse of the
+ * attention path -- attn_out issues groups+1 calls per layer and attn_qkv three more -- so a
+ * generation performs tens of thousands of malloc/free pairs for buffers whose size barely varies.
+ *
+ * These are THREAD-LOCAL: matmul_fp8 runs an OpenMP parallel region internally, and callers may
+ * themselves be threaded, so a shared scratch would race. They grow monotonically and are never
+ * freed; that is deliberate for a process-lifetime scratch, and the cost is bounded by the largest
+ * projection width in the model (a few KB per worker thread).
+ *
+ * This changes NO arithmetic -- same QDQ, same matmul, same buffers by value -- so it is bit-exact
+ * by construction. COLI_V4_FP8_SCRATCH=0 restores the malloc path for A/B measurement. */
+static _Thread_local float *coli_v4_fp8_act_scratch;
+static _Thread_local size_t coli_v4_fp8_act_capacity;
+static _Thread_local uint8_t *coli_v4_fp8_scale_scratch;
+static _Thread_local size_t coli_v4_fp8_scale_capacity;
+
+static int coli_v4_fp8_scratch_enabled(void) {
+    static int cached;              /* benign race: both racers compute the same value */
+    if (!cached) {
+        const char *v = getenv("COLI_V4_FP8_SCRATCH");
+        cached = (v && !strcmp(v, "0")) ? -1 : 1;
+    }
+    return cached > 0;
+}
+
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !weight || !input ||
@@ -13327,23 +13354,46 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
     if (weight->data_bytes != rows * columns ||
         weight->scale_bytes != scale_rows * scale_columns * sizeof(float))
         return -1;
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(scale_columns);
-    if (!activation || !activation_scales) {
-        free(activation);
-        free(activation_scales);
-        return -1;
+    const int use_scratch = coli_v4_fp8_scratch_enabled();
+    float *activation;
+    uint8_t *activation_scales;
+    if (use_scratch) {
+        if (columns > coli_v4_fp8_act_capacity) {
+            float *grown = realloc(coli_v4_fp8_act_scratch,
+                                   columns * sizeof(*grown));
+            if (!grown) return -1;
+            coli_v4_fp8_act_scratch = grown;
+            coli_v4_fp8_act_capacity = columns;
+        }
+        if (scale_columns > coli_v4_fp8_scale_capacity) {
+            uint8_t *grown = realloc(coli_v4_fp8_scale_scratch, scale_columns);
+            if (!grown) return -1;
+            coli_v4_fp8_scale_scratch = grown;
+            coli_v4_fp8_scale_capacity = scale_columns;
+        }
+        activation = coli_v4_fp8_act_scratch;
+        activation_scales = coli_v4_fp8_scale_scratch;
+    } else {
+        activation = malloc(columns * sizeof(*activation));
+        activation_scales = malloc(scale_columns);
+        if (!activation || !activation_scales) {
+            free(activation);
+            free(activation_scales);
+            return -1;
+        }
     }
+#define COLI_V4_FP8_RELEASE() do { \
+        if (!use_scratch) { free(activation_scales); free(activation); } \
+    } while (0)
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128) != 0) {
-        free(activation);
-        free(activation_scales);
+        COLI_V4_FP8_RELEASE();
         return -1;
     }
 #ifdef __AVX2__
     if (weight->block_rows == 8) {
         if (rows % 8) {
-            free(activation_scales); free(activation); return -1;
+            COLI_V4_FP8_RELEASE(); return -1;
         }
         float fp8[256];
         for (int code = 0; code < 256; code++)
@@ -13370,13 +13420,13 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
             }
             _mm256_storeu_ps(output + (size_t)tile * 8, sum);
         }
-        free(activation_scales); free(activation); return 0;
+        COLI_V4_FP8_RELEASE(); return 0;
     }
 #endif
     matmul_fp8(output, activation, weight->data, weight->scales,
                1, (int)columns, (int)rows);
-    free(activation_scales);
-    free(activation);
+    COLI_V4_FP8_RELEASE();
+#undef COLI_V4_FP8_RELEASE
     return 0;
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT */

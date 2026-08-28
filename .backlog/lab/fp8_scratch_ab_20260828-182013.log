@@ -1,0 +1,10 @@
+tok/s A/B  tokens=60  N=2  prompt=p064.txt
+  run1 malloc_old             ttft=  43.733s decode=  41.410s tok/s=1.4248   md5=6b06510597df9c6170c6726b7d7a4747
+  run1 scratch_new            ttft=  43.439s decode=  41.328s tok/s=1.4276   md5=6b06510597df9c6170c6726b7d7a4747
+  run2 malloc_old             ttft=  44.674s decode=  42.687s tok/s=1.3822   md5=6b06510597df9c6170c6726b7d7a4747
+  run2 scratch_new            ttft=  43.982s decode=  41.629s tok/s=1.4173   md5=6b06510597df9c6170c6726b7d7a4747
+
+SUMMARY (median tok/s)
+  malloc_old               1.4035 tok/s  baseline            deterministic  md5=6b06510597df9c6170c6726b7d7a4747 
+  scratch_new             1.42245 tok/s  +1.35% tok/s        deterministic  md5=6b06510597df9c6170c6726b7d7a4747 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.Caw4S0
