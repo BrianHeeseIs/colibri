@@ -92,7 +92,20 @@ Metal environment variable a silent no-op — check with
 | `COLI_V4_METAL=1` | off | run the routed-expert forward on the GPU |
 | `COLI_V4_MOE_BATCHED=1` | off | batch expert groups during prefill (gated by `COLI_V4_MOE_BATCHED_MIN_N`, default 4) |
 | `COLI_V4_METAL_VARIANT=simd_exact_cold` | `ordered_cold` | use the simdgroup expert matmul |
+| `COLI_V4_METAL_ROWS16=1` | off | also send pinned hot (rows16) experts to the GPU — see the warning below |
 | `COLI_V4_METAL_STATS=1` | off | print dispatch, reject and `simd_exact` counters at exit |
+
+**`COLI_V4_METAL_ROWS16` is not bit-exact and is off for that reason.** Without it the decode path
+refuses every pinned hot expert, which on a 24-token run is 2218 of 4902 expert calls — 45% — so
+the GPU only ever sees the cold-layout remainder (`COLI_V4_METAL_STATS=1` prints
+`v4_metal_single_entry rows_rejects=`). Enabling it takes coverage to 4902/4902.
+
+The cost is that `bench/golden.sh` no longer reproduces its md5. The output is not corrupted:
+the task-level gate `.backlog/lab/taskcheck.sh` scores 5/5 on both arms with byte-identical text,
+and on golden's own prompt the whole difference is one token in sixty (`FFN layers.` becomes
+`FFN layer.`), reproduced deterministically. It is a near-tie logit flip of the same family as
+`COLI_METAL_GEMM_MIN`/#622 elsewhere in this engine. Use it only where token-exact parity with the
+CPU is not required, and see `experiments_results.md` E97.
 
 `simd_exact_cold` maps one simdgroup to each output row instead of one thread. At decode the
 expert matmul is a single row against 2048 outputs, so the default kernel launches only 2048
