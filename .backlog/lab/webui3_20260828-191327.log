@@ -1,0 +1,658 @@
+v4_kernels active=attn_sparse,router
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+OpenAI-compatible API listening on http://127.0.0.1:8000/v1
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - Request timed out: TimeoutError('timed out')
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[V4] temperature 0.7 ignored; target engine is greedy
+[V4] top_p 0.9 ignored; target engine is greedy
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+v4_dense_resident layers=43 bytes=6.267GiB
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+v4_profile phase=embed total_ms=0.204 calls=20
+v4_profile phase=hc_norm total_ms=728.333 calls=1720
+v4_profile phase=attention total_ms=14289.442 calls=860
+v4_profile phase=rope total_ms=4.773 calls=860
+v4_profile phase=compressor total_ms=974.979 calls=820
+v4_profile phase=indexer total_ms=1118.458 calls=420
+v4_profile phase=router total_ms=81.634 calls=860
+v4_profile phase=shared_expert total_ms=3431.927 calls=860
+v4_profile phase=expert_wait total_ms=678.786 calls=10320
+v4_profile phase=expert_forward total_ms=14831.120 calls=5160
+v4_profile phase=head total_ms=792.184 calls=20
+v4_profile phase=attn_qkv total_ms=4627.990 calls=860
+v4_profile phase=attn_kv_assembly total_ms=4.295 calls=860
+v4_profile phase=attn_sparse total_ms=174.273 calls=860
+v4_profile phase=attn_out total_ms=9462.838 calls=860
+v4_profile phase=attn_other total_ms=20.046 calls=860
+v4_profile phase=other total_ms=108.773
+v4_profile decode_tokens=20 decode_wall_ms=37035.839 accounted_pct=99.7
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[V4] temperature 0.7 ignored; target engine is greedy
+[V4] top_p 0.9 ignored; target engine is greedy
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+v4_profile phase=embed total_ms=0.480 calls=39
+v4_profile phase=hc_norm total_ms=1400.163 calls=3354
+v4_profile phase=attention total_ms=34949.086 calls=1677
+v4_profile phase=rope total_ms=11.560 calls=1677
+v4_profile phase=compressor total_ms=2716.055 calls=1599
+v4_profile phase=indexer total_ms=2688.148 calls=819
+v4_profile phase=router total_ms=151.454 calls=1677
+v4_profile phase=shared_expert total_ms=8315.187 calls=1677
+v4_profile phase=expert_wait total_ms=971.606 calls=20124
+v4_profile phase=expert_forward total_ms=36978.350 calls=10062
+v4_profile phase=head total_ms=1745.358 calls=39
+v4_profile phase=attn_qkv total_ms=11238.054 calls=1677
+v4_profile phase=attn_kv_assembly total_ms=8.309 calls=1677
+v4_profile phase=attn_sparse total_ms=379.178 calls=1677
+v4_profile phase=attn_out total_ms=23290.334 calls=1677
+v4_profile phase=attn_other total_ms=33.211 calls=1677
+v4_profile phase=other total_ms=234.077
+v4_profile decode_tokens=39 decode_wall_ms=90149.964 accounted_pct=99.7
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[V4] temperature 0.7 ignored; target engine is greedy
+[V4] top_p 0.9 ignored; target engine is greedy
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+v4_profile phase=embed total_ms=11.183 calls=39
+v4_profile phase=hc_norm total_ms=1429.030 calls=3354
+v4_profile phase=attention total_ms=32970.753 calls=1677
+v4_profile phase=rope total_ms=26.976 calls=1677
+v4_profile phase=compressor total_ms=2424.084 calls=1599
+v4_profile phase=indexer total_ms=2563.941 calls=819
+v4_profile phase=router total_ms=167.757 calls=1677
+v4_profile phase=shared_expert total_ms=7390.434 calls=1677
+v4_profile phase=expert_wait total_ms=1024.780 calls=20124
+v4_profile phase=expert_forward total_ms=36202.667 calls=10062
+v4_profile phase=head total_ms=1922.207 calls=39
+v4_profile phase=attn_qkv total_ms=10037.271 calls=1677
+v4_profile phase=attn_kv_assembly total_ms=9.674 calls=1677
+v4_profile phase=attn_sparse total_ms=1227.982 calls=1677
+v4_profile phase=attn_out total_ms=21640.224 calls=1677
+v4_profile phase=attn_other total_ms=55.602 calls=1677
+v4_profile phase=other total_ms=208.484
+v4_profile decode_tokens=39 decode_wall_ms=86315.321 accounted_pct=99.8
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[V4] temperature 0.7 ignored; target engine is greedy
+[V4] top_p 0.9 ignored; target engine is greedy
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+v4_profile phase=embed total_ms=24.349 calls=52
+v4_profile phase=hc_norm total_ms=1996.979 calls=4472
+v4_profile phase=attention total_ms=41084.408 calls=2236
+v4_profile phase=rope total_ms=18.432 calls=2236
+v4_profile phase=compressor total_ms=2808.762 calls=2132
+v4_profile phase=indexer total_ms=2977.036 calls=1092
+v4_profile phase=router total_ms=429.677 calls=2236
+v4_profile phase=shared_expert total_ms=9257.503 calls=2236
+v4_profile phase=expert_wait total_ms=1199.874 calls=26832
+v4_profile phase=expert_forward total_ms=45369.117 calls=13416
+v4_profile phase=head total_ms=2235.205 calls=52
+v4_profile phase=attn_qkv total_ms=13315.117 calls=2236
+v4_profile phase=attn_kv_assembly total_ms=27.470 calls=2236
+v4_profile phase=attn_sparse total_ms=728.031 calls=2236
+v4_profile phase=attn_out total_ms=26738.816 calls=2236
+v4_profile phase=attn_other total_ms=274.973 calls=2236
+v4_profile phase=other total_ms=376.286
+v4_profile decode_tokens=52 decode_wall_ms=107759.195 accounted_pct=99.7
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[V4] temperature 0.7 ignored; target engine is greedy
+[V4] top_p 0.9 ignored; target engine is greedy
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+v4_profile phase=embed total_ms=17.586 calls=52
+v4_profile phase=hc_norm total_ms=1984.276 calls=4472
+v4_profile phase=attention total_ms=41765.335 calls=2236
+v4_profile phase=rope total_ms=37.262 calls=2236
+v4_profile phase=compressor total_ms=3207.007 calls=2132
+v4_profile phase=indexer total_ms=3251.067 calls=1092
+v4_profile phase=router total_ms=223.449 calls=2236
+v4_profile phase=shared_expert total_ms=9078.976 calls=2236
+v4_profile phase=expert_wait total_ms=758.775 calls=26832
+v4_profile phase=expert_forward total_ms=48213.480 calls=13416
+v4_profile phase=head total_ms=2296.791 calls=52
+v4_profile phase=attn_qkv total_ms=12936.561 calls=2236
+v4_profile phase=attn_kv_assembly total_ms=21.260 calls=2236
+v4_profile phase=attn_sparse total_ms=1921.436 calls=2236
+v4_profile phase=attn_out total_ms=26819.014 calls=2236
+v4_profile phase=attn_other total_ms=67.063 calls=2236
+v4_profile phase=other total_ms=316.234
+v4_profile decode_tokens=52 decode_wall_ms=111112.976 accounted_pct=99.7
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[V4] temperature 0.7 ignored; target engine is greedy
+[V4] top_p 0.9 ignored; target engine is greedy
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+v4_profile phase=embed total_ms=22.511 calls=52
+v4_profile phase=hc_norm total_ms=2025.705 calls=4472
+v4_profile phase=attention total_ms=50018.959 calls=2236
+v4_profile phase=rope total_ms=57.168 calls=2236
+v4_profile phase=compressor total_ms=3573.189 calls=2132
+v4_profile phase=indexer total_ms=3731.802 calls=1092
+v4_profile phase=router total_ms=237.581 calls=2236
+v4_profile phase=shared_expert total_ms=9841.293 calls=2236
+v4_profile phase=expert_wait total_ms=544.850 calls=26832
+v4_profile phase=expert_forward total_ms=58686.572 calls=13416
+v4_profile phase=head total_ms=2160.901 calls=52
+v4_profile phase=attn_qkv total_ms=14896.653 calls=2236
+v4_profile phase=attn_kv_assembly total_ms=28.287 calls=2236
+v4_profile phase=attn_sparse total_ms=2332.552 calls=2236
+v4_profile phase=attn_out total_ms=32669.915 calls=2236
+v4_profile phase=attn_other total_ms=91.551 calls=2236
+v4_profile phase=other total_ms=330.176
+v4_profile decode_tokens=52 decode_wall_ms=131173.540 accounted_pct=99.7
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /profile HTTP/1.1" 200 -
