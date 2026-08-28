@@ -39,6 +39,11 @@ static int coli_v4_metal_enabled_value;
 static int coli_v4_metal_variant_value;
 static int coli_v4_metal_profile_enabled_value;
 static int coli_v4_metal_stats_enabled_value;
+/* COLI_V4_METAL_ROWS16=1 -- EXPERIMENTAL, default OFF, KNOWN TO FAIL GOLDEN (experiments E97).
+ * Lets rows16 (pinned hot) experts reach the GPU from the decode entry. They are ~45% of decode
+ * expert calls. Retained as the instrument for the open E97 question; it must NOT be enabled in
+ * any run whose output is expected to be bit-exact. */
+static int coli_v4_metal_rows16_enabled_value;
 static _Atomic unsigned long coli_v4_metal_dispatch_count;
 /* Execution proof for the simd_exact matmul. AGENTS.md: a golden PASS with a flag ON proves
  * nothing about execution -- capture a counter that is zero without the feature. These are
@@ -475,6 +480,8 @@ __attribute__((constructor)) static void coli_v4_metal_read_environment(void) {
     coli_v4_metal_enabled_value = enabled && !strcmp(enabled, "1");
     const char *profile = getenv("COLI_V4_METAL_PROFILE");
     coli_v4_metal_profile_enabled_value = profile && !strcmp(profile, "1");
+    const char *rows16 = getenv("COLI_V4_METAL_ROWS16");
+    coli_v4_metal_rows16_enabled_value = rows16 && !strcmp(rows16, "1");
     const char *stats = getenv("COLI_V4_METAL_STATS");
     coli_v4_metal_stats_enabled_value = stats && !strcmp(stats, "1");
     if (coli_v4_metal_stats_enabled_value) atexit(coli_v4_metal_stats_report);
@@ -1074,7 +1081,8 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
      * validation/metal/probe_rows16_parity shows coli_v4_matmul_mxfp4_ordered_hot_xcache is
      * bit-exact to the rows16 NEON reference across normal, denormal-producing and wide UE8M0
      * scale bands. Do not re-widen this on the assumption that the kernel is the problem. */
-    if (expert && (expert->gate.block_rows != 1 ||
+    if (expert && !coli_v4_metal_rows16_enabled_value &&
+                  (expert->gate.block_rows != 1 ||
                    expert->up.block_rows != 1 ||
                    expert->down.block_rows != 1)) {
         /* This refusal is INVISIBLE in the layout attribution: it bumps the layout counter but
