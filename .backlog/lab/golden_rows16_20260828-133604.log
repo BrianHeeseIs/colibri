@@ -1,0 +1,3 @@
+WARMUP golden max_tokens=1
+RUN golden max_tokens=60
+FAIL golden expected=5d04890413ff539e802985ce8c727814 actual=e5e7aeb4d9909d4b6c216fa9859075be

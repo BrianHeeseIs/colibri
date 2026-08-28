@@ -4857,3 +4857,82 @@ task-level capability gate. It does not: the bit-exact form is within 7-14% of i
 stronger md5 gate instead. E90's dispatch-fusion idea also deserves re-sizing rather than burial —
 with the matmul now ~5x cheaper at S=1, per-call submit+wait is a proportionally larger share of
 the expert chain than when fusion was last measured.
+
+## E97. 45% of decode expert calls never reach the GPU — widening still fails, but NOT for the reason anyone thought
+
+### 1. The measurement that started it
+New instrumentation (`v4_metal_single_entry`) on a 24-token decode run,
+`COLI_V4_METAL=1 COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_STATS=1`:
+```
+v4_metal_reject variant=0 init=0 queue=0 dims=0 layout=2218 pipelines=0 ok=2684
+v4_metal_single_entry rows_rejects=2218 last_block_rows=16
+v4_metal_layout tensor_gate=0 tensor_up=0 ... (ALL ZERO)
+```
+`layout=2218` with every per-tensor attribution field zero looked like a contradiction. It is not:
+`coli_v4_metal_expert_forward` (the single-expert **decode** entry) refuses any expert that is not
+`block_rows==1` and bumps the layout counter WITHOUT ever reaching the batch entry's
+`coli_v4_record_layout_mismatches`. The refusals are all `block_rows=16`.
+
+**2218 of 4902 expert calls — 45.2% — are pinned hot (rows16) experts turned away before any
+pipeline is chosen.** Every Metal expert-path result in this project, E96's +33.9% included, was
+measured on the cold-layout 55% only. Confirmed by explore against source: routed experts have
+exactly two layouts, `block_rows=1` from `fill_tensor_view` (`c/deepseek_v4.c:7284`) and
+`block_rows=16` from `hot_fill_view` (`:7932`) for pinned slots only, capped by
+`COLI_V4_MAX_PIN_SLOTS_PER_LAYER` (default 4).
+
+### 2. Widening it: still fails golden
+`COLI_V4_METAL=1` + widened acceptance -> `layout=0 ok=4902` (all experts on the GPU), and the
+engine still answers `17*23` = `391`. But:
+```
+FAIL golden expected=5d04890413ff539e802985ce8c727814 actual=e5e7aeb4d9909d4b6c216fa9859075be
+```
+The memory "widening scalar acceptance BREAKS GOLDEN" is **CONFIRMED**, not stale. Reverted; golden
+returns to PASS with `simd_exact_cold` still enabled.
+
+### 3. But the cause is NOT the matmul, and that is the new information
+The obvious explanation — that `ordered_hot_xcache` is not really bit-exact to the rows16 NEON
+path — is **WRONG**. New probe `validation/metal/probe_rows16_parity` implements BOTH CPU
+references and checks every hot kernel against both:
+
+| kernel | vs COLD ref | vs ROWS16 ref |
+|---|---|---|
+| `ordered_hot` | **0** | 1982/2048 |
+| `ordered_hot_xcache` | 1982/2048 | **0** |
+
+Each matches its own reference exactly, and the two references genuinely differ (1982/2048) — the
+intended split. Repeated across UE8M0 scale bands `[120,135)`, `[10,25)` (small enough that the
+per-column product `(x*w)*sc` underflows to denormal) and `[10,130)`: **`ordered_hot_xcache` is
+bit-exact to the rows16 reference in all of them.**
+
+Two specific hypotheses were formed and both REFUTED by that probe:
+- **FMA contraction.** `neon_rows16_accumulate` (`c/deepseek_v4.c`) is
+  `vaddq_f32(sums, vmulq_f32(vmulq_f32(x, values), scales))` — three separately rounded NEON
+  instructions, no fma — while the GPU writes `a += (x*w)*sc`, which clang may contract. It does
+  not: the kernel matches a `#pragma clang fp contract(off)` reference exactly.
+- **Denormal flush-to-zero.** GPUs typically flush denormals; NEON does not; and the rows16 form
+  multiplies by the scale on EVERY column rather than once per group, so it should be far more
+  exposed. Tested directly with a denormal-producing scale band: still 0 mismatches.
+
+### 4. What that leaves
+Golden PASSES with `COLI_V4_METAL=1` on cold experts, so the GPU `fp8_qdq`, `bf16_round_array`,
+`swiglu` and `weighted_bf16` stages are already proven bit-exact to their CPU counterparts, and the
+rows16 CPU chain (`coli_v4_expert_forward_ref`, `c/deepseek_v4.c:8719-8755`) is structurally
+identical to the GPU chain, step for step. Combined with section 3, every arithmetic component is
+individually exact — yet the composed path diverges.
+
+That points away from numerics. The leading remaining suspect is the **zero-copy hot slab**:
+rows16 weights are packed lazily into a registered slab (`coli_v4_metal_register_slab`,
+`c/deepseek_v4.c:8228`; note `COLI_V4_HOT_PACK_UNLOCKED` exists precisely because that packing
+races the mutex), and the GPU reads that memory with `newBufferWithBytesNoCopy`. A GPU dispatch
+observing a partially-packed or concurrently-repacked slab would produce exactly this signature:
+every kernel provably exact in isolation, the composed path wrong.
+
+**Not proven — named as the next thing to test, not as a conclusion.** A cheap discriminator: pin
+and fully pack all hot experts before generation (`COLI_V4_PREWARM`), then re-run the widened
+golden. If it passes, the defect is staging/synchronisation, not the expert path.
+
+### 5. Status
+Widening REVERTED (repo precedent: `f8aef6b`). Kept: the `v4_metal_single_entry` counter that made
+the 45% visible, and `probe_rows16_parity`, which converts "rows16 is cursed" into a bounded
+question. The comment at the refusal site now records that the matmul has been cleared, so the next
+attempt does not re-derive it.

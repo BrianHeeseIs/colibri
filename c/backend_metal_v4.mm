@@ -1068,6 +1068,12 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward_batc
 COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
     float *out, const ColiExpertView *expert, const float *input,
     float route_weight, float swiglu_limit) {
+    /* rows16 (pinned hot) experts are refused here and run on the CPU. They are ~45% of decode
+     * expert calls, so this is the single largest limit on the Metal expert path -- but widening
+     * it was MEASURED and it BREAKS GOLDEN (experiments E97), and the cause is NOT the matmul:
+     * validation/metal/probe_rows16_parity shows coli_v4_matmul_mxfp4_ordered_hot_xcache is
+     * bit-exact to the rows16 NEON reference across normal, denormal-producing and wide UE8M0
+     * scale bands. Do not re-widen this on the assumption that the kernel is the problem. */
     if (expert && (expert->gate.block_rows != 1 ||
                    expert->up.block_rows != 1 ||
                    expert->down.block_rows != 1)) {
