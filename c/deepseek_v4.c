@@ -9915,7 +9915,25 @@ static const float *v4_mainh_get(int64_t position) {
 #ifdef COLI_M4_TRACE
 extern _Thread_local int coli_m4_prefill_active;
 extern _Thread_local int coli_m4_prefill_chunk;
+
 #endif
+
+/* Prefill chunk width. Was hardcoded to 64 in the target prefill loop below, which caps how many
+ * tokens a single batched forward sees. That matters for the GPU: MoE routing fragments the batch,
+ * so a 64-token chunk at top-6 over 256 experts averages only ~1.5 rows per expert and most groups
+ * fall under COLI_V4_MOE_BATCHED_MIN_N. A wider chunk raises per-expert group sizes.
+ * Default 64 keeps existing behaviour bit-for-bit. */
+static int coli_v4_prefill_chunk_width(void) {
+    static int cached;                 /* benign race: both racers compute the same value */
+    if (!cached) {
+        const char *v = getenv("COLI_V4_PREFILL_CHUNK");
+        int n = v ? atoi(v) : 64;
+        if (n < 1) n = 64;
+        if (n > 512) n = 512;          /* bound the per-chunk scratch growth */
+        cached = n;
+    }
+    return cached;
+}
 
 static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
@@ -9939,12 +9957,13 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) return -1;
         int result = 0;
-        for (int offset = 0; !result && offset < batch; offset += 64) {
+        const int chunk_width = coli_v4_prefill_chunk_width();
+        for (int offset = 0; !result && offset < batch; offset += chunk_width) {
             int chunk = batch - offset;
-            if (chunk > 64) chunk = 64;
+            if (chunk > chunk_width) chunk = chunk_width;
 #ifdef COLI_M4_TRACE
             if (coli_m4_prefill_active)
-                coli_m4_prefill_chunk = m4_chunk_base + offset / 64;
+                coli_m4_prefill_chunk = m4_chunk_base + offset / chunk_width;
 #endif
             result = coli_v4_block_window_batch_ref(
                 next + (size_t)offset * hd, attention[layer_id],
