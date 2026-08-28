@@ -5196,3 +5196,49 @@ now.
 prefill loop); default 64, golden PASS on a fresh binary, so the change is behaviour-neutral until
 the flag is set. The sweep needs p512 or longer to have multiple chunks, which costs ~5 min per run
 and 30+ min for a 3-arm pair. **Not run — backlogged for the next benchmark batch.**
+
+## E102. Re-profiling decode: **attention and expert_forward have swapped places**
+
+Cost: one ~2-minute run. It invalidates the premise several recent entries were built on.
+
+`COLI_V4_METAL=0 COLI_V4_PROFILE=1`, p064, 24 tokens, `accounted_pct=99.4`,
+`decode_wall=16272 ms / 23 tokens = 707 ms/token = 1.41 tok/s` — which matches the measured CPU arm
+in E99 (1.4285), so the profile is internally consistent.
+
+| phase | ms | % of decode | previously recorded |
+|---|---|---|---|
+| **attention** | 6299.5 | **38.7** | 26.3 |
+| **expert_forward** | 4397.0 | **27.0** | 52.5 |
+| expert_wait | 1579.3 | **9.7** | 4.4 |
+| shared_expert | 947.1 | 5.8 | 4.0 |
+| head | 834.6 | 5.1 | 3.5 |
+| router | 768.2 | 4.7 | 3.2 |
+| hc_norm | 643.3 | 4.0 | — |
+| indexer | 380.8 | 2.3 | — |
+| compressor | 321.8 | 2.0 | — |
+
+Attention sub-phases, subsets of the 38.7%: **attn_out 17.9%**, attn_sparse 11.7%, attn_qkv 9.0%.
+
+### What this changes
+1. **Attention is now the largest decode phase**, expert_forward second. The two have swapped.
+2. **This session optimised the wrong phase.** E95-E100 targeted `expert_forward` on the strength of
+   the 52.5% figure. It is 27%, and E99 then measured that it runs FASTER on the CPU (1.4285 tok/s)
+   than on the Metal path that was optimised (1.3239). The work is sound and `simd_exact` is a real
+   +20-34% *within* the Metal path; it was simply aimed at the second-largest phase on the slower
+   backend.
+3. **`expert_wait` more than doubled** (4.4% -> 9.7%, hit_rate 78.2%). The recorded conclusion
+   "decode is NOT I/O bound — useful for killing loader/prefetch ideas" no longer holds as strongly,
+   and any lever that trades I/O overlap away is now more expensive than it looked. That is exactly
+   what sank the fused fan-out in E100.
+4. **`COLI_V4_KERNELS=all` accelerates attn_sparse + router = 16.4% of decode**, which explains its
+   recorded +16.7% tok/s and why it stays the fastest known setting.
+5. **`attn_out` at 17.9% is the largest sub-phase never examined** in this ledger.
+6. `COLI_V4_METAL_ATTN=1` was judged "negative on decode" when attention was believed to be a
+   quarter of decode. That verdict was formed against a different profile and should be re-read
+   before being trusted.
+
+### The rule
+**Re-profile before choosing a target.** It costs one short run, and the stale figure cost this
+project a session of work aimed at the wrong phase on the wrong backend. Profiles drift with
+context length, pin policy and cache hit rate — this run had `pin_slots_per_layer=16` and a 78%
+hit rate, neither of which matches whenever the old profile was taken.
