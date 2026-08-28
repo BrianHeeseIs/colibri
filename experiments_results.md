@@ -4980,3 +4980,59 @@ Before that: taskcheck at N>=3, a multi-chunk prose differential at p256/p512, a
 measurement — because the prize is real and unmeasured. Widening takes GPU expert coverage from
 2684/4902 to **4902/4902**, so it roughly doubles the population over which E96's +33.9% applies.
 That number has not been measured and is NOT claimed here.
+
+## E98. Raising S: the decode batch dimension, and why concurrency is the only untried route
+**DOCUMENTATION ONLY — no measurement in this entry.** Recorded at the operator's request as a
+defined lane to be tested later, deliberately NOT built now.
+
+### What S actually is
+`S` is the batch dimension of a matmul — the number of ROWS fed to one dispatch. It is not
+"number of users". In this engine it has four distinct sources, and only one of them is unexplored:
+
+| source | S | status |
+|---|---|---|
+| Prefill chunk | up to 64 tokens, but see below | already exercised |
+| **Decode** | **1, structurally** — one token per forward | the constraint |
+| Speculation | drafts + 1 (verify already batches) | MEASURED, does not pay: drafts rarely fire, and rejected-suffix replay costs more than it saves |
+| **Concurrent in-flight requests** | number of simultaneous requests | **NEVER TESTED** |
+
+A subtlety that matters: during prefill the relevant S is **not** the chunk size, it is the number
+of tokens routed to a GIVEN expert. With a 64-token chunk, top-6 of 256 experts, the mean group is
+64x6/256 = **1.5 rows**. Routing is skewed so some experts clear the `MIN_N=4` gate and many do
+not. Prefill is therefore not the uniformly-large-S regime it looks like from the chunk size.
+
+### Why this matters for the hardware
+The GPU's advantage GROWS with S while the CPU's cost grows linearly. Measured
+(`validation/metal/bench_matmul 20`, gate|up 4096->2048):
+
+| | S=1 | S=8 |
+|---|---|---|
+| CPU | 0.428 ms | 3.012 ms |
+| GPU `simd_exact` | 0.072 ms | 0.387 ms |
+| ratio | 5.9x | **7.8x** |
+
+Decode runs the whole 40-core GPU at S=1. That is the single largest structural inefficiency in
+this engine on this hardware, and speculation — the only other lever that raises decode S — has
+already been measured and rejected.
+
+### The lane, for whoever picks it up
+Concurrent serving raises AGGREGATE throughput (tokens/second across requests); it does **not**
+reduce single-request latency, and may slightly increase it. That trade must be stated in any
+result, because this project's headline metric has always been single-request tok/s.
+
+Prerequisites and hazards, from what is already known:
+- `coli serve` currently supports **greedy generation and ONE active KV slot** (`docs/deepseek-v4.md`),
+  so multi-request batching is not merely a scheduling change — it needs KV slot management.
+- The batched MoE path already exists and is the natural beneficiary: `coli_v4_moe_grouped_batch`
+  with `COLI_V4_MOE_BATCHED=1`, gated at `COLI_V4_MOE_BATCHED_MIN_N=4`. Concurrency raises group
+  occupancy above that gate, which is exactly what it was built for.
+- `COLI_V4_MOE_BATCHED_MIN_N=3` was measured at **+0.81% SLOWER** with the old kernels. That
+  crossover MUST be re-measured against `simd_exact`, which changes the GPU side of the trade by
+  roughly 5x and therefore very likely moves the optimal MIN_N downward.
+- Memory: the engine already reaches ~58 GB RSS at `--memory-gb 96` on a 128 GB host. Additional
+  concurrent KV state must be budgeted, and `swap > 0` invalidates any measurement here.
+
+Suggested first experiment (cheap, before any engine work): re-measure the `MIN_N` crossover with
+`simd_exact` enabled. If the optimum moves from 4 down to 2 or 1, that alone converts part of
+prefill's small-group population to the GPU with no concurrency work at all, and it sizes the prize
+for the concurrency lane.
