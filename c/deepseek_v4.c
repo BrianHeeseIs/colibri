@@ -11307,7 +11307,14 @@ static void v4_hwinfo_emit(void) {
  * expert_wait used to be LITERAL ZEROS in this format string, so the UI's "Other" bucket silently
  * absorbed them -- 58% of a turn on this host, which reads as unexplained overhead when it is in
  * fact attention (the largest decode phase, 38.7% per experiments E102) plus the head, router,
- * shared expert, norms and prefill. Reporting them is what makes that chart honest. */
+ * shared expert, norms and prefill. Reporting them is what makes that chart honest.
+ *
+ * BUCKET ASYMMETRY, deliberate and worth knowing: attention/lm_head/expert_wait come from the
+ * phase counters, which coli_v4_profile_reset_decode() zeroes at the START OF DECODE, so they are
+ * DECODE-ONLY. expert_disk_s/expert_matmul_s come from the expert store's cumulative counters and
+ * therefore span PREFILL + DECODE. wall_s spans the whole turn. So the UI's residual "Other" is
+ * mostly PREFILL's non-expert work plus the decode phases still not reported here (router,
+ * shared_expert, hc_norm, indexer, compressor). It is real work, not overhead. */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
                          double expert_disk_s, double expert_wait_s,
                          double expert_matmul_s, double attention_s,
@@ -11479,10 +11486,6 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     double matmul_before =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
-    /* Phase counters are cumulative; snapshot them so the turn reports its own delta. */
-    uint64_t attn_ns_before = coli_v4_profile_phase_ns(COLI_V4_PROFILE_ATTENTION);
-    uint64_t head_ns_before = coli_v4_profile_phase_ns(COLI_V4_PROFILE_HEAD);
-    uint64_t wait_ns_before = coli_v4_profile_phase_ns(COLI_V4_PROFILE_EXPERT_WAIT);
     V4ServeStream stream = {session, request->id, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
@@ -11533,10 +11536,15 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         : 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
                  expert_disk_s,
-                 (coli_v4_profile_phase_ns(COLI_V4_PROFILE_EXPERT_WAIT) - wait_ns_before) / 1e9,
+                 /* NOT a delta: coli_v4_profile_reset_decode() zeroes these counters at the
+                  * start of decode (:10746, right at the TTFT marker), so the value at the end of
+                  * the turn IS that turn's decode total. Subtracting a pre-prefill snapshot
+                  * silently reported turn N minus turn N-1 -- 9.25s instead of 27.05s on the
+                  * second turn of a session. */
+                 coli_v4_profile_phase_ns(COLI_V4_PROFILE_EXPERT_WAIT) / 1e9,
                  expert_matmul_s,
-                 (coli_v4_profile_phase_ns(COLI_V4_PROFILE_ATTENTION) - attn_ns_before) / 1e9,
-                 (coli_v4_profile_phase_ns(COLI_V4_PROFILE_HEAD) - head_ns_before) / 1e9);
+                 coli_v4_profile_phase_ns(COLI_V4_PROFILE_ATTENTION) / 1e9,
+                 coli_v4_profile_phase_ns(COLI_V4_PROFILE_HEAD) / 1e9);
     coli_v4_expert_store_emit_hits(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
     coli_v4_expert_store_emit_tiers(engine->experts);

@@ -5457,3 +5457,46 @@ The two big items that WERE hiding in "Other" are already at their limits on thi
 
 So the actionable outcome here was instrumentation, not optimisation: the chart now tells the truth
 about where the time goes, and where it goes is where this session already established the limits.
+
+### E106b. What the residual "Other" is — measured, not inferred
+After the fix above, "Other" settled at 21-29% rather than 58%. Three turns on the running server
+identify it exactly:
+
+| turn | prompt_tok | gen | wall | matmul | attn | **OTHER** |
+|---|---|---|---|---|---|---|
+| 1 | 12 | 20 | 76.2 | 38.62 | 14.29 | **21.77** |
+| 2 | 9 | **40** | 103.7 | 44.13 | 34.95 | **21.92** |
+| 3 | **70** | 40 | 190.8 | 97.63 | 32.97 | **57.29** |
+
+Turn 2 DOUBLES the generated tokens against turn 1 and "Other" does not move (21.77 -> 21.92).
+Turn 3 raises the PROMPT 7.8x and "Other" goes up 2.6x. **"Other" tracks prompt length, not
+generation length: it is prefill.**
+
+That follows directly from the bucket asymmetry now documented at `v4_prof_emit`:
+`coli_v4_profile_reset_decode()` zeroes the phase counters at the START OF DECODE
+(`c/deepseek_v4.c:10746`), so attention/lm_head/expert_wait are **decode-only**, while
+`expert_matmul_s` comes from the expert store's cumulative counter and spans prefill+decode, and
+`wall_s` spans the whole turn. Prefill's attention, router and norms therefore have nowhere to go
+but the residual.
+
+Secondary, roughly constant contribution: the decode phases still not reported at all — router,
+shared_expert, hc_norm, indexer, compressor, together ~19% of decode per E102.
+
+### A second bug, in the first version of this fix
+The initial patch computed the phase values as a delta against a snapshot taken BEFORE prefill.
+Because the counters are zeroed mid-turn, that reported **turn N minus turn N-1**: the second turn
+of a session showed `attention_s=9.25` when the true figure was 27.05 (and 27.05 - 17.80 = 9.25
+exactly). Caught by running a second turn rather than trusting the first. The values are now read
+raw, since the post-decode value IS that turn's total.
+
+### So: can "Other" be reduced?
+**It is not overhead and it is not mislabelled any more — it is prefill, and prefill is ~70% of the
+user-visible wall.** The levers for it are the ones already staged and NOT yet run:
+- `COLI_V4_PREFILL_CHUNK` (the D sweep, backlogged) — wider chunks raise per-expert group sizes,
+  and the chunk width has been hardcoded at 64.
+- `--ram` / expert residency — never swept in this ledger, and prefill is bound by getting experts
+  into memory, which turn 3's `expert_matmul=97.63s` on a 70-token prompt reflects.
+
+The instrumentation work is done: the chart no longer hides attention. Making the last band
+self-explanatory would mean giving prefill its own PROF field and its own UI bucket, which is a
+protocol plus front-end change rather than a performance one.
