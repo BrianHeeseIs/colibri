@@ -1,0 +1,6 @@
+tok/s A/B  tokens=60  N=3  prompt=p064.txt
+  run1 minn4_default          ttft=  46.828s decode=  44.977s tok/s=1.3118   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run1 minn2                  ttft=  46.577s decode=  45.324s tok/s=1.3017   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run1 minn1                  ttft=  46.975s decode=  45.488s tok/s=1.2970   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run1 minn8                  ttft=  46.373s decode=  45.122s tok/s=1.3076   md5=d7e11251b80b1a4b36fbd1ecd2382bb0
+  run2 minn4_default          ttft=  46.447s decode=  45.189s tok/s=1.3056   md5=d7e11251b80b1a4b36fbd1ecd2382bb0

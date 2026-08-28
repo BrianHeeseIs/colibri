@@ -73,6 +73,29 @@ They do not move together. `COLI_V4_METAL_ATTN=1` is -15.9 % TTFT but trends *ne
 delta under ~10 % cannot be resolved at n=3, and several apparent effects here reversed when a
 third or fifth point was added.
 
+### MANDATORY: do not run a long benchmark without asking. Size it to the question first.
+Operator rule. Benchmark wall-clock is the scarcest resource in this project; spending it badly is
+worse than not measuring, because it also delays everything behind it.
+
+1. **Size the run to the claim.** If 3-5 runs settle it, NEVER plan 15. A lever predicted to be
+   flat on an axis needs a *flatness check* (2 points), not a resolution-grade measurement (n>=5).
+   The n>=5 decode rule exists for resolving deltas under ~10% — it is not a default for every arm.
+2. **Ask before starting anything long.** Say what it costs, what it decides, and why it must run
+   NOW rather than going into the backlog. Default is the backlog:
+   `.backlog/simd-exact-remaining-measurements.md`, run in a batch when the operator says so.
+3. **Cut arms that are already known-losing.** Re-measuring a recorded dead setting is pure cost.
+4. **Check the signal-to-load ratio before choosing a prompt.** Model load is ~35 s of EVERY fresh
+   run. At p064 TTFT is ~46 s, so load is ~75% of the metric and a prefill effect is diluted into
+   the noise. Choose the prompt so the thing being measured dominates the wall — or accept that a
+   null result at that length means nothing.
+5. **A short prompt can make the effect structurally impossible.** p064 is 64 tokens = exactly ONE
+   64-token chunk, so any chunk-width or grouping lever is inert there BY CONSTRUCTION. Confirm the
+   mechanism can even fire at the chosen length before spending runs on it.
+
+Learned by wasting two sweeps: a 4-arm x N=3 MIN_N sweep at p064 (12 runs) whose first round already
+showed a 0.6% spread — the TTFT noise floor — with identical md5s across all arms, and a p512 chunk
+sweep launched unasked that would have taken 30+ minutes at ~5 min/run.
+
 ### MANDATORY: if an experiment generates tokens, it MUST report tok/s — not TTFT alone
 Operator rule, binding on every experiment and every ledger entry.
 

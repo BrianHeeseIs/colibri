@@ -5155,3 +5155,44 @@ removed. What survives is this entry, and the conclusion that the expert path is
 command-buffer overhead in production — which retires the largest remaining hypothesis about why
 Metal loses to the CPU here, and redirects attention to the ~45% of experts that never reach the
 GPU at all (E97) and to prefill/streaming, which is ~70% of the wall.
+
+## E101. `COLI_V4_MOE_BATCHED_MIN_N` is inert at p064 — and the sweep that proved it was mis-designed
+
+### Result (E, partial by design — one round was enough)
+Four arms on top of `COLI_V4_METAL=1 COLI_V4_MOE_BATCHED=1 simd_exact_cold`, p064, 60 tokens:
+
+| MIN_N | TTFT | tok/s | md5 |
+|---|---|---|---|
+| 4 (default) | 46.83 s | 1.3118 | d7e11251b8… |
+| 2 | 46.58 s | 1.3017 | d7e11251b8… |
+| 1 | 46.98 s | 1.2970 | d7e11251b8… |
+| 8 | 46.37 s | 1.3076 | d7e11251b8… |
+
+TTFT spread **0.6%** — exactly the recorded TTFT noise floor. tok/s spread 1.1%, also noise, and
+**flat as pre-registered** (the batched path fires zero times at decode). **All four md5s
+identical**, so MIN_N does not change the output at all at this length.
+
+**Verdict: no measurable effect at p064.** The sweep was stopped after the first round; the
+remaining 8 runs were cancelled as pure cost.
+
+### Why this measurement could never have worked, and the rule that follows
+The design was wrong in three ways, all now recorded in AGENTS.md:
+
+1. **Signal-to-load ratio.** Model load is ~35 s of every fresh run. p064 TTFT is ~46 s, so **~75%
+   of the metric is load** and any prefill effect is diluted below the noise floor before it starts.
+2. **The mechanism cannot fire at that length.** p064 is 64 tokens = exactly ONE 64-token prefill
+   chunk. Per-expert groups average 64x6/256 = 1.5 rows, so almost nothing reaches ANY MIN_N
+   threshold and lowering the gate has essentially no population to act on. The null result is
+   structural, not empirical — it says nothing about MIN_N at longer prompts.
+3. **Over-sized.** 4 arms x N=3 = 12 runs to resolve a quantity whose first round already sat
+   inside the noise floor, including an arm (MIN_N=8) previously recorded as known-losing.
+
+So E is **NOT settled in general** — it is settled at p064, where it could not have mattered. It
+remains open at lengths where chunks are plentiful, and is backlogged as such rather than re-run
+now.
+
+### D — built, not measured
+`COLI_V4_PREFILL_CHUNK` now makes the prefill chunk width tunable (was hardcoded 64 at the target
+prefill loop); default 64, golden PASS on a fresh binary, so the change is behaviour-neutral until
+the flag is set. The sweep needs p512 or longer to have multiple chunks, which costs ~5 min per run
+and 30+ min for a 3-arm pair. **Not run — backlogged for the next benchmark batch.**
