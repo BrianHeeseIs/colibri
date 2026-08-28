@@ -1,0 +1,9 @@
+task-level correctness gate  tokens=120  N=1  checks=5
+  run1 base_cold_only correctness=11111 (5/5)
+  run1 widened_rows16 correctness=11111 (5/5)
+
+VERDICT
+  base_cold_only vectors=11111          stable=1/1
+  widened_rows16 vectors=11111          stable=1/1
+  PASS - capability identical across arms (vector 11111)
+  transcripts: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//taskcheck.H7VyYl

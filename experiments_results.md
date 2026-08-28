@@ -4936,3 +4936,47 @@ Widening REVERTED (repo precedent: `f8aef6b`). Kept: the `v4_metal_single_entry`
 the 45% visible, and `probe_rows16_parity`, which converts "rows16 is cursed" into a bounded
 question. The comment at the refusal site now records that the matmul has been cleared, so the next
 attempt does not re-derive it.
+
+### 6. CORRECTION to sections 2-5: the widened path FAILS BIT-EXACTNESS but PASSES CAPABILITY
+Sections 2-5 reported the golden FAIL and stopped there, comparing only md5s. That was an
+incomplete test and the framing "widening still fails" was misleading. The actual TEXT was then
+compared, and it changes the verdict.
+
+**Task-level capability gate** (`.backlog/lab/taskcheck.sh`, the operator-approved bar for
+non-bit-exact changes), N=1, 120 tokens, arms `COLI_V4_METAL=1 COLI_V4_METAL_VARIANT=simd_exact_cold`
+with and without `COLI_V4_METAL_ROWS16=1`:
+```
+  run1 base_cold_only correctness=11111 (5/5)
+  run1 widened_rows16 correctness=11111 (5/5)
+  PASS - capability identical across arms (vector 11111)
+```
+and the generated text on that prompt is **byte-identical between the two arms**.
+
+**On golden's own prompt** (60 tokens, free-form prose — the case that fails), the entire
+divergence is ONE token in sixty:
+```
+base:     ... passes through the *same* set of weights in the feed-forward network (FFN) layers. In an MoE
+widened:  ... passes through the *same* set of weights in the feed-forward network (FFN) layer.  In an MoE
+```
+`layers.` -> `layer.` and nothing else. The widened arm also **reproduces its own output** on a
+repeat run, so it is deterministic, not racy — which additionally weakens the section-4 suspicion
+of a slab race, since a race would not land on the same single token twice.
+
+**What this means.** A singular/plural flip on a near-tie logit is the signature of a very small,
+very rare numeric difference — entirely consistent with sections 3's probes finding the matmul
+bit-exact on synthetic data while some rare real-data case (an e8m0 edge code, or an exact tie in
+bf16 rounding) differs. It is NOT corruption, and the meaning is fully preserved.
+
+So rows16 widening belongs in the same category as `COLI_V4_KERNELS=all`: it fails the md5 gate,
+passes the capability gate, and is therefore admissible under the recorded acceptance bar as a
+documented opt-in. Note `COLI_V4_KERNELS=all` is the project's currently-recommended fastest
+setting and is *nondeterministic at short prompts*; this flag is at least deterministic.
+
+**Kept** as `COLI_V4_METAL_ROWS16=1`, **default OFF**, documented as failing golden by one token.
+
+**Limits of this evidence, stated plainly:** taskcheck at N=1, one prose prompt, one determinism
+pair. It is enough to overturn "the output is broken"; it is NOT enough to recommend enabling it.
+Before that: taskcheck at N>=3, a multi-chunk prose differential at p256/p512, and the tok/s
+measurement — because the prize is real and unmeasured. Widening takes GPU expert coverage from
+2684/4902 to **4902/4902**, so it roughly doubles the population over which E96's +33.9% applies.
+That number has not been measured and is NOT claimed here.
