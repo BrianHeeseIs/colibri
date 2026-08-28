@@ -117,6 +117,31 @@ for arm in "" "COLI_V4_METAL=1" "COLI_V4_METAL=1 COLI_V4_METAL_VARIANT=simd_exac
 done 2>&1 | tee .backlog/lab/golden_simdexact_$(date +%Y%m%d-%H%M%S).log
 ```
 
+## 5. D — prefill chunk width sweep (BUILT, NOT MEASURED)
+`COLI_V4_PREFILL_CHUNK` is implemented and defaults to 64, so today's behaviour is unchanged and
+golden passes. The sweep was NOT run: it needs p512+ to have multiple chunks and costs ~5 min per
+run, 30+ min for three arms.
+
+**Must run at p512 or p1024, never p064** — p064 is exactly ONE 64-token chunk, so chunk width is
+inert there by construction.
+```bash
+N=2 TOKENS=24 PROMPT_FILE=.backlog/prefill_prompts/p512.txt ./.backlog/lab/tokps.sh \
+  'chunk64_default=@=COLI_V4_METAL=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_PREFILL_CHUNK=64' \
+  'chunk128=@=COLI_V4_METAL=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_PREFILL_CHUNK=128' \
+  'chunk256=@=COLI_V4_METAL=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_PREFILL_CHUNK=256' \
+  2>&1 | tee .backlog/lab/chunk_sweep_p512_$(date +%Y%m%d-%H%M%S).log
+```
+tok/s here is a FLATNESS CHECK (decode is unaffected by chunking), not a resolution-grade number —
+report it anyway per the both-axes rule, labelled as such. **Check the md5 across arms**: wider
+chunks change prefill batching and may shift a near-tie token. If it changes, diff the TEXT before
+calling it a regression.
+
+## 6. E — MIN_N crossover, RE-TEST ONLY AT LENGTH
+Measured inert at p064 (E101) and that result does NOT generalise: p064 has one chunk and ~1.5 rows
+per expert, so no group reaches any threshold. Re-test **only** at p512+, and **only if item 5 shows
+chunk width matters** — bigger chunks are what create the group sizes MIN_N gates on. Drop MIN_N=8,
+already recorded as known-losing. Two arms (4 vs 2) at N=2 is enough for a first read.
+
 ## Follow-on work these measurements would unlock
 - **THE 45% CEILING — now the biggest lever, and bounded (E97).** `v4_metal_single_entry
   rows_rejects=2218` of 4902 decode expert calls: pinned hot (rows16) experts are refused by
