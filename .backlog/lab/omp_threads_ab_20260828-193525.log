@@ -1,0 +1,10 @@
+tok/s A/B  tokens=60  N=2  prompt=p064.txt
+  run1 omp16_current          ttft=  40.029s decode=  35.946s tok/s=1.6414   md5=4e242afd4c9bf934c24a880c5d958643
+  run1 omp12_pcores           ttft=  40.933s decode=  36.605s tok/s=1.6118   md5=4e242afd4c9bf934c24a880c5d958643
+  run2 omp16_current          ttft=  40.381s decode=  35.147s tok/s=1.6787   md5=4e242afd4c9bf934c24a880c5d958643
+  run2 omp12_pcores           ttft=  39.510s decode=  35.255s tok/s=1.6735   md5=4e242afd4c9bf934c24a880c5d958643
+
+SUMMARY (median tok/s)
+  omp16_current           1.66005 tok/s  baseline            deterministic  md5=4e242afd4c9bf934c24a880c5d958643 
+  omp12_pcores            1.64265 tok/s  -1.05% tok/s        deterministic  md5=4e242afd4c9bf934c24a880c5d958643 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.9yLytE

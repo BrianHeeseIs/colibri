@@ -5500,3 +5500,42 @@ user-visible wall.** The levers for it are the ones already staged and NOT yet r
 The instrumentation work is done: the chart no longer hides attention. Making the last band
 self-explanatory would mean giving prefill its own PROF field and its own UI bucket, which is a
 protocol plus front-end change rather than a performance one.
+
+## E107. Two creative levers for Expert matmul / Attention — both measured, both refuted
+
+Task: reduce "Expert matmul" (47% of a serve turn) and "Attention" (30%) on this host.
+
+### Lever 1: OMP thread count vs the 12P+4E asymmetry — NO EFFECT
+`c/coli` sets `OMP_NUM_THREADS=16` (physical cores; the tune targeted x86 SMT, a no-op here since
+M3 Max has no SMT). Hypothesis: `schedule(static)` barriers wait for E-core stragglers; 12 threads
+(P-cores only) should win. **Measured: -1.05% (noise), identical md5s.** macOS's scheduler handles
+the asymmetry. 16 is fine. (4 runs.)
+
+### Lever 2: give more experts the NEON kernel — SLOWER on both axes
+Fact base (explore): only PINNED experts (cap 16/layer, `-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16`)
+are rows16-packed and run `neon_rows16_accumulate`; the other ~148 resident experts per layer run
+**scalar C** `matmul_mxfp4` (`c/quant.h:1440`, no aarch64 SIMD) — ~55% of decode expert calls.
+Raised the compile cap to 256 and added `COLI_V4_PIN_SLOTS` (default UNCHANGED at 16; golden PASSES
+with env unset). At 158 pins/layer, `packed_slots` 624 -> 1737+ and capability holds (taskcheck
+5/5 both arms, deterministic). But, p064, N=2:
+
+| arm | tok/s | TTFT |
+|---|---|---|
+| pins16 (default) | **1.66915** | **39.7 s** |
+| pins158 | 1.53905 (**-7.79%**) | 46.9 s (**+18%**) |
+
+Non-overlapping on both axes. Two mechanisms: (a) the pack is ~12 MB of byte-transpose per expert,
+~6.8k experts, re-churned by `repin_interval=6` — a pack storm that lands on TTFT and bleeds into
+decode; (b) decode itself slowed 8.5%, so the NEON rows16 kernel is NOT clearly faster than
+scalar+OMP in situ — the "scalar path = free win" assumption fails the same way E104's did for FP8.
+**Cap 16 was accidentally near-optimal.** The knob is kept (default off) as the instrument that
+made this measurable; the cap raise is behaviour-neutral by construction.
+
+### Where this leaves the two phases on this host
+- Expert matmul: scalar MXFP4 + OMP is competitive with the NEON pack in situ; coverage is not the
+  lever. Remaining: the backlogged `--ram`/residency sweep (misses -> disk service) and prefill
+  chunk width.
+- Attention: `KERNELS=all` already covers attn_sparse+router; FP8 projections are at the gather
+  limit (E104) bit-exactly. The one open lever is the NON-bit-exact decode-16 FP8 kernel, ceiling
+  well under 2x on ~29% of decode (~+10-15% tok/s best case), needing the taskcheck gate.
+  Backlogged, not attempted — the numerics risk per point of gain is the worst of any open item.

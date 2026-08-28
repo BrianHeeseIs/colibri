@@ -8439,10 +8439,22 @@ int COLI_V4_ROWS16_STORE_OPEN(
     if (maximum_pins > COLI_V4_MAX_PIN_SLOTS_PER_LAYER)
         maximum_pins = COLI_V4_MAX_PIN_SLOTS_PER_LAYER;
     int pin_requested = options->pin_slots_per_layer;
-    /* -1 / 0 => implementation default (use maximum_pins). */
+    /* COLI_V4_PIN_SLOTS: how many experts per layer get the rows16 NEON pack. Pinned experts run
+     * the hand-written NEON kernel; every OTHER resident expert runs the scalar matmul_mxfp4
+     * (quant.h -- no aarch64 SIMD), and on this host ~55% of decode expert calls take that scalar
+     * path (experiments E107). Raising this converts them to NEON at zero steady-state memory
+     * cost (the pack is in-place in the same slot). NOTE: rows16 and cold arithmetic are
+     * different summation orders (E97), so changing WHICH experts are packed changes near-tie
+     * tokens -- gate with taskcheck, not golden. */
+    const char *pin_env = getenv("COLI_V4_PIN_SLOTS");
+    if (pin_env && *pin_env) pin_requested = atoi(pin_env);
+    /* -1 / 0 => implementation default. The compile cap is now 256 so the env can reach
+     * slots_per_layer-6; the DEFAULT stays the historical 16 so behaviour without the env is
+     * unchanged (golden depends on the pin assignment). */
+    int default_pins = maximum_pins > 16 ? 16 : maximum_pins;
     uint64_t requested = pin_requested > 0
         ? (uint64_t)pin_requested
-        : (uint64_t)(maximum_pins > 0 ? maximum_pins : 0);
+        : (uint64_t)(default_pins > 0 ? default_pins : 0);
     int pin_count = requested > (uint64_t)maximum_pins
         ? maximum_pins : (int)requested;
     if (pin_count < 0) pin_count = 0;

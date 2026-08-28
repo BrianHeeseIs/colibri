@@ -1,0 +1,19 @@
+task-level correctness gate  tokens=120  N=1  checks=5
+  run1 pins16         correctness=11111 (5/5)
+  run1 pins158        correctness=11111 (5/5)
+
+VERDICT
+  pins16         vectors=11111          stable=1/1
+  pins158        vectors=11111          stable=1/1
+  PASS - capability identical across arms (vector 11111)
+  transcripts: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//taskcheck.W3gaWQ
+tok/s A/B  tokens=60  N=2  prompt=p064.txt
+  run1 pins16                 ttft=  39.584s decode=  35.303s tok/s=1.6712   md5=4e242afd4c9bf934c24a880c5d958643
+  run1 pins158                ttft=  46.891s decode=  38.413s tok/s=1.5359   md5=f10ff38ba5591f4ca4fb6350b525c58e
+  run2 pins16                 ttft=  39.897s decode=  35.391s tok/s=1.6671   md5=4e242afd4c9bf934c24a880c5d958643
+  run2 pins158                ttft=  46.868s decode=  38.256s tok/s=1.5422   md5=f10ff38ba5591f4ca4fb6350b525c58e
+
+SUMMARY (median tok/s)
+  pins16                  1.66915 tok/s  baseline            deterministic  md5=4e242afd4c9bf934c24a880c5d958643 
+  pins158                 1.53905 tok/s  -7.79% tok/s        deterministic  md5=f10ff38ba5591f4ca4fb6350b525c58e 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.4fvJ5H

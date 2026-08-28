@@ -50,7 +50,7 @@ endif
 CFLAGS = -D_DARWIN_C_SOURCE -D_FILE_OFFSET_BITS=64 -O3 $(V4_OMPC) -pthread \
 	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
-	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=256 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24
 ifneq ($(ARCH),)
 ifeq ($(UNAME_M),arm64)
@@ -67,7 +67,7 @@ ARCH ?= x86-64-v3
 CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
-	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=256 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24
 LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
@@ -77,7 +77,7 @@ ARCH ?= native
 CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
-	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=256 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24
 LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
