@@ -49,6 +49,11 @@ static _Atomic unsigned long coli_v4_metal_dispatch_count;
  *                          ordered_hot_xcache. Silent fallback would corrupt an A/B. */
 static _Atomic unsigned long coli_v4_metal_simd_exact_matmuls;
 static _Atomic unsigned long coli_v4_metal_simd_exact_rows16_fallbacks;
+/* Experts refused by the SINGLE-expert entry (the decode path) for not being block_rows==1,
+ * and the last block_rows value seen there. Separated from the batch entry's layout
+ * attribution because that refusal produces a layout reject with no per-tensor detail. */
+static _Atomic unsigned long coli_v4_metal_single_rows_rejects;
+static _Atomic unsigned long coli_v4_metal_single_rows_last;
 
 typedef enum {
     COLI_V4_METAL_REJECT_VARIANT,
@@ -1066,6 +1071,16 @@ COLI_V4_METAL_EXTERN __attribute__((used)) int coli_v4_metal_expert_forward(
     if (expert && (expert->gate.block_rows != 1 ||
                    expert->up.block_rows != 1 ||
                    expert->down.block_rows != 1)) {
+        /* This refusal is INVISIBLE in the layout attribution: it bumps the layout counter but
+         * never reaches coli_v4_record_layout_mismatches, which lives in the batch entry. A run
+         * therefore reports "layout=N" with every per-tensor field zero, which reads like a
+         * mystery. Count it separately, and record the block_rows actually seen, so the share of
+         * experts excluded here is visible rather than inferred. */
+        atomic_fetch_add_explicit(&coli_v4_metal_single_rows_rejects, 1,
+                                  memory_order_relaxed);
+        atomic_store_explicit(&coli_v4_metal_single_rows_last,
+                              (unsigned long)expert->gate.block_rows,
+                              memory_order_relaxed);
         coli_v4_metal_reject(COLI_V4_METAL_REJECT_LAYOUT);
         return -1;
     }
@@ -1214,6 +1229,12 @@ static void coli_v4_metal_stats_report(void) {
             atomic_load_explicit(&coli_v4_metal_simd_exact_matmuls,
                                  memory_order_relaxed),
             atomic_load_explicit(&coli_v4_metal_simd_exact_rows16_fallbacks,
+                                 memory_order_relaxed));
+    fprintf(stderr,
+            "v4_metal_single_entry rows_rejects=%lu last_block_rows=%lu\n",
+            atomic_load_explicit(&coli_v4_metal_single_rows_rejects,
+                                 memory_order_relaxed),
+            atomic_load_explicit(&coli_v4_metal_single_rows_last,
                                  memory_order_relaxed));
     fprintf(stderr,
             "v4_metal_layout tensor_gate=%lu tensor_up=%lu tensor_down=%lu "
