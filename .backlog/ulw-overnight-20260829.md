@@ -67,3 +67,15 @@ be indirect (Metal context init / memory pressure), same class as E112's +3.4% d
 
 ### Order of work
 #8 and #7 are measurements (no code). #10 is the only implementation. Do measurements first.
+
+### #7 MOE_BATCHED_ROWS16: ALSO a measurement, not implementation
+`COLI_V4_MOE_BATCHED_ROWS16` is an existing env flag (deepseek_v4.c:5100). `coli_v4_moe_layout_batchable`
+(:5195) returns 1 for block_rows==1 always, and for block_rows==16 ONLY when the flag is set; otherwise
+those groups are rejected from the Metal batch and fall to CPU. rows16 == the HOT-PINNED experts
+(:8442, `COLI_V4_PIN_SLOTS`), so the flag decides whether hot pins can reach the GPU at all.
+The comment at :5497 says rows16 "has no such proof [of bit-exactness], so it keeps the CPU path" -
+that is the E97 revert reasoning, which AGENTS.md records as WRONG (one token in sixty, taskcheck 5/5).
+Engagement counter is free: `metal_row_share=%` in the `moe_batched` stats line (:5162), which also
+prints `rows16=%d`. Interaction to watch: champion uses METAL_VARIANT=simd_exact_COLD while rows16
+are the HOT pins, so the two may target disjoint expert sets.
+=> All three report items (#7, #8, #10): only #10 needs code.

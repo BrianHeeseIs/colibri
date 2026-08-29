@@ -1,0 +1,12 @@
+tok/s A/B  tokens=40  N=3  prompt=p256.txt
+  run1 gpu_prefill            ttft=  80.750s decode=  23.136s tok/s=1.6857   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run1 gpu_prefill_attn       ttft=  63.819s decode=  23.402s tok/s=1.6665   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run2 gpu_prefill            ttft=  80.792s decode=  23.019s tok/s=1.6943   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run2 gpu_prefill_attn       ttft=  63.930s decode=  23.280s tok/s=1.6753   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run3 gpu_prefill            ttft=  82.398s decode=  23.388s tok/s=1.6675   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run3 gpu_prefill_attn       ttft=  63.493s decode=  23.051s tok/s=1.6919   md5=9a5cb00223b4beaad728e0e7e46f8173
+
+SUMMARY (median tok/s)
+  gpu_prefill              1.6857 tok/s  baseline            deterministic  md5=9a5cb00223b4beaad728e0e7e46f8173 
+  gpu_prefill_attn         1.6753 tok/s  -0.62% tok/s        deterministic  md5=9a5cb00223b4beaad728e0e7e46f8173 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.mGWKlu

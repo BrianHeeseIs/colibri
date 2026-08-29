@@ -5924,3 +5924,46 @@ COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_col
 ```
 For token-reproducible work, drop `COLI_V4_KERNELS=all`: `gpu_prefill_nokall` is deterministic 5/5
 and still beats its own CPU baseline on TTFT (99.0 vs E112's 113.2, -12.5%), at a large tok/s cost.
+
+## E115. `COLI_V4_METAL_ATTN=1` on the GPU-prefill stack — -21% TTFT, BIT-EXACT. New champion.
+
+Report item #8 was scoped as "make Metal attention phase-dependent (prefill only)". **It already is,
+and needs no code.** `coli_v4_metal_fp8_enabled()` (backend_metal_v4.mm:558, reads
+`COLI_V4_METAL_ATTN`) has exactly two call sites, both on the batch path — `deepseek_v4.c:2838`
+(`coli_v4_attention_window_batch_ref`) and `:13736` (`coli_fp8_matmul_batch_ref`). Single-token
+decode uses a different function entirely (`attention_token_impl`, :1830-2128) which contains **zero**
+Metal references, and speculative decode — the only other batch consumer — defaults off. So the flag
+is *already* "Metal attention in prefill, CPU attention in decode". #8 was a measurement.
+
+**Engagement proven first** (E101 rule), `--max-tokens 1`, so prefill only:
+`metal_fp8_dispatches=0` with the flag off, **644** with it on. Clean separation.
+
+Six runs, p256, 40 tokens, on top of the E114 `gpu_prefill` stack.
+
+| arm | TTFT median [range] | decode median [range] | tok/s | md5 |
+|---|---|---|---|---|
+| `gpu_prefill` | 80.792 [80.750, 82.398] | 23.136 [23.019, 23.388] | 1.6857 | `9a5cb002...` |
+| **`gpu_prefill_attn`** | **63.819 [63.493, 63.930]** | 23.280 [23.051, 23.402] | 1.6753 | `9a5cb002...` |
+
+- **TTFT -21.01%**, ranges **non-overlapping** and very tight (the attn arm spans 0.44 s over three runs).
+- **decode +0.62%, ranges OVERLAP — unresolved at N=3 and immaterial.** The decode noise floor here is
+  5-13%; a 0.6% move cannot be resolved by any affordable N and is dwarfed by the TTFT gain. This does
+  NOT reproduce E87's "decode trended -5.25% with `METAL_ATTN=1`" as a resolvable effect.
+- **BIT-EXACT: all six runs, both arms, produced the identical md5** `9a5cb00223b4beaad728e0e7e46f8173` —
+  which is also the majority variant from E114's `gpu_prefill`. Both arms were deterministic 3/3 here.
+  (E114 saw 1-in-5 variation on this same stack, so 3/3 is not proof of stability, only consistent
+  with it. The bit-exactness of the flag itself is the solid claim: it changed nothing.)
+
+### Stacked against the E114 CPU baseline
+`cpu_only` (117.30 s wall) -> `gpu_prefill_attn` (87.10 s):
+**TTFT -32.48%, net wall @40 tokens -25.75%, tok/s -2.15%.**
+Break-even moves out to ~2400 generated tokens.
+
+### New recommended setting
+```bash
+COLI_V4_METAL=0 COLI_V4_KERNELS=all COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 \
+COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1
+```
+`COLI_V4_METAL=0` still disables single-token decode Metal; prefill attention and batched MoE are
+gated independently. Adding `METAL_ATTN=1` is free on the decode axis and bit-exact, so unlike
+`KERNELS=all` it carries no reproducibility cost.
