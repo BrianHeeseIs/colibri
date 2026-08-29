@@ -6455,3 +6455,101 @@ reproducibility price. `COLI_V4_BASELINE=1` forces it off with everything else.
 it was not touched here. `COLI_V4_PIN_SLOTS` remains dead (E123). The 12 OpenMP regions entered per
 layer per token, and the fact that DeepSeek-V4 never adopted `c/omp_tune.h` (so it runs 16 threads
 including the 4 efficiency cores, against that header's own P-cores-only policy), are both untested.
+
+## E126. Three more decode kernels — +9.20% tok/s on top of E125, all BIT-EXACT
+
+E125 moved decode for the first time (+10.18%). Re-profiling after it (its own rule) showed
+`expert_forward` had become the largest phase at 36.0%, but a head-to-head measurement of the two
+existing fp4 kernels closed that door (see the E107 vindication below). The remaining wins were
+three separate instances of the SAME defect class E125 fixed: a vectorised path compiled only for
+x86, or a hot loop left serial.
+
+Clean post-E125 baseline (p256, 39 generated tokens, no background load): decode_wall 20977.5 ms.
+
+### E126a — LM head: four vocabulary rows in flight (`COLI_V4_HEAD_ILP`, default on)
+`head_bf16_dot` (:9605) was vectorised only under `#ifdef __AVX2__`, so this host ran the scalar
+tail for the whole 4096-wide dot product, streaming vocab 129280 x hidden 4096 x 2 B = **1.059 GB
+per token** at ~29.5 GB/s against a ~105 GB/s ceiling.
+
+**That framing was wrong, and the correction is the whole result.** The head is **latency-bound, not
+bandwidth-bound**: each row is a 4096-deep SERIAL chain of dependent multiply-accumulates. At ~4
+cycles of FP latency that is ~16.4k cycles/row; 129280 rows over 16 threads is ~132M cycles ≈
+**35 ms/token** at ~3.8 GHz. Measured was 1399.6/39 = **35.9 ms/token**. The arithmetic predicted the
+measurement to within 3%.
+
+So the fix is not SIMD — it is **four independent accumulator chains**, the `o += 4` idiom already in
+`matmul_fp8` (quant.h:506). Each row keeps its own accumulator and the identical expression, so the
+compiler applies the same transformation to every chain and **exactness follows structurally**.
+That mattered: `head_bf16_dot` is `static`, inlined and built with `-flto`, so its FP contraction
+cannot be read reliably from the shipped binary. A probe under the engine's exact CFLAGS
+(`.backlog/lab/kbench/contract_probe.c`) reported `fmla=0 fmul=9 fadd=36` — UNFUSED — but the probe
+inlines the bf16 decode differently than the engine does, so that reading was treated as
+non-binding and the design was made independent of it.
+
+**head 1399.6 -> 524.4 ms (-62.5%, 2.67x); decode_wall 20977.5 -> 20049.1 (-4.4%).**
+
+### E126b — hyper-connection mix matvec parallelised (`COLI_V4_HC_OMP`, default on)
+`coli_v4_hc_pre` (:1438), `normalized_hc_pre` (:3657) and the sinkhorn split (:1400) contain **no
+OpenMP at all** and run **twice per layer per token** — 5.2% of decode single-threaded on a
+16-thread machine. At hc=4/dimension=4096 the mix loop is 24 rows x 16384 columns, ~92% of the
+function's arithmetic.
+
+Only that loop is parallelised. Each iteration writes exactly one `mixes[row]` and its inner column
+sum is untouched, so no summation is reordered. Three neighbours are deliberately left alone, with
+the reasons in the code: `mean_square` (:1449) is a serial reduction an `omp reduction` would
+reorder; the sinkhorn split is hc x hc and not worth the risk; the output loop (:1471) writes
+`output` while reading `input`.
+
+**hc_norm 1092.4 -> 398.3 ms (-63.5%, 2.74x); decode_wall 20049.1 -> 19339.4 (-3.5%).**
+
+### E126c — fp8 DUAL matvec reuses the rows16 kernel (`COLI_V4_FP8_DUAL_ROWS16`, default on)
+E125 covered `coli_fp8_matvec_ref` only. The shared expert's gate/up go through
+`coli_fp8_dual_matvec_ref` (:14027), which had an AVX2 rows8 arm and nothing for aarch64, so two
+thirds of that phase still ran scalar `matmul_fp8_dual`. (Its down projection already benefited,
+which is why shared_expert had fallen 1619.8 -> 1372.6 in E125.)
+
+The new arm quantises the activation ONCE then runs the existing rows16 kernel twice over it — no
+new numerics. Bit-exact by construction: `matmul_fp8_dual` accumulates per row exactly as
+`matmul_fp8` does (float within a 128-block, double across blocks), the shape the rows16 kernel
+already reproduces. Because the permute is in place and keyed by pointer, the arm **refuses if the
+two views overlap** rather than let two packs corrupt each other silently.
+
+**shared_expert 1372.6 -> 965.1 ms (-29.7%); decode_wall 19339.4 -> 19106.2 (-1.2%).**
+Bonus: TTFT also fell ~49.0 -> 45.3 s, because prefill drives the shared expert through the same
+per-item matvec.
+
+### Aggregate (p256, 40 tokens, N=5) — the single expensive run of the night
+| arm | decode median [range] | tok/s | TTFT median [range] |
+|---|---|---|---|
+| all three off | 21.044 [20.903, 21.135] | 1.8533 | 48.526 [48.428, 48.842] |
+| **all three on** | **19.271 [19.024, 19.341]** | **2.0238** | **45.473 [45.173, 45.613]** |
+
+**tok/s +9.20%**, decode -8.4%, **TTFT -6.3%**, ranges **non-overlapping on both axes**, and the
+output md5 was **identical across all 10 runs**. Both golden gates PASS with all three flags on:
+`5d04890413ff539e802985ce8c727814` (sacred) and `cc09015d089d9a25d10d75753f9e849a`.
+
+### Session total
+**1.6655 -> 2.0238 tok/s = +21.5%** (E125 +10.18%, then E126 +9.20%), every step bit-exact.
+
+### E107 vindicated — "raise pin coverage" is CLOSED
+`expert_forward` is the largest phase (36.0%) and only the 16 hot-pinned experts per layer of 256
+reach the NEON rows16 fp4 kernel; the rest run scalar `matmul_mxfp4`. The obvious move is to raise
+`COLI_V4_PIN_SLOTS`. **Measured head-to-head** with a new harness (`.backlog/lab/kbench/fp4bench.c`,
+no model, calling the engine's own kernels at real expert shapes, median of 15):
+
+| shape | scalar | NEON rows16 | speedup |
+|---|---:|---:|---:|
+| gate 2048x4096 | 0.253 ms | 0.222 ms | **1.14x** |
+| up 2048x4096 | 0.271 ms | 0.237 ms | **1.14x** |
+| down 4096x2048 | 0.240 ms | 0.232 ms | **1.03x** |
+
+Converting *every* call would buy at most ~1.1x on 36% = **+3.5% whole**, before the +66%
+`expert_wait` that pinning also costs (E123). E107 said "scalar MXFP4 + OMP is competitive with the
+NEON pack" and it was right; this proves it directly instead of inferring it from a confounded pin
+sweep. Note this is the OPPOSITE of the fp8 case, where the scalar path had no SIMD and the gap was
+2.1x. **Do not re-run the pin sweep.**
+
+Open, unmeasured: both fp4 kernels sit at 16-19 GB/s of the ~105 GB/s ceiling, and in *elements* per
+second the fp4 NEON does ~37.8 G/s against the fp8 rows16 kernel's ~66 G/s despite fp4 packing two
+elements per byte. A genuinely better fp4 kernel may exist, but the bar is the existing NEON one,
+not the scalar one, which makes it far larger and riskier than E125/E126 were.
