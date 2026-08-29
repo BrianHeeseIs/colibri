@@ -150,3 +150,24 @@ was asked to make).
 DECISION: attempt behind `COLI_V4_MOE_WHOLE_PROMPT` (default OFF) so the existing path stays
 bit-for-bit and a non-converging attempt costs nothing. Timeboxed; if it does not converge, leave the
 flag off, tree green, and hand over the design + this verdict.
+
+## RUN COMPLETE 2026-08-29 ~07:00 — all three report items delivered
+E114 N=5 (decode regression real at +1.94%, determinism = flag interaction)
+E115 #8 METAL_ATTN=1  -> -21.0% TTFT, BIT-EXACT, no code needed
+E116 #7 ROWS16=1      -> -7.3% TTFT, taskcheck 5/5, no code needed (E97's revert was wrong)
+E117 #10 precondition -> group size 4.14 -> 7.97 (reproduces E62 exactly), no code needed
+E118 champion holds at p064 (-34.3% TTFT)
+E119 #10 IMPLEMENTED  -> -17.4% TTFT, decode free, taskcheck 5/5, default-OFF bit-identical
+E119a mechanism scales: row share 69.8->95.1% at p512 (counter-only)
+
+CHAMPION: COLI_V4_METAL=0 KERNELS=all MOE_GROUPED=1 MOE_BATCHED=1
+          METAL_VARIANT=simd_exact_cold METAL_ATTN=1 MOE_BATCHED_ROWS16=1 MOE_WHOLE_PROMPT=1
+  vs cpu_only @p256: TTFT -48.2%, net wall@40 -38.5%, tok/s -1.75%
+REGRESSION GATE: bench/golden.sh PASS md5=5d04890413ff539e802985ce8c727814 (default path intact).
+
+OPEN / BACKLOG (need operator go-ahead, all are LONG timing sweeps):
+- p512 + p1024 timing sweep of MOE_WHOLE_PROMPT (mechanism says the win grows; only counters so far).
+- Memory: `states` is ~235 MB at 2048 tokens. If it bites, tile the deferred FINISH pass only —
+  never the attention contract.
+- Decode axis is untouched by all of tonight's work: every win is prefill. tok/s is still ~1.68.
+  The remaining decode lever list is in .backlog/simd-exact-remaining-measurements.md.

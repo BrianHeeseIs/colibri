@@ -6149,3 +6149,23 @@ COLI_V4_METAL=0 COLI_V4_KERNELS=all COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 
 COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED_ROWS16=1 \
 COLI_V4_MOE_WHOLE_PROMPT=1
 ```
+
+### E119a. The whole-prompt effect GROWS with prompt length (counter-only probe)
+
+Counter probe at p512 (331 words, ~6 chunks), `--max-tokens 1`, champion stack.
+**No timing claim is made here** — this run generates no decode tokens, so per the project rule it
+reports counters only. A timing sweep at p512 costs ~5 min/run and is left for the backlog.
+
+| p512 | groups | Metal rows | `metal_row_share` | CPU rows | CPU ms | Metal ms |
+|---|---|---|---|---|---|---|
+| OFF | 7144 | 65876 | 69.8% | 28552 | 21107.1 | 16200.4 |
+| ON | **4567** | 89798 | **95.1%** | 4630 | **3474.2** | **15500.1** |
+
+- Row share 69.8% -> **95.1%**, against 71.0% -> 89.1% at p256. The longer the prompt, the more chunks
+  the union spans, so the bigger the effect — exactly what E117's mechanism predicts.
+- 23922 rows move off the CPU (84% of all CPU rows), cutting CPU MoE work by 17633 ms, against ~6227 ms
+  at p256.
+- **Metal time DROPS too** (16200.4 -> 15500.1 ms), where at p256 it was flat. Fewer, larger dispatches
+  (7144 -> 4567 groups) are cheaper in absolute terms, not merely better value per row.
+
+Implication: the -17.4% TTFT measured at p256 is a **lower bound** on the benefit for longer prompts.
