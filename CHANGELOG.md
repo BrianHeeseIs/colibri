@@ -45,6 +45,15 @@ arm at p256 (N=3-5, non-overlapping ranges): **time to first token -48.2%, net w
   token-identical to the historical arm, golden would otherwise have failed. Rather than re-pin a
   reference md5, the gate was split so the original value keeps guarding the deterministic path.
 
+- **Decode is 10.18% faster** (`COLI_V4_FP8_ROWS16`, on by default). The fp8 matrix-vector product
+  behind the attention projections is a third of decode and had no ARM vector path at all — its only
+  vectorised arm is compiled for AVX2. The new kernel uses a 16-row interleaved layout so one
+  column's sixteen weights are a single vector load, and decodes fp8 by reinterpreting each byte as
+  half precision, which is exact for every value including subnormals. Weights are permuted in place,
+  so this costs no extra memory; the prefill path, which cannot read that order, restores row-major
+  on demand and in practice never has to. Bit-exact: both golden hashes are unchanged and the output
+  hash was identical across all ten measurement runs.
+
 ### Notes
 
 - **The default output is no longer token-identical to the historical CPU arm.** It is

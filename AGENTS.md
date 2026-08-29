@@ -144,8 +144,13 @@ present-but-wrong seed corrupts results silently. Sync from the durable copy bef
 ```bash
 COLI_V4_METAL=0 COLI_V4_KERNELS=all COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 \
 COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED_ROWS16=1 \
-COLI_V4_MOE_WHOLE_PROMPT=1
+COLI_V4_MOE_WHOLE_PROMPT=1 COLI_V4_FP8_ROWS16=1
 ```
+(All of these are now DEFAULTS; the list is written out only so the stack is explicit.)
+**Decode moved for the first time in E125**: `COLI_V4_FP8_ROWS16` is +10.18% tok/s, bit-exact, and
+free of memory cost. Note what did NOT work, so it is not retried: a drop-in NEON port is neutral
+(E124), arithmetic e4m3 decode is 0.70x, and keeping the packed weights as a SECOND copy costs +4 GB
+and reverses the win — permute in place.
 Against the `KERNELS=all` CPU arm below: **TTFT -48.2%, net wall @40 tokens -38.5%, tok/s -1.75%**
 at p256 (N=3-5, non-overlapping ranges). `COLI_V4_METAL=0` still disables single-token decode Metal;
 prefill attention, batched MoE and the whole-prompt dispatch are gated independently. Do NOT combine

@@ -105,6 +105,8 @@ Metal environment variable a silent no-op — check with
 | `COLI_V4_METAL_ROWS16=1` | off | also send pinned hot experts to the GPU on the *single-expert decode* path — see the warning below |
 | `COLI_V4_METAL_STATS=1` | off | print dispatch, reject and `simd_exact` counters at exit |
 | `COLI_V4_MOE_GROUPED_STATS=1` | off | print group counts, `metal_row_share` and the group-size histogram |
+| `COLI_V4_FP8_ROWS16` | **on** | NEON rows16 fp8 matvec for DECODE attention projections. Bit-exact, +10.18% tok/s (E125) |
+| `COLI_V4_FP8_ROWS16_MAXMB` | 8192 | legacy cap from the rejected shadow-copy design; the in-place permute uses no extra memory |
 | `COLI_V4_BASELINE=1` | off | restore every historical default in one move |
 
 **Two different `ROWS16` knobs — do not confuse them.** `COLI_V4_METAL_ROWS16` gates the
@@ -160,13 +162,30 @@ differences are wording-level. Two gates enforce this split:
 
 For bit-exactness differentials, regression triage or bisecting, set `COLI_V4_BASELINE=1` first.
 
-### Decode is unimproved, and here is where it goes
-All of the above is prefill. Decode profiling (E123, `COLI_V4_PROFILE=1`) accounts for 99.3% of it:
-`attn_out` 21.6%, `expert_forward` 32.2%, `attn_qkv` 10.8%. The attention projections both run
-`coli_fp8_matvec_ref`, whose 8-wide SIMD path is `#ifdef __AVX2__` — x86 only — so Apple silicon runs
-a scalar loop. A drop-in NEON port was written, proved bit-exact, and measured **neutral**: the loop
-is load-bound, not compute-bound (E124). The real lever is repacking fp8 weights row-interleaved, or
-decoding e4m3 in-register. Raising `COLI_V4_PIN_SLOTS` does **not** help (E123).
+### Decode: +10.18% from a NEON fp8 kernel (E125)
+Decode profiling (E123) accounts for 99.3% of it: `attn_out` 21.6%, `expert_forward` 32.2%,
+`attn_qkv` 10.8%. The attention projections both run `coli_fp8_matvec_ref`, whose 8-wide SIMD path is
+`#ifdef __AVX2__` — x86 only — so Apple silicon ran a scalar loop.
+
+`COLI_V4_FP8_ROWS16` fixes that: a 16-row interleaved layout so one column's 16 weights are a single
+`vld1q_u8`, and an e4m3 decode done by **reinterpreting the byte as f16** (`h = ((b & 0x80) << 8) |
+((b & 0x7F) << 7)`, then `vcvt_f32_f16`), which is exact for every value including subnormals, with
+the resulting 2⁸ folded into the block scale. The e4m3 NaN codes are the one case needing an explicit
+select. **+10.18% tok/s at N=5 with non-overlapping ranges, bit-exact** (both golden md5s unchanged),
+and no extra memory — the weights are permuted in place, and the layout-unaware prefill path restores
+row-major order on demand.
+
+Three things that do **not** work, all measured, so nobody repeats them:
+- A drop-in NEON port of the existing loop is **neutral** — it is load-bound, not compute-bound (E124).
+- Arithmetic bit-twiddle e4m3 decode (the PyTorch/MLX approach) is **0.70×**. The 1 KB LUT is
+  L1-resident and retires at ~1/cycle; only a nearly-free replacement beats it.
+- Keeping the packed weights as a **second copy** costs +4 GB and the memory pressure reverses the
+  win entirely (E125). Permute in place.
+- Raising `COLI_V4_PIN_SLOTS` does **not** help (E123).
+
+Still open on decode: `expert_forward` (32.2%) uses the mxfp4 path, untouched here; and DeepSeek-V4
+never adopted `c/omp_tune.h`, so it runs 16 threads including the 4 efficiency cores against that
+header's own P-cores-only policy.
 
 Note: an unrecognised `COLI_V4_METAL_VARIANT` value silently falls back to `ordered_cold`, so a
 typo produces the default rather than an error. `COLI_V4_METAL_STATS=1` prints
