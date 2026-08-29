@@ -5879,3 +5879,48 @@ CPU-vs-GPU. Future arms should be named for the backend they exercise.
 neither engages Metal. E113 measures prefetch on the **pure-CPU path only**. Its interaction with
 the GPU prefill configuration is **unknown and currently untestable**, because that combination is
 the one that deadlocks.
+
+## E114. GPU prefill at N=5 — both open items RESOLVED
+
+E112 left two questions at N=2: is the decode regression real, and is the lane nondeterministic.
+15 runs at p256, 40 tokens, arms named for the backend they exercise (E113b).
+
+| arm | TTFT median [range] | decode median [range] | tok/s | determinism (5 runs) |
+|---|---|---|---|---|
+| `cpu_only` | 94.524 [93.889, 95.002] | 22.780 [22.445, 22.812] | 1.7120 | deterministic `cd2823d9...` |
+| **`gpu_prefill`** | **81.847 [81.579, 82.058]** | 23.223 [22.943, 23.373] | 1.6794 | **1 variant in 5** |
+| `gpu_prefill_nokall` | 99.002 | 28.404 | 1.3730 | **deterministic** `8e057c7a...` (5/5) |
+
+### S1 — the decode regression is REAL, and smaller than N=2 suggested
+Ranges are **non-overlapping on both axes**: decode cpu [22.445, 22.812] vs gpu [22.943, 23.373].
+The regression is **+1.94%**, not E112's +3.4% — that estimate was inflated by its small sample.
+It is now resolved rather than suspected.
+
+- **TTFT -13.41%**, ranges non-overlapping and extremely tight (gpu spans 0.48 s over five runs).
+- **Net wall @40 tokens: 117.30 -> 105.07 s, -10.43%**, reproducing E112's -10.5%.
+- **Decode penalty 11.36 ms/token => BREAK-EVEN at 1116 generated tokens** (E112 estimated 674 from
+  the noisier sample). Below ~1100 output tokens this is a net win; above it, a net loss.
+
+### S2 — determinism: it is the COMBINATION, not either flag alone
+- `gpu_prefill_nokall`: **deterministic, 5/5 identical.** The GPU prefill lane is clean.
+- `cpu_only` (has `KERNELS=all`): **deterministic, 5/5** at this prompt.
+- `gpu_prefill` (both): **1 variant in 5.**
+
+Neither ingredient is nondeterministic alone at p256 over five samples; only together. That refines
+E111 (which blamed `KERNELS=all`) and E112 (which called it unresolved): it is an **interaction**.
+`KERNELS=all` is recorded as reassociating `attn_sparse`/`router`, and GPU prefill changes the
+numeric path feeding them, so the combination has more near-tie opportunities. Rate ~20% per run.
+
+### Verdict
+Under this project's stated bar — capability, not token identity — the combination is admissible,
+and it is the same bar under which `KERNELS=all` is already the recommended default despite its own
+recorded nondeterminism. Capability was verified in E111 (taskcheck 5/5 both arms) and the text
+differs only in wording (E111, E112).
+
+**Recommended for interactive use** (answers under ~1100 tokens):
+```bash
+COLI_V4_METAL=0 COLI_V4_KERNELS=all \
+COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold
+```
+For token-reproducible work, drop `COLI_V4_KERNELS=all`: `gpu_prefill_nokall` is deterministic 5/5
+and still beats its own CPU baseline on TTFT (99.0 vs E112's 113.2, -12.5%), at a large tok/s cost.

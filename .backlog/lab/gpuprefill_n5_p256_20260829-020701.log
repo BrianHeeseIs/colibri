@@ -1,0 +1,22 @@
+tok/s A/B  tokens=40  N=5  prompt=p256.txt
+  run1 cpu_only               ttft=  94.789s decode=  22.812s tok/s=1.7096   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run1 gpu_prefill            ttft=  81.847s decode=  23.373s tok/s=1.6686   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run1 gpu_prefill_nokall     ttft=  99.582s decode=  28.404s tok/s=1.3730   md5=8e057c7a10a04097e104213b966f0699
+  run2 cpu_only               ttft=  95.002s decode=  22.782s tok/s=1.7119   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run2 gpu_prefill            ttft=  82.040s decode=  22.943s tok/s=1.6999   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run2 gpu_prefill_nokall     ttft=  99.006s decode=  28.474s tok/s=1.3697   md5=8e057c7a10a04097e104213b966f0699
+  run3 cpu_only               ttft=  93.889s decode=  22.506s tok/s=1.7329   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run3 gpu_prefill            ttft=  81.579s decode=  23.223s tok/s=1.6794   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run3 gpu_prefill_nokall     ttft=  99.058s decode=  28.219s tok/s=1.3820   md5=8e057c7a10a04097e104213b966f0699
+  run4 cpu_only               ttft=  94.524s decode=  22.780s tok/s=1.7120   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run4 gpu_prefill            ttft=  82.058s decode=  23.002s tok/s=1.6955   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run4 gpu_prefill_nokall     ttft=  98.798s decode=  28.450s tok/s=1.3708   md5=8e057c7a10a04097e104213b966f0699
+  run5 cpu_only               ttft=  93.948s decode=  22.445s tok/s=1.7376   md5=cd2823d9de2f61ed4a9ba124f5e070f0
+  run5 gpu_prefill            ttft=  81.682s decode=  23.265s tok/s=1.6763   md5=80628ddafca14a2399c6e7d16e95a562
+  run5 gpu_prefill_nokall     ttft=  99.002s decode=  28.288s tok/s=1.3787   md5=8e057c7a10a04097e104213b966f0699
+
+SUMMARY (median tok/s)
+  cpu_only                 1.7120 tok/s  baseline            deterministic  md5=cd2823d9de2f61ed4a9ba124f5e070f0 
+  gpu_prefill              1.6794 tok/s  -1.90% tok/s        NONDETERMINISTIC  md5=80628ddafca14a2399c6e7d16e95a562 9a5cb00223b4beaad728e0e7e46f8173 
+  gpu_prefill_nokall       1.3730 tok/s  -19.80% tok/s       deterministic  md5=8e057c7a10a04097e104213b966f0699 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.XjZnKk
