@@ -13741,7 +13741,7 @@ static void coli_v4_fp8_unpack_rows16(uint8_t *dst, const uint8_t *src, int I, i
 
 /* Permute `data` in place into rows16 order (or confirm it already is). Returns 1 on success.
  * Transient cost is ONE tensor's worth of scratch, not a per-tensor permanent copy. */
-static int coli_v4_fp8_rows16_ensure(const uint8_t *data, int rows, int columns) {
+int coli_v4_fp8_rows16_ensure(const uint8_t *data, int rows, int columns) {
     int tiles = rows / 16;
     if (tiles < 1) return 0;
     size_t bytes = (size_t)tiles * columns * 16;
@@ -13808,7 +13808,7 @@ static inline void coli_v4_e4m3_decode16(uint8x16_t b, float32x4_t out[4]) {
     out[2] = vcvt_f32_f16(vget_low_f16(f1));  out[3] = vcvt_f32_f16(vget_high_f16(f1));
 }
 
-static void coli_v4_fp8_matvec_rows16(float *y, const float *x, const uint8_t *packed,
+void coli_v4_fp8_matvec_rows16(float *y, const float *x, const uint8_t *packed,
                                       const uint8_t *raw, const float *bscale,
                                       int I, int O, int tiles) {
     const int64_t nblkI = fp8_nblk(I);
@@ -14024,6 +14024,33 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
     free(activation_scales); free(activation); return 0;
 }
 
+#if defined(__aarch64__)
+int  coli_v4_fp8_rows16_ensure(const uint8_t *data, int rows, int columns);
+void coli_v4_fp8_matvec_rows16(float *y, const float *x, const uint8_t *packed,
+                               const uint8_t *raw, const float *bscale,
+                               int I, int O, int tiles);
+static unsigned long long coli_v4_fp8_dual_rows16_tile_count;
+unsigned long long coli_v4_fp8_dual_rows16_tiles(void) {
+    return __atomic_load_n(&coli_v4_fp8_dual_rows16_tile_count, __ATOMIC_RELAXED);
+}
+void coli_v4_fp8_dual_rows16_reset(void) {
+    __atomic_store_n(&coli_v4_fp8_dual_rows16_tile_count, 0ULL, __ATOMIC_RELAXED);
+}
+static int coli_v4_fp8_dual_rows16_force = -1;
+void coli_v4_fp8_dual_rows16_set(int on) { coli_v4_fp8_dual_rows16_force = on ? 1 : 0; }
+static int coli_v4_fp8_dual_rows16_enabled(void) {
+    if (coli_v4_fp8_dual_rows16_force >= 0) return coli_v4_fp8_dual_rows16_force;
+    static int cached = -1;   /* benign race: both racers compute the same value */
+    if (cached < 0) {
+        const char *bs = getenv("COLI_V4_BASELINE");
+        const int baseline = bs && *bs && atoi(bs) != 0;
+        const char *v = getenv("COLI_V4_FP8_DUAL_ROWS16");
+        cached = (v && *v) ? (atoi(v) != 0) : !baseline;
+    }
+    return cached;
+}
+#endif
+
 int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
                              const ColiTensorView *a,
                              const ColiTensorView *b,
@@ -14051,6 +14078,34 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
                                     input, columns, 128) != 0) {
         free(activation_scales); free(activation); return -1;
     }
+#if defined(__aarch64__)
+    /* Shared-expert gate/up. E125 already accelerated this pair's DOWN projection through the
+     * single matvec; this closes the other two thirds by reusing the SAME kernel twice over one
+     * shared quantised activation. Bit-exact by construction: matmul_fp8_dual accumulates per row
+     * exactly as matmul_fp8 does (float within a 128-block, double across blocks), which is the
+     * shape coli_v4_fp8_matvec_rows16 already reproduces. */
+    if (coli_v4_fp8_dual_rows16_enabled() &&
+        a->block_rows == 128 && b->block_rows == 128 && rows >= 16) {
+        const uint8_t *pa = a->data, *pb = b->data;
+        const size_t span = rows * columns;
+        /* The permute is IN PLACE and keyed by pointer, so overlapping views would corrupt each
+         * other silently. Refuse rather than risk it. */
+        const int overlap = (pa == pb) || (pa < pb + span && pb < pa + span);
+        if (!overlap &&
+            coli_v4_fp8_rows16_ensure(pa, (int)rows, (int)columns) &&
+            coli_v4_fp8_rows16_ensure(pb, (int)rows, (int)columns)) {
+            coli_v4_fp8_matvec_rows16(output_a, activation, pa, pa,
+                                      (const float *)a->scales,
+                                      (int)columns, (int)rows, (int)rows / 16);
+            coli_v4_fp8_matvec_rows16(output_b, activation, pb, pb,
+                                      (const float *)b->scales,
+                                      (int)columns, (int)rows, (int)rows / 16);
+            __atomic_fetch_add(&coli_v4_fp8_dual_rows16_tile_count,
+                               (unsigned long long)(rows / 16) * 2ULL, __ATOMIC_RELAXED);
+            free(activation_scales); free(activation); return 0;
+        }
+    }
+#endif
 #ifdef __AVX2__
     if (a->block_rows == 8) {
         if (rows % 8) {
