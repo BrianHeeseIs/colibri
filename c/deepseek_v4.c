@@ -69,6 +69,8 @@ enum {
 #undef COLI_V4_KERNEL_ALL_BIT
 };
 
+#include "head_ilp.h"
+
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
 
@@ -9602,6 +9604,31 @@ static int final_hidden(float *output, const float *state,
     return 0;
 }
 
+/* COLI_V4_HEAD_ILP: process four vocabulary rows per pass so four independent accumulator chains
+ * are in flight. The head is latency-bound on a 4096-deep serial chain, not bandwidth-bound --
+ * see c/head_ilp.h. Bit-exact by construction: each row keeps its own accumulator and the same
+ * expression, so the compiler treats every chain identically. */
+static unsigned long long coli_v4_head_ilp_row_count;
+unsigned long long coli_v4_head_ilp_rows(void) {
+    return __atomic_load_n(&coli_v4_head_ilp_row_count, __ATOMIC_RELAXED);
+}
+void coli_v4_head_ilp_reset(void) {
+    __atomic_store_n(&coli_v4_head_ilp_row_count, 0ULL, __ATOMIC_RELAXED);
+}
+static int coli_v4_head_ilp_force = -1;
+void coli_v4_head_ilp_set(int on) { coli_v4_head_ilp_force = on ? 1 : 0; }
+static int coli_v4_head_ilp_enabled(void) {
+    if (coli_v4_head_ilp_force >= 0) return coli_v4_head_ilp_force;
+    static int cached = -1;   /* benign race: both racers compute the same value */
+    if (cached < 0) {
+        const char *b = getenv("COLI_V4_BASELINE");   /* this unit cannot see the shared inline */
+        const int baseline = b && *b && atoi(b) != 0;
+        const char *v = getenv("COLI_V4_HEAD_ILP");
+        cached = (v && *v) ? (atoi(v) != 0) : !baseline;
+    }
+    return cached;
+}
+
 static float head_bf16_dot(const uint16_t *weight, const float *hidden,
                            int dimension) {
     float sum = 0.0f;
@@ -9652,10 +9679,27 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
     if (resident) {
         float *scores = malloc((size_t)vocab * sizeof(*scores));
         if (!scores) return -1;
+        if (coli_v4_head_ilp_enabled()) {
+            const int blocks = vocab / 4;
+            #pragma omp parallel for schedule(static)
+            for (int block = 0; block < blocks; block++) {
+                const int row = block * 4;
+                coli_v4_head_dot4(resident + (size_t)(row + 0) * d,
+                                  resident + (size_t)(row + 1) * d,
+                                  resident + (size_t)(row + 2) * d,
+                                  resident + (size_t)(row + 3) * d,
+                                  hidden, d, scores + row);
+            }
+            for (int row = blocks * 4; row < vocab; row++)   /* vocab % 4 tail */
+                scores[row] = head_bf16_dot(resident + (size_t)row * d, hidden, d);
+            __atomic_fetch_add(&coli_v4_head_ilp_row_count,
+                               (unsigned long long)blocks * 4ULL, __ATOMIC_RELAXED);
+        } else {
         #pragma omp parallel for schedule(static)
         for (int row = 0; row < vocab; row++) {
             const uint16_t *weight = resident + (size_t)row * d;
             scores[row] = head_bf16_dot(weight, hidden, d);
+        }
         }
         int winner = -1;
         float maximum = -FLT_MAX;
