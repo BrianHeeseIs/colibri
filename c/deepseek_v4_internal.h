@@ -540,6 +540,18 @@ int coli_v4_block_window_token_ref(
 /* amalgamated: deepseek_v4_layer.h */
 #include "expert_store.h"
 
+/* Champion-by-default (operator decision, 2026-08-29). Every performance gate below now defaults
+ * ON, because the measured stack is 48.2% faster to first token and 38.5% faster in net wall at 40
+ * tokens than the historical CPU arm (E114-E119), with capability gated at 5/5 throughout.
+ * COLI_V4_BASELINE=1 restores the historical defaults in ONE move -- that is what bench/golden.sh
+ * uses, so its md5 keeps testing the deterministic reference path rather than being re-pinned.
+ * Individual flags still win over the default either way, so COLI_V4_MOE_BATCHED=0 still disables
+ * just that gate. Inline rather than cross-unit because it is a pure environment read. */
+static inline int coli_v4_baseline_mode(void) {
+    const char *v = getenv("COLI_V4_BASELINE");
+    return v && *v && atoi(v) != 0;
+}
+
 /* #10 whole-prompt MoE. The dispatch is hoisted out of the 64-token chunk loop so one call sees
  * every row of the prompt (E117: mean expert group 4.14 -> 7.97, and layers clearing MIN_N=4 go
  * from 29/43 to 43/43). The chunk loop already sits inside the layer loop and `state`/`next` are

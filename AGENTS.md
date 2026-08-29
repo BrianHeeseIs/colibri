@@ -29,9 +29,27 @@ This is not hypothetical. Both of these were lost mid-session on this machine:
 - benchmark logs / runners: `.backlog/lab/`
 - durable notes and resumable state: `.backlog/*.md`
 
+## DEFAULTS CHANGED 2026-08-29 — the engine now ships the champion stack
+As of E114-E119 the performance gates default **ON**: `KERNELS=all`, `MOE_GROUPED`, `MOE_BATCHED`,
+`MOE_BATCHED_ROWS16`, `MOE_WHOLE_PROMPT`, `METAL_ATTN`, and `METAL_VARIANT=simd_exact_cold`.
+`COLI_V4_METAL` still defaults **OFF** — it gates single-token DECODE Metal, which is slower here
+(E99). Any individual flag still overrides the default (`COLI_V4_MOE_BATCHED=0` disables just that).
+
+**`COLI_V4_BASELINE=1` restores every historical default in one move.** Use it whenever you need the
+old deterministic reference: bit-exactness differentials, regression triage, or bisecting.
+
+Consequence you must internalise: **the engine's default output is no longer token-identical to the
+historical CPU arm.** It is capability-equivalent (`taskcheck` 5/5 at every step), not byte-equal.
+
+- `bench/golden.sh` pins `COLI_V4_BASELINE=1`, so its sacred md5 still guards the reference path.
+- `bench/golden_default.sh` guards the SHIPPING path against `bench/GOLDEN_DEFAULT_MD5`. That value
+  is NOT sacred: re-record it deliberately when a default changes, and write down why.
+
 ## Benchmark integrity (earned the hard way)
 - Golden output md5 `5d04890413ff539e802985ce8c727814` is SACRED. Never edit the expected
-  value to make something pass; fix the code.
+  value to make something pass; fix the code. It is now reached via `COLI_V4_BASELINE=1`, which
+  `bench/golden.sh` sets for you — if you invoke the engine by hand and see a different hash, check
+  that you set it before concluding anything broke.
 - `bench/ab.sh` prints `delta = 100*(on-off)/off` — **FASTER IS NEGATIVE**.
 - `bench/ab.sh` runs `--max-tokens 1` and parses only `time_to_first_token`; the metric is
   TTFT (load + prefill) and **decode is excluded by construction**. `p064`/`p256` are prompt

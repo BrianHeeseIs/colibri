@@ -5080,10 +5080,12 @@ static uint64_t coli_v4_moe_cpu_ns;           /* wall inside the per-row CPU pat
 static uint64_t coli_v4_moe_hist[COLI_V4_MOE_HIST_MAX + 1]; /* group-size histogram, N clamped */
 
 static void coli_v4_moe_grouped_init(void) {
+    /* Default ON unless COLI_V4_BASELINE=1; an explicit value always wins. */
+    const int dflt = !coli_v4_baseline_mode();
     const char *grouped = getenv("COLI_V4_MOE_GROUPED");
     const char *stats = getenv("COLI_V4_MOE_GROUPED_STATS");
     coli_v4_moe_grouped_enabled_value =
-        grouped && *grouped && atoi(grouped) != 0;
+        (grouped && *grouped) ? (atoi(grouped) != 0) : dflt;
     coli_v4_moe_grouped_stats_enabled_value =
         stats && *stats && atoi(stats) != 0;
     /* A8: batch a group's N routed rows into ONE Metal expert dispatch.
@@ -5099,11 +5101,11 @@ static void coli_v4_moe_grouped_init(void) {
      * bit-exact on real data. */
     const char *rows16 = getenv("COLI_V4_MOE_BATCHED_ROWS16");
     coli_v4_moe_batched_rows16_value =
-        rows16 && *rows16 && atoi(rows16) != 0;
+        (rows16 && *rows16) ? (atoi(rows16) != 0) : dflt;
     const char *batched = getenv("COLI_V4_MOE_BATCHED");
     const char *min_n = getenv("COLI_V4_MOE_BATCHED_MIN_N");
     coli_v4_moe_batched_enabled_value =
-        batched && *batched && atoi(batched) != 0;
+        (batched && *batched) ? (atoi(batched) != 0) : dflt;
     coli_v4_moe_batched_min_n_value = 4;
     if (min_n && *min_n) {
         int parsed = atoi(min_n);
@@ -5154,7 +5156,7 @@ int coli_v4_moe_whole_prompt_enabled(void) {
     static int cached = -1;   /* benign race: both racers compute the same value */
     if (cached < 0) {
         const char *v = getenv("COLI_V4_MOE_WHOLE_PROMPT");
-        cached = (v && *v && atoi(v) != 0);
+        cached = (v && *v) ? (atoi(v) != 0) : !coli_v4_baseline_mode();
     }
     /* Only meaningful on the grouped path -- the scalar path interleaves the MoE per item, so
      * there is nothing to hoist. Checked here so callers in other units need not see the
@@ -10457,7 +10459,10 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
     } else if (!options->prompt) {
         return -1;
     }
+    /* Default "all": measured +12-20% tok/s and -10-20% TTFT (AGENTS.md). Opt out with
+     * COLI_V4_KERNELS=none, or restore every historical default with COLI_V4_BASELINE=1. */
     const char *kernel_environment = getenv("COLI_V4_KERNELS");
+    if (!kernel_environment && !coli_v4_baseline_mode()) kernel_environment = "all";
     if (kernel_environment &&
         v4_kernel_mask_parse(kernel_environment, &options->requested_kernels))
         return -1;

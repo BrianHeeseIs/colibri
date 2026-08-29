@@ -475,7 +475,16 @@ static int coli_v4_get_chain_pipelines(uint32_t block_rows, int variant,
            (*matmul).staticThreadgroupMemoryLength <= coli_v4_device.maxThreadgroupMemoryLength;
 }
 
+/* Mirrors coli_v4_baseline_mode() from deepseek_v4_internal.h, which this file does not include. */
+static int coli_v4_metal_baseline_mode(void) {
+    const char *v = getenv("COLI_V4_BASELINE");
+    return v && *v && atoi(v) != 0;
+}
+
 __attribute__((constructor)) static void coli_v4_metal_read_environment(void) {
+    /* NOTE: COLI_V4_METAL stays default-OFF. It gates SINGLE-TOKEN DECODE Metal, which measured
+     * SLOWER here (E99); the champion runs it off. Prefill attention, batched MoE and the
+     * whole-prompt dispatch are gated independently and default ON. */
     const char *enabled = getenv("COLI_V4_METAL");
     coli_v4_metal_enabled_value = enabled && !strcmp(enabled, "1");
     const char *profile = getenv("COLI_V4_METAL_PROFILE");
@@ -487,7 +496,9 @@ __attribute__((constructor)) static void coli_v4_metal_read_environment(void) {
     if (coli_v4_metal_stats_enabled_value) atexit(coli_v4_metal_stats_report);
 
     const char *variant = getenv("COLI_V4_METAL_VARIANT");
-    if (!variant || !strcmp(variant, "ordered_cold"))
+    if (!variant)
+        coli_v4_metal_variant_value = coli_v4_metal_baseline_mode() ? 0 : 4;
+    else if (!strcmp(variant, "ordered_cold"))
         coli_v4_metal_variant_value = 0;
     else if (!strcmp(variant, "ordered_hot"))
         coli_v4_metal_variant_value = 1;
@@ -557,8 +568,11 @@ static int coli_v4_fp8_cache_count;
 
 COLI_V4_METAL_EXTERN int coli_v4_metal_fp8_enabled(void) {
     if (coli_v4_fp8_enabled_value < 0) {
+        /* Default ON: -21.0% TTFT and BIT-EXACT over six runs (E115), so unlike the other gates
+         * this one costs nothing in reproducibility. Already prefill-only by construction. */
         const char *v = getenv("COLI_V4_METAL_ATTN");
-        coli_v4_fp8_enabled_value = (v && *v && atoi(v) != 0) ? 1 : 0;
+        coli_v4_fp8_enabled_value = (v && *v) ? (atoi(v) != 0)
+                                              : (coli_v4_metal_baseline_mode() ? 0 : 1);
     }
     return coli_v4_fp8_enabled_value;
 }

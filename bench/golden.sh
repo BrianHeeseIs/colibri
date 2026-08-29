@@ -97,7 +97,12 @@ run_model() {
     local log=$2
     local status=0 restore_status=0
     cp "$SNAPSHOT" "$USAGE"
-    if env "${EXTRA_ENV_ARGS[@]}" COLI_V4_SAVE_USAGE=0 \
+    # COLI_V4_BASELINE=1 pins the HISTORICAL defaults. As of 2026-08-29 the engine defaults to the
+    # champion stack (E114-E119), whose output is intentionally not token-identical to this file's
+    # md5. Rather than re-pin a value AGENTS.md calls sacred, golden keeps testing the deterministic
+    # reference path. It is placed before EXTRA_ENV_ARGS so a caller can still override it.
+    # The champion default has its own gate: bench/golden_default.sh.
+    if env COLI_V4_BASELINE=1 "${EXTRA_ENV_ARGS[@]}" COLI_V4_SAVE_USAGE=0 \
         "$BINARY" "$MODEL" "$PROMPT" --max-tokens "$max_tokens" --memory-gb 96 \
         >"$log" 2>&1; then
         status=0

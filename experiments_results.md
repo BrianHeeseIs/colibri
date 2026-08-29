@@ -6169,3 +6169,25 @@ reports counters only. A timing sweep at p512 costs ~5 min/run and is left for t
   (7144 -> 4567 groups) are cheaper in absolute terms, not merely better value per row.
 
 Implication: the -17.4% TTFT measured at p256 is a **lower bound** on the benefit for longer prompts.
+
+## E120. Whole-prompt MoE at p512 — the win GROWS with prompt length (timing, authorized sweep)
+
+E119a predicted from counters alone that the benefit scales with prompt length. Measured, N=3, p512,
+40 tokens, champion stack.
+
+| arm | TTFT median [range] | decode median [range] | tok/s | md5 (3 runs) |
+|---|---|---|---|---|
+| `wp_off` | 117.460 [117.175, 117.729] | 23.819 [23.418, 29.530] | 1.6373 | `9ff26baf...` 3/3 |
+| **`wp_on`** | **87.051 [86.971, 87.227]** | 23.527 [23.421, 23.801] | 1.6577 | `d7f7c51a...` 3/3 |
+
+- **TTFT -25.89%**, ranges non-overlapping and very tight (the ON arm spans 0.26 s over three runs).
+- **The scaling is confirmed: -17.43% at p256 -> -25.89% at p512**, matching the mechanism — a longer
+  prompt spans more chunks, so the union of routed experts is proportionally larger (E117).
+- **Net wall @40 tokens 141.28 -> 110.58 s, -21.73%.**
+- Both arms deterministic 3/3.
+- **Honest note on decode:** `wp_off` run1 shows 29.530 s against 23.418/23.819 for its siblings — a
+  cold-start outlier on the very first run of the sweep. The medians are robust to it, but it is why
+  the decode ranges overlap and why the -1.23% decode figure should be read as **flat, not an
+  improvement**. Decode remains untouched by this change, consistent with p256's +0.00%.
+
+Practical reading: at p512 this single flag removes 30 seconds of wall clock from the first token.

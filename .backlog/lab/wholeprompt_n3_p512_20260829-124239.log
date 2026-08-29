@@ -1,0 +1,12 @@
+tok/s A/B  tokens=40  N=3  prompt=p512.txt
+  run1 wp_off                 ttft= 117.729s decode=  29.530s tok/s=1.3207   md5=9ff26baf6e01926fdbf127d34cab21c3
+  run1 wp_on                  ttft=  87.227s decode=  23.421s tok/s=1.6652   md5=d7f7c51a0421eb149360131e10450a6b
+  run2 wp_off                 ttft= 117.175s decode=  23.819s tok/s=1.6373   md5=9ff26baf6e01926fdbf127d34cab21c3
+  run2 wp_on                  ttft=  87.051s decode=  23.527s tok/s=1.6577   md5=d7f7c51a0421eb149360131e10450a6b
+  run3 wp_off                 ttft= 117.460s decode=  23.418s tok/s=1.6654   md5=9ff26baf6e01926fdbf127d34cab21c3
+  run3 wp_on                  ttft=  86.971s decode=  23.801s tok/s=1.6386   md5=d7f7c51a0421eb149360131e10450a6b
+
+SUMMARY (median tok/s)
+  wp_off                   1.6373 tok/s  baseline            deterministic  md5=9ff26baf6e01926fdbf127d34cab21c3 
+  wp_on                    1.6577 tok/s  +1.25% tok/s        deterministic  md5=d7f7c51a0421eb149360131e10450a6b 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.USMtjD
