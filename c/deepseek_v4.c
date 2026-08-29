@@ -1435,6 +1435,34 @@ int coli_v4_hc_split_sinkhorn(float *pre, float *post, float *comb,
     return 0;
 }
 
+/* COLI_V4_HC_OMP: parallelise the hc_pre mix matvec. At hc=4/dimension=4096 that loop is
+ * 24 rows x 16384 columns -- about 92% of hc_pre's arithmetic -- and it runs twice per layer per
+ * token entirely single-threaded today. Each iteration writes exactly one `mixes[row]` and its
+ * inner column sum is untouched, so parallelising over `row` cannot reorder any summation and the
+ * result is bit-exact. The `mean_square` reduction above, the sinkhorn split and the output loop
+ * below are deliberately left alone: the first would reorder, the second is hc x hc and not worth
+ * the risk, and the third writes `output` while reading `input`. */
+static unsigned long long coli_v4_hc_omp_row_count;
+unsigned long long coli_v4_hc_omp_rows(void) {
+    return __atomic_load_n(&coli_v4_hc_omp_row_count, __ATOMIC_RELAXED);
+}
+void coli_v4_hc_omp_reset(void) {
+    __atomic_store_n(&coli_v4_hc_omp_row_count, 0ULL, __ATOMIC_RELAXED);
+}
+static int coli_v4_hc_omp_force = -1;
+void coli_v4_hc_omp_set(int on) { coli_v4_hc_omp_force = on ? 1 : 0; }
+static int coli_v4_hc_omp_enabled(void) {
+    if (coli_v4_hc_omp_force >= 0) return coli_v4_hc_omp_force;
+    static int cached = -1;   /* benign race: both racers compute the same value */
+    if (cached < 0) {
+        const char *b = getenv("COLI_V4_BASELINE");
+        const int baseline = b && *b && atoi(b) != 0;
+        const char *v = getenv("COLI_V4_HC_OMP");
+        cached = (v && *v) ? (atoi(v) != 0) : !baseline;
+    }
+    return cached;
+}
+
 int coli_v4_hc_pre(float *output, float *post, float *comb,
                    const float *input, const float *hc_fn,
                    const float scale[3], const float *base,
@@ -1456,11 +1484,23 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
         free(pre);
         return -1;
     }
+    if (coli_v4_hc_omp_enabled()) {
+        #pragma omp parallel for schedule(static)
+        for (int row = 0; row < mix_count; row++) {
+            float sum = 0.0f;
+            for (int column = 0; column < flattened; column++)
+                sum += hc_fn[(size_t)row * flattened + column] * input[column];
+            mixes[row] = sum * inverse_rms;
+        }
+        __atomic_fetch_add(&coli_v4_hc_omp_row_count,
+                           (unsigned long long)mix_count, __ATOMIC_RELAXED);
+    } else {
     for (int row = 0; row < mix_count; row++) {
         float sum = 0.0f;
         for (int column = 0; column < flattened; column++)
             sum += hc_fn[(size_t)row * flattened + column] * input[column];
         mixes[row] = sum * inverse_rms;
+    }
     }
     if (coli_v4_hc_split_sinkhorn(pre, post, comb, mixes, scale, base,
                                   hc, iterations, hc_eps) != 0) {
