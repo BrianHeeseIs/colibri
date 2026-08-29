@@ -3,6 +3,60 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+DeepSeek-V4 prefill performance on Apple silicon. Measured against the previous `KERNELS=all` CPU
+arm at p256 (N=3-5, non-overlapping ranges): **time to first token -48.2%, net wall at 40 tokens
+-38.5%**, tok/s -1.75%. Full evidence in `experiments_results.md` E114-E124.
+
+### Added
+
+- **Whole-prompt expert dispatch** (`COLI_V4_MOE_WHOLE_PROMPT`, on by default). The routed-expert
+  dispatch now runs once per prompt instead of once per 64-token chunk, so expert groups are ~1.94x
+  larger and dispatches are correspondingly wider. **-17.4% TTFT at p256 and -25.9% at p512** — the
+  gain grows with prompt length, because a longer prompt spans more chunks and the union of routed
+  experts is larger. Decode is unchanged. The Metal row share rises from 71.0% to 89.1%, moving 8554
+  rows off the CPU for 6.2 s less CPU work while GPU time stays flat within 13 ms: the extra rows
+  ride inside dispatches that are merely wider. Attention stays chunked at 64, so the existing
+  batch-size contract is untouched.
+- **`COLI_V4_MOE_TILE`** (default 1024 tokens) bounds the deferred dispatch buffers, which were
+  previously proportional to prompt length without limit (~940 MB at 8192 tokens). Now capped near
+  176 MB. `0` disables the bound.
+- **`COLI_V4_BASELINE=1`** restores every historical default in one move, for bit-exactness
+  differentials, regression triage and bisecting.
+- **`bench/golden_default.sh`**, a regression gate for the shipping configuration, checked against
+  `bench/GOLDEN_DEFAULT_MD5`.
+
+### Changed
+
+- **The engine now ships the measured-fastest stack by default.** `COLI_V4_KERNELS=all`,
+  `COLI_V4_MOE_GROUPED`, `COLI_V4_MOE_BATCHED`, `COLI_V4_MOE_BATCHED_ROWS16`,
+  `COLI_V4_MOE_WHOLE_PROMPT`, `COLI_V4_METAL_ATTN` and `COLI_V4_METAL_VARIANT=simd_exact_cold` all
+  default on. Individual flags still override. `COLI_V4_METAL` remains **off**: it gates
+  single-token decode on the GPU, which measured slower on this host.
+- **Metal prefill attention is on by default** — -21.0% TTFT and **bit-exact** across six runs, so
+  unlike the other gates it costs nothing in reproducibility. It was already prefill-only: the
+  enabling function has two call sites, both on the batch path, while single-token decode attention
+  contains no Metal references.
+- **Pinned hot (rows16) experts now reach the batched prefill dispatch** (`COLI_V4_MOE_BATCHED_ROWS16`),
+  taking the Metal row share from 52.9% to 71.0% for -7.3% TTFT. These groups had been refused for a
+  layout reason rather than a size one.
+- **`bench/golden.sh` now pins `COLI_V4_BASELINE=1`.** Because the default output is no longer
+  token-identical to the historical arm, golden would otherwise have failed. Rather than re-pin a
+  reference md5, the gate was split so the original value keeps guarding the deterministic path.
+
+### Notes
+
+- **The default output is no longer token-identical to the historical CPU arm.** It is
+  capability-equivalent, not byte-equal: the task-level gate scores 5/5 on every arm and the
+  differences are wording-level. Set `COLI_V4_BASELINE=1` when token identity is required.
+- `COLI_V4_PREFILL_PREFETCH=1` deadlocks in combination with the default GPU prefill stack; do not
+  enable it.
+- **Decode is unimproved.** Profiling attributes 99.3% of it, with a single scalar fp8 matvec worth
+  32.4%, whose 8-wide SIMD path is compiled for x86 only. A NEON port was written, proved bit-exact
+  and measured neutral — the loop is load-bound rather than compute-bound. The remaining lever is a
+  weight-layout change, recorded in E124.
+
 ## [1.1.1] — 2026-07-23
 
 A same-day patch release. **Windows users on v1.1.0 should upgrade**: Microsoft
