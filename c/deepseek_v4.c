@@ -13609,17 +13609,26 @@ static size_t coli_v4_fp8_rows16_budget_bytes(void) {
     return cached;
 }
 
-/* Pointer-keyed shadow cache. wo_a's eight group views carry distinct offset pointers and so get
- * eight distinct entries, which is correct and costs the same total bytes. */
+/* IN-PLACE layout state, keyed by the weight pointer.
+ * A side-by-side packed copy was measured and REJECTED: it cost +4.0 GB peak RSS (87.8 -> 91.8 GB
+ * on a 128 GB host already holding ~88 GB) and the resulting memory pressure ate the entire compute
+ * win -- decode went 23.345 -> 23.853 s and the run-to-run spread blew out to 20%. Capping the
+ * copies to 512 MB recovered parity (23.094 s) but no win. So the weights are permuted IN PLACE and
+ * this table records only WHICH pointers are currently in rows16 order.
+ * Prefill's batch path cannot read that order (it validates block_rows and rejects anything but
+ * 128/8), so it UNPACKS on demand. In a normal generation prefill runs once before decode, so the
+ * unpack fires zero times; it exists to keep multi-turn sessions correct rather than fast. */
 #define COLI_V4_FP8_R16_SLOTS 4096
 typedef struct {
     const uint8_t *key;
-    uint8_t *packed;
     int rows, columns;
 } ColiV4Fp8R16Entry;
 static ColiV4Fp8R16Entry coli_v4_fp8_r16_table[COLI_V4_FP8_R16_SLOTS];
-static size_t coli_v4_fp8_r16_bytes;
+static unsigned long long coli_v4_fp8_r16_unpacks;
 static pthread_mutex_t coli_v4_fp8_r16_lock = PTHREAD_MUTEX_INITIALIZER;
+unsigned long long coli_v4_fp8_rows16_unpacks(void) {
+    return __atomic_load_n(&coli_v4_fp8_r16_unpacks, __ATOMIC_RELAXED);
+}
 
 /* [tile][column][lane] : the 16 rows of a tile are contiguous for a given column, so one column is
  * exactly one vld1q_u8. Only whole 16-row tiles are packed; the O%16 remainder stays scalar. */
@@ -13632,31 +13641,69 @@ static void coli_v4_fp8_pack_rows16(uint8_t *dst, const uint8_t *src, int I, int
         }
 }
 
-static const uint8_t *coli_v4_fp8_rows16_get(const uint8_t *data, int rows, int columns) {
+static void coli_v4_fp8_unpack_rows16(uint8_t *dst, const uint8_t *src, int I, int tiles) {
+    for (int t = 0; t < tiles; t++)
+        for (int i = 0; i < I; i++) {
+            const uint8_t *o = src + ((size_t)t * I + i) * 16;
+            uint8_t *base = dst + (size_t)t * 16 * I + i;
+            for (int r = 0; r < 16; r++) base[(size_t)r * I] = o[r];
+        }
+}
+
+/* Permute `data` in place into rows16 order (or confirm it already is). Returns 1 on success.
+ * Transient cost is ONE tensor's worth of scratch, not a per-tensor permanent copy. */
+static int coli_v4_fp8_rows16_ensure(const uint8_t *data, int rows, int columns) {
     int tiles = rows / 16;
-    if (tiles < 1) return NULL;
-    size_t need = (size_t)tiles * columns * 16;
+    if (tiles < 1) return 0;
+    size_t bytes = (size_t)tiles * columns * 16;
     size_t h = ((uintptr_t)data >> 6) % COLI_V4_FP8_R16_SLOTS;
     pthread_mutex_lock(&coli_v4_fp8_r16_lock);
     for (size_t probe = 0; probe < COLI_V4_FP8_R16_SLOTS; probe++) {
         ColiV4Fp8R16Entry *e = &coli_v4_fp8_r16_table[(h + probe) % COLI_V4_FP8_R16_SLOTS];
         if (e->key == data && e->rows == rows && e->columns == columns) {
             pthread_mutex_unlock(&coli_v4_fp8_r16_lock);
-            return e->packed;
+            return 1;                              /* already packed */
         }
         if (!e->key) {
-            if (coli_v4_fp8_r16_bytes + need > coli_v4_fp8_rows16_budget_bytes()) break;
-            uint8_t *packed = malloc(need);
-            if (!packed) break;                    /* degrade to scalar, never fail */
-            coli_v4_fp8_pack_rows16(packed, data, columns, tiles);
-            e->key = data; e->packed = packed; e->rows = rows; e->columns = columns;
-            coli_v4_fp8_r16_bytes += need;
+            uint8_t *scratch = malloc(bytes);
+            if (!scratch) break;                   /* degrade to scalar, never fail */
+            coli_v4_fp8_pack_rows16(scratch, data, columns, tiles);
+            memcpy((uint8_t *)data, scratch, bytes);
+            free(scratch);
+            e->key = data; e->rows = rows; e->columns = columns;
             pthread_mutex_unlock(&coli_v4_fp8_r16_lock);
-            return packed;
+            return 1;
         }
     }
     pthread_mutex_unlock(&coli_v4_fp8_r16_lock);
-    return NULL;
+    return 0;
+}
+
+/* Restore row-major order if this pointer is packed. Called by any layout-unaware reader
+ * (the prefill batch path) so it can never observe rows16 bytes. */
+int coli_v4_fp8_rows16_release(const uint8_t *data) {
+    size_t h = ((uintptr_t)data >> 6) % COLI_V4_FP8_R16_SLOTS;
+    pthread_mutex_lock(&coli_v4_fp8_r16_lock);
+    for (size_t probe = 0; probe < COLI_V4_FP8_R16_SLOTS; probe++) {
+        ColiV4Fp8R16Entry *e = &coli_v4_fp8_r16_table[(h + probe) % COLI_V4_FP8_R16_SLOTS];
+        if (!e->key) break;
+        if (e->key == data) {
+            int tiles = e->rows / 16;
+            size_t bytes = (size_t)tiles * e->columns * 16;
+            uint8_t *scratch = malloc(bytes);
+            if (scratch) {
+                memcpy(scratch, data, bytes);
+                coli_v4_fp8_unpack_rows16((uint8_t *)data, scratch, e->columns, tiles);
+                free(scratch);
+                e->key = NULL;                     /* tombstone-free: probe stops at first empty */
+                __atomic_fetch_add(&coli_v4_fp8_r16_unpacks, 1ULL, __ATOMIC_RELAXED);
+            }
+            pthread_mutex_unlock(&coli_v4_fp8_r16_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&coli_v4_fp8_r16_lock);
+    return 0;
 }
 
 /* 16 e4m3 bytes -> 4 x float32x4, exact, NaN-correct. */
@@ -13810,9 +13857,10 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
 #endif
 #if defined(__aarch64__)
     if (coli_v4_fp8_rows16_enabled() && weight->block_rows == 128 && rows >= 16) {
-        const uint8_t *packed = coli_v4_fp8_rows16_get(weight->data, (int)rows, (int)columns);
-        if (packed) {
-            coli_v4_fp8_matvec_rows16(output, activation, packed, weight->data,
+        if (coli_v4_fp8_rows16_ensure(weight->data, (int)rows, (int)columns)) {
+            /* Tail rows (rows % 16) were never permuted, so the scalar remainder still reads them
+             * correctly from the same buffer. */
+            coli_v4_fp8_matvec_rows16(output, activation, weight->data, weight->data,
                                       (const float *)weight->scales,
                                       (int)columns, (int)rows, (int)rows / 16);
             COLI_V4_FP8_RELEASE();
@@ -13991,6 +14039,13 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
         weight->columns < 1 || weight->columns % 128 ||
         (weight->block_rows != 128 && weight->block_rows != 8) ||
         weight->block_columns != 128) return -1;
+#if defined(__aarch64__)
+    /* This path is layout-unaware. If decode permuted these bytes into rows16 order, restore them
+     * first. In a normal generation prefill precedes decode, so this fires zero times; it exists so
+     * a multi-turn session stays correct rather than fast. */
+    { extern int coli_v4_fp8_rows16_release(const uint8_t *data);
+      coli_v4_fp8_rows16_release(weight->data); }
+#endif
     size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
     size_t scale_rows = (rows + 127) / 128;
     size_t scale_columns = columns / 128;
