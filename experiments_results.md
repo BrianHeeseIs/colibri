@@ -5850,3 +5850,32 @@ Observed once, so it is recorded as a hazard rather than a fully characterised b
 23 minutes is unambiguous, and the mechanism is the one this repo has already been bitten by.
 **Do not enable both flags together**, and treat any future concurrent-expert-acquisition work as
 requiring the store's threading contract to be settled first.
+
+### E113b. Verification: the grouped-lane gain IS the GPU — and a naming defect in E110-E113
+Raised in review: the E111/E112 arms all set `COLI_V4_METAL=0`, so was the -13.9% TTFT actually
+GPU work, or just CPU-side row grouping? E109's engagement probe had used `COLI_V4_METAL=1`, so the
+question was never closed on the arms that produced the number.
+
+Closed now, running the **literal E111/E112 arm** (`COLI_V4_METAL=0 COLI_V4_KERNELS=all
+COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 COLI_V4_METAL_VARIANT=simd_exact_cold`), p256,
+`--max-tokens 1`:
+```
+metal_dispatches=2890
+v4_metal_reject ... layout=0 ok=2890
+v4_metal_simd_exact matmuls=8670          (= 3 x 2890: gate, up, down)
+moe_batched groups=2890 rows=25130 ms=8913.8 | cpu_rows=22342 cpu_ms=15701.4 | metal_row_share=52.9%
+```
+**The GPU is engaged and carrying 52.9% of prefill expert rows at 0.355 ms/row against the CPU
+path's 0.703 — 1.98x cheaper.** `COLI_V4_METAL=0` disables only the SINGLE-TOKEN DECODE Metal path
+(the one that loses, E105); the batched prefill seam is gated independently by
+`COLI_V4_MOE_BATCHED` and dispatches Metal regardless. The E111/E112 attribution to the GPU stands.
+
+**Naming defect, recorded so the ledger is not misread:** arms labelled `grouped_*` in E110-E112 are
+**GPU arms**, and arms labelled `cpu_*` are the CPU-only baseline. Naming the challenger after the
+scheduling change (`grouped`) rather than the backend (`gpu_prefill`) hid that the comparison is
+CPU-vs-GPU. Future arms should be named for the backend they exercise.
+
+**Scope limit on E113 that follows from this:** both prefetch arms omit `COLI_V4_MOE_GROUPED`, so
+neither engages Metal. E113 measures prefetch on the **pure-CPU path only**. Its interaction with
+the GPU prefill configuration is **unknown and currently untestable**, because that combination is
+the one that deadlocks.
