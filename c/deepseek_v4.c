@@ -13543,6 +13543,185 @@ static int coli_v4_fp8_scratch_enabled(void) {
     return cached > 0;
 }
 
+/* ============================ fp8 rows16 NEON decode path ============================
+ * E123 measured `coli_fp8_matvec_ref` at 32.4% of decode (attn_out 21.6% + attn_qkv 10.8%). Its
+ * only vector arm is `#ifdef __AVX2__` gated on block_rows==8, which `v4_fp8_pack_rows8_inplace`
+ * never produces on ARM, so Apple silicon runs the scalar `matmul_fp8` (quant.h:502).
+ *
+ * WHY A SHADOW COPY RATHER THAN AN IN-PLACE REPACK
+ * The same weight bytes are read by the PREFILL batch path (`coli_fp8_matmul_batch_ref`, :13801,
+ * which validates block_rows and returns -1 for anything but 128/8), by Metal prefill attention,
+ * by deepseek_v4_dspark.inc and by a second attention implementation. Repacking in place would
+ * break prefill outright. The packed copy therefore lives BESIDE the original and is consulted
+ * ONLY here, so every other reader is unaffected by construction.
+ * This is affordable because layers are resident: coli_v4_layer_load (:841-874) loads each layer
+ * once and returns stable pointers, so a shadow is built once and amortised over every token.
+ *
+ * WHY THIS KERNEL IS BIT-EXACT (and why E104 concluded it could not be)
+ * E104 held that 16-wide decode requires vectorising across COLUMNS within one row, which changes
+ * summation order. It does not: the 16 weights loaded per step are 16 DIFFERENT OUTPUT ROWS at the
+ * SAME column. Each lane owns one output row and accumulates serially over ascending columns, so
+ * the reference order is preserved exactly while the decode is 16 wide.
+ *
+ * THE DECODE
+ * e4m3 -> f16 by reinterpret: h = ((b & 0x80) << 8) | ((b & 0x7F) << 7)  =>  h == e4m3 / 256,
+ * then vcvt_f32_f16. Exact for every non-NaN code including subnormals (an e4m3 subnormal m*2^-9
+ * lands on the f16 subnormal m*2^-17; f16's smallest is 2^-24). The 2^8 folds into the block scale,
+ * exactly, as it is a power of two. e4m3 NaN (0x7F/0xFF) would map to a FINITE f16, so it needs an
+ * explicit compare+select -- see c/tests/test_fp8_rows16.c, which plants those codes deliberately.
+ * Measured 2.09-2.28x at the real shapes, bit-exact. Arithmetic decode was 0.70x; layout alone
+ * 1.04x. Do not "simplify" either of those back in. */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#include <pthread.h>   /* the engine build force-includes this; the unit tests do not */
+
+static unsigned long long coli_v4_fp8_rows16_tile_count;
+unsigned long long coli_v4_fp8_rows16_tiles(void) {
+    return __atomic_load_n(&coli_v4_fp8_rows16_tile_count, __ATOMIC_RELAXED);
+}
+void coli_v4_fp8_rows16_reset(void) {
+    __atomic_store_n(&coli_v4_fp8_rows16_tile_count, 0ULL, __ATOMIC_RELAXED);
+}
+
+/* -1 = follow the environment. Set explicitly by tests, which must toggle the path at RUNTIME:
+ * the env value is cached on first use (getenv on every matvec would cost ~20k calls per token),
+ * so without this hook the first arm of an A/B would latch the setting for the whole process. */
+static int coli_v4_fp8_rows16_force = -1;
+void coli_v4_fp8_rows16_set(int on) { coli_v4_fp8_rows16_force = on ? 1 : 0; }
+
+static int coli_v4_fp8_rows16_enabled(void) {
+    if (coli_v4_fp8_rows16_force >= 0) return coli_v4_fp8_rows16_force;
+    static int cached = -1;   /* benign race: both racers compute the same value */
+    if (cached < 0) {
+        const char *v = getenv("COLI_V4_FP8_ROWS16");
+        cached = (v && *v) ? (atoi(v) != 0) : 0;   /* default OFF until measured */
+    }
+    return cached;
+}
+static size_t coli_v4_fp8_rows16_budget_bytes(void) {
+    static size_t cached;
+    if (!cached) {
+        const char *v = getenv("COLI_V4_FP8_ROWS16_MAXMB");
+        long mb = (v && *v) ? atol(v) : 8192;      /* 8 GiB default cap */
+        if (mb < 0) mb = 0;
+        cached = (size_t)mb * 1024u * 1024u;
+    }
+    return cached;
+}
+
+/* Pointer-keyed shadow cache. wo_a's eight group views carry distinct offset pointers and so get
+ * eight distinct entries, which is correct and costs the same total bytes. */
+#define COLI_V4_FP8_R16_SLOTS 4096
+typedef struct {
+    const uint8_t *key;
+    uint8_t *packed;
+    int rows, columns;
+} ColiV4Fp8R16Entry;
+static ColiV4Fp8R16Entry coli_v4_fp8_r16_table[COLI_V4_FP8_R16_SLOTS];
+static size_t coli_v4_fp8_r16_bytes;
+static pthread_mutex_t coli_v4_fp8_r16_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* [tile][column][lane] : the 16 rows of a tile are contiguous for a given column, so one column is
+ * exactly one vld1q_u8. Only whole 16-row tiles are packed; the O%16 remainder stays scalar. */
+static void coli_v4_fp8_pack_rows16(uint8_t *dst, const uint8_t *src, int I, int tiles) {
+    for (int t = 0; t < tiles; t++)
+        for (int i = 0; i < I; i++) {
+            uint8_t *o = dst + ((size_t)t * I + i) * 16;
+            const uint8_t *base = src + (size_t)t * 16 * I + i;
+            for (int r = 0; r < 16; r++) o[r] = base[(size_t)r * I];
+        }
+}
+
+static const uint8_t *coli_v4_fp8_rows16_get(const uint8_t *data, int rows, int columns) {
+    int tiles = rows / 16;
+    if (tiles < 1) return NULL;
+    size_t need = (size_t)tiles * columns * 16;
+    size_t h = ((uintptr_t)data >> 6) % COLI_V4_FP8_R16_SLOTS;
+    pthread_mutex_lock(&coli_v4_fp8_r16_lock);
+    for (size_t probe = 0; probe < COLI_V4_FP8_R16_SLOTS; probe++) {
+        ColiV4Fp8R16Entry *e = &coli_v4_fp8_r16_table[(h + probe) % COLI_V4_FP8_R16_SLOTS];
+        if (e->key == data && e->rows == rows && e->columns == columns) {
+            pthread_mutex_unlock(&coli_v4_fp8_r16_lock);
+            return e->packed;
+        }
+        if (!e->key) {
+            if (coli_v4_fp8_r16_bytes + need > coli_v4_fp8_rows16_budget_bytes()) break;
+            uint8_t *packed = malloc(need);
+            if (!packed) break;                    /* degrade to scalar, never fail */
+            coli_v4_fp8_pack_rows16(packed, data, columns, tiles);
+            e->key = data; e->packed = packed; e->rows = rows; e->columns = columns;
+            coli_v4_fp8_r16_bytes += need;
+            pthread_mutex_unlock(&coli_v4_fp8_r16_lock);
+            return packed;
+        }
+    }
+    pthread_mutex_unlock(&coli_v4_fp8_r16_lock);
+    return NULL;
+}
+
+/* 16 e4m3 bytes -> 4 x float32x4, exact, NaN-correct. */
+static inline void coli_v4_e4m3_decode16(uint8x16_t b, float32x4_t out[4]) {
+    const uint16x8_t lo = vmovl_u8(vget_low_u8(b)), hi = vmovl_u8(vget_high_u8(b));
+    const uint16x8_t m80 = vdupq_n_u16(0x80), m7F = vdupq_n_u16(0x7F), qnan = vdupq_n_u16(0x7E00);
+    uint16x8_t h0 = vorrq_u16(vshlq_n_u16(vandq_u16(lo, m80), 8), vshlq_n_u16(vandq_u16(lo, m7F), 7));
+    uint16x8_t h1 = vorrq_u16(vshlq_n_u16(vandq_u16(hi, m80), 8), vshlq_n_u16(vandq_u16(hi, m7F), 7));
+    h0 = vbslq_u16(vceqq_u16(vandq_u16(lo, m7F), m7F), qnan, h0);
+    h1 = vbslq_u16(vceqq_u16(vandq_u16(hi, m7F), m7F), qnan, h1);
+    const float16x8_t f0 = vreinterpretq_f16_u16(h0), f1 = vreinterpretq_f16_u16(h1);
+    out[0] = vcvt_f32_f16(vget_low_f16(f0));  out[1] = vcvt_f32_f16(vget_high_f16(f0));
+    out[2] = vcvt_f32_f16(vget_low_f16(f1));  out[3] = vcvt_f32_f16(vget_high_f16(f1));
+}
+
+static void coli_v4_fp8_matvec_rows16(float *y, const float *x, const uint8_t *packed,
+                                      const uint8_t *raw, const float *bscale,
+                                      int I, int O, int tiles) {
+    const int64_t nblkI = fp8_nblk(I);
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < tiles; t++) {
+        const int o = t * 16;
+        const uint8_t *w = packed + (size_t)t * I * 16;
+        const float *sc = bscale + (o / FP8_BLOCK) * nblkI;   /* 128 % 16 == 0: one scale per tile */
+        double a[16];
+        for (int r = 0; r < 16; r++) a[r] = 0.0;
+        for (int64_t bi = 0; bi * FP8_BLOCK < I; bi++) {
+            int base = (int)(bi * FP8_BLOCK), blen = FP8_BLOCK;
+            if (base + blen > I) blen = I - base;
+            float32x4_t c0 = vdupq_n_f32(0), c1 = vdupq_n_f32(0),
+                        c2 = vdupq_n_f32(0), c3 = vdupq_n_f32(0);
+            for (int i = base; i < base + blen; i++) {
+                float32x4_t d[4];
+                coli_v4_e4m3_decode16(vld1q_u8(w + (size_t)i * 16), d);
+                const float xv = x[i];
+                c0 = vfmaq_n_f32(c0, d[0], xv); c1 = vfmaq_n_f32(c1, d[1], xv);
+                c2 = vfmaq_n_f32(c2, d[2], xv); c3 = vfmaq_n_f32(c3, d[3], xv);
+            }
+            const float sv = sc[bi] * 256.0f;     /* fold the reinterpret's 2^8; exact */
+            float tmp[16];
+            vst1q_f32(tmp + 0, c0); vst1q_f32(tmp + 4, c1);
+            vst1q_f32(tmp + 8, c2); vst1q_f32(tmp + 12, c3);
+            for (int r = 0; r < 16; r++) a[r] += (double)tmp[r] * sv;
+        }
+        for (int r = 0; r < 16; r++) y[o + r] = (float)a[r];
+    }
+    __atomic_fetch_add(&coli_v4_fp8_rows16_tile_count, (unsigned long long)tiles, __ATOMIC_RELAXED);
+    /* O % 16 remainder, scalar. Per-row arithmetic in the reference is independent of its o+=4
+     * grouping, so a per-row loop is bit-identical. */
+    for (int o = tiles * 16; o < O; o++) {
+        const uint8_t *w = raw + (size_t)o * I;
+        const float *sc = bscale + (o / FP8_BLOCK) * nblkI;
+        double a = 0.0;
+        for (int64_t bi = 0; bi * FP8_BLOCK < I; bi++) {
+            int base = (int)(bi * FP8_BLOCK), blen = FP8_BLOCK;
+            if (base + blen > I) blen = I - base;
+            float c = 0.0f;
+            for (int i = base; i < base + blen; i++) c += e4m3_decode(w[i]) * x[i];
+            a += (double)c * sc[bi];
+        }
+        y[o] = (float)a;
+    }
+}
+#endif /* __aarch64__ */
+
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !weight || !input ||
@@ -13627,6 +13806,18 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
             _mm256_storeu_ps(output + (size_t)tile * 8, sum);
         }
         COLI_V4_FP8_RELEASE(); return 0;
+    }
+#endif
+#if defined(__aarch64__)
+    if (coli_v4_fp8_rows16_enabled() && weight->block_rows == 128 && rows >= 16) {
+        const uint8_t *packed = coli_v4_fp8_rows16_get(weight->data, (int)rows, (int)columns);
+        if (packed) {
+            coli_v4_fp8_matvec_rows16(output, activation, packed, weight->data,
+                                      (const float *)weight->scales,
+                                      (int)columns, (int)rows, (int)rows / 16);
+            COLI_V4_FP8_RELEASE();
+            return 0;
+        }
     }
 #endif
     matmul_fp8(output, activation, weight->data, weight->scales,

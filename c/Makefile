@@ -859,6 +859,9 @@ tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h 
 tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
 
+tests/test_fp8_rows16$(EXE): tests/test_fp8_rows16.c deepseek_v4.c native_quant.h tensor.h quant.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
 V4_TEST_LINK_OBJS = \
