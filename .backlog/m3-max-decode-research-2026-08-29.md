@@ -434,3 +434,153 @@ External:
 Keep the shipping defaults for interactive use, explicitly add `COLI_V4_KERNELS=all` in serve mode, and do not enable single-token Metal merely because the GPU is present. The champion has largely solved TTFT; decode remains a memory-layout problem.
 
 The no-model gate has now produced a real winner: **packed-row16 FP8 with exact FP16 reinterpretation**. The next engineering step is guarded engine integration plus all-256-code/build-flag validation, not another generic SIMD rewrite. Real-shape kernels win 1.61-2.28x, supporting a derived **about 2.05 tok/s (+23%)** scenario only if the result transfers without packing or integration loss. A 12-versus-16 OpenMP-thread A/B is the cheapest separate host lever. MLX, new quantization, speculative transactions, and deeper Metal orchestration remain behind these gates.
+
+---
+
+# REVIEW + UPDATE — 2026-08-30, post-E125
+
+Reviewed against the shipped tree. **This document's headline recommendation has since been
+implemented and measured**, so the sections above are historically accurate but no longer current.
+Corrections first, then the re-ranked avenues.
+
+## 1. The P0 recommendation is DONE — with a smaller gain than projected
+
+The document's P0 ("integrate the measured 16-row interleave plus exact FP8-to-FP16
+reinterpretation kernel behind a guarded resident-layout tag") shipped as **E125**.
+
+| | this document projected | measured (E125, N=5, p256) |
+|---|---|---|
+| tok/s | 1.67 -> 2.05, **+23%** | 1.6655 -> **1.8350, +10.18%** |
+| decode | — | 23.417 -> **21.253 s, -9.24%** |
+| exactness | "must be validated" | **bit-exact**; both golden md5s unchanged, identical output across all 10 runs |
+| ranges | — | non-overlapping on both axes |
+
+**The +23% line should be retired.** It was the optimistic end, and this document's own Amdahl table
+bounded 2x-on-32.4% at 1.193x. The realised 1.102x is consistent with that bound: the kernel really
+does hit 2.09-2.28x at the real shapes, but the phases it accelerates also contain rope, bf16
+rounding and the **serial** activation QDQ, which the kernel does not touch.
+
+### What this document got RIGHT (all independently confirmed during implementation)
+- rows16 + exact E4M3->FP16 reinterpretation is the winning design (lines 34, 105).
+- E104's "no bit-exact arm64 kernel beats scalar" is refuted (line 117).
+- "cover all 256 E4M3 codes" (lines 105, 231). This is the real trap: the reinterpret maps the NaN
+  codes 0x7F/0xFF to a **finite** f16. The shipped test plants them deliberately, and deleting the
+  rescue was shown to fail every real shape with `ref=nan neon=42.59`.
+- "The resident layout can be memory-neutral ... only a temporary packing tile" (line 229).
+  **Stronger than stated: memory neutrality is REQUIRED, not merely possible.** The first
+  integration used a side-by-side packed copy. It was bit-exact and it *lost*: +4.0 GB peak RSS
+  (87.8 -> 91.8 GB on a 128 GB host already at ~88), decode 23.345 -> 23.853 s, and a 20% run
+  spread whose best run beat every baseline run while its worst was far worse. Permuting in place
+  gave +10.18%.
+- "Producer/consumer mismatch is the critical corruption hazard" (line 229) — exactly what bit:
+  `coli_fp8_matmul_batch_ref:13801` validates `block_rows` and returns -1 for anything but 128/8,
+  so a naive in-place repack makes **prefill hard-fail**. Resolved by having the layout-unaware
+  prefill path restore row-major on demand (it never fires in practice, since prefill precedes
+  decode).
+
+### What this document got WRONG
+- **Power state (line 47, 323, and the P0-operational candidate).** It reports "Low Power Mode
+  **Yes** on AC; High Power **No**". The host reads `powermode 2` in `pmset -g` **and** in the AC
+  profile of `pmset -g custom` (0=automatic, 1=low, 2=high). **High Power Mode is already on**, and
+  `pmset -g therm` records no thermal or performance warning. That candidate is **void — no gain
+  available**, and should not consume an operator-gated A/B.
+- It named the producer/consumer hazard abstractly but never traced the concrete reader set. It is:
+  `coli_fp8_matmul_batch_ref` (prefill), Metal prefill attention, `deepseek_v4_dspark.inc`, and a
+  **second attention implementation at :2346-2508** that the document does not mention at all.
+
+## 2. Re-profiled after the win (this document's own rule, line 160)
+
+p256, 39 generated tokens, defaults, no background load. **decode_wall 20977.5 ms, accounted 99.2%**
+(matches the N=5 median of 21253 ms, so it is trustworthy).
+
+| phase | ms | share | vs E123 |
+|---|---:|---:|---|
+| **`expert_forward`** | 7557.1 | **36.0%** | 7528.7 — unchanged; now the largest |
+| `attention` | 6697.6 | 31.9% | 8787.8, **-23.8%** |
+| &nbsp;&nbsp;`attn_out` | 3724.7 | 17.8% | 5046.9, -26.2% |
+| &nbsp;&nbsp;`attn_qkv` | 1767.9 | 8.4% | 2530.6, -30.1% |
+| &nbsp;&nbsp;`attn_sparse` | 1139.9 | 5.4% | unchanged |
+| `head` | 1399.6 | 6.7% | 1432.2 |
+| `expert_wait` | 1394.6 | 6.6% | 1320.5 |
+| `shared_expert` | 1372.6 | 6.5% | 1619.8, -15.3% |
+| `hc_norm` | 1092.4 | 5.2% | 1089.8 |
+
+E125 removed ~2337 ms of 23360 = **-10.0%**, independently reproducing the measured +10.18% tok/s.
+
+## 3. The biggest remaining phase is NOT the biggest remaining opportunity
+
+`expert_forward` is now 36.0%, and this document (and the in-code comment at `deepseek_v4.c:8519`)
+suggest raising `COLI_V4_PIN_SLOTS` so more experts reach the NEON rows16 kernel instead of the
+scalar `matmul_mxfp4`. **Measured directly, that is not a lever.**
+
+`.backlog/lab/kbench/fp4bench.c` (new; no model, calls the engine's own kernels) times the scalar
+and NEON paths head-to-head at the real expert shapes, with no pinning policy involved:
+
+| shape | scalar | NEON rows16 | speedup | bandwidth |
+|---|---:|---:|---:|---|
+| gate 2048x4096 | 0.253 ms | 0.222 ms | **1.14x** | 16.6 -> 18.9 GB/s |
+| up 2048x4096 | 0.271 ms | 0.237 ms | **1.14x** | 15.5 -> 17.7 GB/s |
+| down 4096x2048 | 0.240 ms | 0.232 ms | **1.03x** | 17.5 -> 18.1 GB/s |
+
+**E107 is vindicated** — and now by direct measurement rather than by inference from a pin sweep
+(which was confounded: pinning also raised `expert_wait` 66%). Converting *every* expert call to the
+existing NEON kernel would be at most ~1.1x on 36% of decode = **+3.5% whole**, before the wait cost.
+This is the opposite of the fp8 situation, where the scalar path had no SIMD at all and the gap was
+2.1x. **Close "raise pin coverage" as a decode lever.**
+
+Second-order, and the reason this phase is not finished: in *elements* per second the fp8 rows16
+kernel does ~66 G/s while the fp4 NEON does ~37.8 G/s, despite fp4 packing two elements per byte.
+Both fp4 kernels sit at 16-19 GB/s against the measured ~105 GB/s host ceiling. So a **better** fp4
+kernel plausibly exists — but the thing to beat is the existing NEON kernel, not the scalar one,
+which makes it a far larger and riskier project than E125 was.
+
+## 4. Three untouched instances of the exact bug class E125 fixed
+
+Each is an AVX2-only fast path with a scalar fallback on ARM, or a serial/allocating hot path.
+
+**(a) `head_bf16_dot` — best effort-to-value ratio remaining.** `c/deepseek_v4.c:9605-9631` is
+vectorised only under `#ifdef __AVX2__`, so M3 runs a scalar bf16 multiply-add. The head streams
+`vocab 129280 x hidden 4096 x 2 B = 1.059 GB per token` at ~29.5 GB/s against a ~105 GB/s ceiling.
+**bf16 -> f32 is a 16-bit left shift**, so vectorising is far simpler than the fp8 work was.
+Also `head_argmax` mallocs `scores[129280]` every token and `final_hidden` calls
+`coli_tensor_load_f32` on four tensors every token.
+
+**(b) `coli_fp8_dual_matvec_ref` — direct extension of already-shipped code.** `:13943-14014` has
+**no** rows16 path; E125 covered only the single matvec. It falls to scalar `matmul_fp8_dual`
+(`quant.h:542`) and mallocs per call. It is the gate/up of `shared_expert`, i.e. roughly two thirds
+of that 6.5% is still scalar. The kernel, the packer and the test harness all already exist.
+
+**(c) `hc_norm` is fully serial.** `normalized_hc_pre` (:3657), `coli_v4_hc_pre` (:1436) and the
+sinkhorn split (:1400) contain **no OpenMP at all**, run twice per layer per token, and malloc three
+times per call — 5.2% of decode running single-threaded on a 16-thread machine.
+
+**(d) Allocation churn.** ~30+ malloc/free per layer per token (block_token_pipeline 7,
+attention_token_impl 8, hc/sinkhorn 3+, compressor 5, indexer 7+, moe_token_pipeline 6), order
+**50,000 malloc/free pairs per 39-token generation**. Precedent that this is real: E102/E103 removed
+two mallocs per call from the fp8 matvec and it mattered.
+
+## 5. Re-ranked avenues (Amdahl ceilings from the profile in section 2)
+
+| # | avenue | share | ceiling | cost | risk | basis |
+|---|---|---:|---|---|---|---|
+| 1 | `head_bf16_dot` NEON + drop per-token `scores`/tensor-load allocs | 6.7% | 2x -> **+3.5%**, 3x -> +4.7% | low | low | bf16->f32 is a shift; same bug class as E125, measured |
+| 2 | rows16 path for `coli_fp8_dual_matvec_ref` (+ scratch) | ~4.4% eff. | 2x -> **+2.2%** | low | low | kernel/packer/test already exist and are proven |
+| 3 | Parallelise + de-malloc `hc_norm` | 5.2% | 4x -> **+4.1%** | low-med | low | currently 0 threads of 16; measured serial |
+| 4 | Global scratch-buffer pass on the decode path | unattributed | unquantified | med | low | E102/E103 precedent; ~50k malloc/free per generation |
+| 5 | `OMP_NUM_THREADS=12` (P-cores only) | n/a | unknown | zero code | low | V4 never adopted `omp_tune.h`; its own policy is P-core-only |
+| 6 | A *better* fp4 expert kernel (beat the existing NEON) | 36.0% | 2x -> **+22%** | **high** | high | 37.8 vs 66 G elem/s and 18 of 105 GB/s => headroom is real |
+| 7 | `expert_wait` restructuring | 6.6% | 2x -> +3.4% | med-high | med | condvar, 2 waits per expert call |
+| — | ~~raise `COLI_V4_PIN_SLOTS`~~ | — | **closed** | — | — | kernels within 1.03-1.14x (section 3) |
+| — | ~~High Power Mode A/B~~ | — | **closed** | — | — | already `powermode 2` on AC |
+
+Items 1-3 compound to about **+10.1%** and are all low risk, all the same class of defect, and all
+smaller than the work already completed. That is the recommended next block. Item 6 is the only path
+to a large step, and it should not start until 1-3 are banked and the profile is re-taken.
+
+## 6. Methodology note earned this session
+
+**Do not run a timing benchmark while background agents are in flight.** A profile taken while two
+explore agents ran reported `decode_wall` 28500 ms and `expert_forward` 13290 ms — a fake 76% jump.
+`ps -Ao pcpu -r` showed the agent host at 235% CPU with load average 5.72; the engine takes 16 OMP
+threads, so any concurrent agent competes directly. The clean re-run gave 20977 ms. `AGENTS.md`
+enforces "one engine at a time" but says nothing about agent CPU load; it should.
