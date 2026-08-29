@@ -1,0 +1,5 @@
+COLI_V4_MOE_WHOLE_PROMPT engagement, p256, --max-tokens 1, champion stack, MOE_GROUPED_STATS=1
+OFF: groups=3550 metal_rows=33721 share=71.0% cpu_rows=13751 cpu_ms=10034.8 metal_ms=8279.6
+ON : groups=3095 metal_rows=42275 share=89.1% cpu_rows= 5197 cpu_ms= 3807.9 metal_ms=8292.4
+hist N=1  OFF 4556 -> ON 1446   N=2 2415 -> 944   N=3 1455 -> 621   N>=32 170 -> 224
+Groups FEWER (3550->3095) and BIGGER; 8554 rows move CPU->GPU; CPU time -6227 ms; Metal time FLAT +13 ms.

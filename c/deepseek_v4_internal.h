@@ -540,6 +540,30 @@ int coli_v4_block_window_token_ref(
 /* amalgamated: deepseek_v4_layer.h */
 #include "expert_store.h"
 
+/* #10 whole-prompt MoE. The dispatch is hoisted out of the 64-token chunk loop so one call sees
+ * every row of the prompt (E117: mean expert group 4.14 -> 7.97, and layers clearing MIN_N=4 go
+ * from 29/43 to 43/43). The chunk loop already sits inside the layer loop and `state`/`next` are
+ * whole-prompt buffers swapped only after all chunks, so no re-nesting is needed and the batch<=64
+ * contract -- which binds attention and the matmul entries, not the grouped MoE -- is untouched.
+ * Set by target_batch (GENERATE_STATS unit) per chunk, read by coli_v4_block_window_batch_ref
+ * (BLOCK_HYBRID unit); NULL means the flag is off and every path is bit-for-bit unchanged. */
+typedef struct {
+    float *states;         /* chunk slice of the whole-prompt post-attention state */
+    float *ffn_normalized; /* chunk slice of the whole-prompt FFN-normalised rows */
+    float *ffn_post;
+    float *ffn_comb;
+} ColiV4MoEDefer;
+extern ColiV4MoEDefer *coli_v4_moe_defer;
+int coli_v4_moe_whole_prompt_enabled(void);
+
+/* Runs the hoisted dispatch for one layer plus the deferred hyper-connection combine into
+ * `outputs_hc`. Lives in BLOCK_HYBRID because coli_v4_moe_grouped_batch is static there. */
+int coli_v4_block_window_layer_finish(
+    float *outputs_hc, const ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
+    float *scratch_branch, const float *wp_states, const float *wp_normalized,
+    const float *wp_post, const float *wp_comb, const int *tokens, int batch);
+
 int coli_v4_block_window_batch_ref(
     float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
     const ColiDeepSeekV4LayerWeights *weights,

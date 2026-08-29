@@ -5134,6 +5134,33 @@ static int coli_v4_moe_batched_rows16(void) {
     pthread_once(&coli_v4_moe_grouped_once, coli_v4_moe_grouped_init);
     return coli_v4_moe_batched_rows16_value;
 }
+
+/* #10 whole-prompt MoE. The chunk loop in target_batch already sits INSIDE the layer loop, and
+ * `state`/`next` are whole-prompt buffers swapped only after every chunk of that layer, so the
+ * expert dispatch can be hoisted out of the chunk loop without re-nesting anything and without
+ * touching the batch<=64 contract -- that contract binds attention and the matmul entries
+ * (E108, four sites), NOT coli_v4_moe_grouped_batch, which has no batch cap.
+ * Motivation (E117): mean expert group size 4.14 at 64-token chunk scope vs 7.97 across the whole
+ * prompt, a 1.942x enlargement, taking layers whose mean clears MIN_N=4 from 29/43 to 43/43. The
+ * GPU wins at S=4 (1.68-2.41x) and loses at S=1 (0.40x), so bigger dispatches -- not a lower
+ * threshold -- is the mechanism.
+ * The context is a global rather than a new parameter to match the existing
+ * coli_v4_prefill_route_cache pattern and to avoid changing the signature at seven call sites;
+ * the prefill chunk loop is sequential, so this is safe. Default OFF: with the flag unset the
+ * pointer stays NULL and every path below is bit-for-bit unchanged. */
+ColiV4MoEDefer *coli_v4_moe_defer;   /* declared in deepseek_v4_internal.h */
+
+int coli_v4_moe_whole_prompt_enabled(void) {
+    static int cached = -1;   /* benign race: both racers compute the same value */
+    if (cached < 0) {
+        const char *v = getenv("COLI_V4_MOE_WHOLE_PROMPT");
+        cached = (v && *v && atoi(v) != 0);
+    }
+    /* Only meaningful on the grouped path -- the scalar path interleaves the MoE per item, so
+     * there is nothing to hoist. Checked here so callers in other units need not see the
+     * static coli_v4_moe_grouped_enabled(). */
+    return cached && coli_v4_moe_grouped_enabled();
+}
 #endif
 
 static int coli_v4_moe_grouped_stats_enabled(void) {
@@ -5729,6 +5756,8 @@ int coli_v4_block_window_batch_ref(
         !inputs_hc || !tokens || batch < 1 || batch > 64) return -1;
     int d = config->hidden_size, hc = config->hc_mult;
     int grouped_moe = coli_v4_moe_grouped_enabled();
+    /* Only the grouped path can defer; the scalar path interleaves MoE per item. */
+    ColiV4MoEDefer *defer = grouped_moe ? coli_v4_moe_defer : NULL;
     size_t hd = (size_t)hc * d;
     float *states = malloc((size_t)batch * hd * sizeof(*states));
     float *normalized = malloc((size_t)batch * d * sizeof(*normalized));
@@ -5814,7 +5843,7 @@ int coli_v4_block_window_batch_ref(
             COLI_V4_PREFILL_TRACE_ATTENTION,
             coli_v4_prefill_trace_now_ns() - trace_began);
 #endif
-    if (!result && coli_v4_prefill_routeahead_enabled()) {
+    if (!result && !defer && coli_v4_prefill_routeahead_enabled()) {
 #ifdef COLI_V4_PREFILL_TRACE
         trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
 #endif
@@ -5906,8 +5935,14 @@ int coli_v4_block_window_batch_ref(
 #endif
     }
     if (!result && grouped_moe) {
+        /* When deferring, step A's products go straight into the caller's whole-prompt buffers so
+         * that the single hoisted dispatch can see every row of the prompt at once. */
+        float *st_dst = defer ? defer->states         : states;
+        float *fp_dst = defer ? defer->ffn_post       : ffn_post_batch;
+        float *fc_dst = defer ? defer->ffn_comb       : ffn_comb_batch;
+        float *fn_dst = defer ? defer->ffn_normalized : ffn_normalized_batch;
         for (int item = 0; !result && item < batch; item++) {
-            float *state = states + (size_t)item * hd;
+            float *state = st_dst + (size_t)item * hd;
 #ifdef COLI_V4_PREFILL_TRACE
             trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
 #endif
@@ -5926,9 +5961,9 @@ int coli_v4_block_window_batch_ref(
 #endif
             if (!result) phase = "FFN hyper-connection";
             if (!result) result = normalized_hc_pre(
-                reduced, ffn_post_batch + (size_t)item * hc,
-                ffn_comb_batch + (size_t)item * hc * hc,
-                ffn_normalized_batch + (size_t)item * d, state,
+                reduced, fp_dst + (size_t)item * hc,
+                fc_dst + (size_t)item * hc * hc,
+                fn_dst + (size_t)item * d, state,
                 weights, config, "ffn", "ffn_norm.weight");
 #ifdef COLI_V4_PREFILL_TRACE
             if (trace_prefill)
@@ -5941,7 +5976,7 @@ int coli_v4_block_window_batch_ref(
 #ifdef COLI_V4_PREFILL_TRACE
         trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
 #endif
-        if (!result) result = coli_v4_moe_grouped_batch(
+        if (!result && !defer) result = coli_v4_moe_grouped_batch(
             ffn_branch_batch, weights, config, experts,
             ffn_normalized_batch, tokens, batch);
 #ifdef COLI_V4_PREFILL_TRACE
@@ -5950,7 +5985,7 @@ int coli_v4_block_window_batch_ref(
                 COLI_V4_PREFILL_TRACE_MOE,
                 coli_v4_prefill_trace_now_ns() - trace_began);
 #endif
-        for (int item = 0; !result && item < batch; item++) {
+        for (int item = 0; !result && !defer && item < batch; item++) {
 #ifdef COLI_V4_PREFILL_TRACE
             trace_began = trace_prefill ? coli_v4_prefill_trace_now_ns() : 0;
 #endif
@@ -6000,6 +6035,31 @@ int coli_v4_block_window_batch_ref(
     if (!result) return 0;
     if (error && error_size && error[0]) return -1;
     return set_error(error, error_size, "hybrid batched block failed in %s", phase);
+}
+
+int coli_v4_block_window_layer_finish(
+    float *outputs_hc, const ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
+    float *scratch_branch, const float *wp_states, const float *wp_normalized,
+    const float *wp_post, const float *wp_comb, const int *tokens, int batch) {
+    if (!outputs_hc || !weights || !config || !experts || !scratch_branch ||
+        !wp_states || !wp_normalized || !wp_post || !wp_comb || !tokens || batch < 1)
+        return -1;
+    int d = config->hidden_size, hc = config->hc_mult;
+    size_t hd = (size_t)hc * d;
+    /* ONE dispatch for the whole prompt. Deliberately not chunked: the entire point is that the
+     * expert groups are ~1.94x larger here, which is where the GPU wins (S=4 is 1.68-2.41x, S=1
+     * only 0.40x). coli_v4_moe_grouped_batch has no batch cap. */
+    int result = coli_v4_moe_grouped_batch(
+        scratch_branch, weights, config, experts, wp_normalized, tokens, batch);
+    for (int item = 0; !result && item < batch; item++) {
+        result = coli_v4_hc_post(
+            outputs_hc + (size_t)item * hd, scratch_branch + (size_t)item * d,
+            wp_states + (size_t)item * hd, wp_post + (size_t)item * hc,
+            wp_comb + (size_t)item * hc * hc, hc, d);
+        if (!result) coli_bf16_round_array(outputs_hc + (size_t)item * hd, hd);
+    }
+    return result;
 }
 #endif /* COLI_V4_UNIT_BLOCK_HYBRID */
 
@@ -9983,13 +10043,46 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     }
     float *state = *state_ptr, *next = *next_ptr;
     size_t hd = (size_t)config->hc_mult * config->hidden_size;
+    const int wp_d = config->hidden_size, wp_hc = config->hc_mult;
+    /* #10: hoist the MoE dispatch out of the chunk loop so it sees the whole prompt at once.
+     * Owned here rather than by the engine: target_batch already orchestrates both the chunk loop
+     * and the layer swap, and several of its callers pass engine==NULL. Allocated once, reused for
+     * every layer. Cost is prompt-proportional: states is ~21 MB at 184 tokens, ~235 MB at 2048. */
+    int whole_prompt = coli_v4_moe_whole_prompt_enabled() && batch > 1;
+    float *wp_states = NULL, *wp_norm = NULL, *wp_branch = NULL,
+          *wp_post = NULL, *wp_comb = NULL;
+    if (whole_prompt) {
+        /* coli_v4_hc_post reads every residual row while overwriting output rows, so the deferred
+         * state must not alias either ping-pong buffer. Callers do allocate them distinctly; assert
+         * it rather than trust it, because the failure mode is silent corruption. */
+        if (state == next) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "whole-prompt MoE requires distinct state/next buffers");
+            return -1;
+        }
+        wp_states = malloc((size_t)batch * hd * sizeof(*wp_states));
+        wp_norm   = malloc((size_t)batch * (size_t)wp_d * sizeof(*wp_norm));
+        wp_branch = malloc((size_t)batch * (size_t)wp_d * sizeof(*wp_branch));
+        wp_post   = malloc((size_t)batch * (size_t)wp_hc * sizeof(*wp_post));
+        wp_comb   = malloc((size_t)batch * (size_t)wp_hc * wp_hc * sizeof(*wp_comb));
+        if (!wp_states || !wp_norm || !wp_branch || !wp_post || !wp_comb) {
+            free(wp_comb); free(wp_post); free(wp_branch); free(wp_norm); free(wp_states);
+            if (error && error_size)
+                snprintf(error, error_size, "whole-prompt MoE allocation failed");
+            return -1;
+        }
+    }
+#define COLI_V4_WP_FREE() do { \
+    free(wp_comb); free(wp_post); free(wp_branch); free(wp_norm); free(wp_states); \
+} while (0)
 #ifdef COLI_M4_TRACE
     int m4_chunk_base = coli_m4_prefill_chunk;
 #endif
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
-                               error, error_size)) return -1;
+                               error, error_size)) { COLI_V4_WP_FREE(); return -1; }
         int result = 0;
         const int chunk_width = coli_v4_prefill_chunk_width();
         for (int offset = 0; !result && offset < batch; offset += chunk_width) {
@@ -9999,17 +10092,37 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
             if (coli_m4_prefill_active)
                 coli_m4_prefill_chunk = m4_chunk_base + offset / chunk_width;
 #endif
+            ColiV4MoEDefer defer_ctx;
+            if (whole_prompt) {
+                defer_ctx.states         = wp_states + (size_t)offset * hd;
+                defer_ctx.ffn_normalized = wp_norm   + (size_t)offset * (size_t)wp_d;
+                defer_ctx.ffn_post       = wp_post   + (size_t)offset * (size_t)wp_hc;
+                defer_ctx.ffn_comb       = wp_comb   + (size_t)offset * (size_t)wp_hc * wp_hc;
+                coli_v4_moe_defer = &defer_ctx;
+            }
             result = coli_v4_block_window_batch_ref(
                 next + (size_t)offset * hd, attention[layer_id],
                 &layer, config, experts, state + (size_t)offset * hd,
                 tokens + offset, start + offset, chunk, error, error_size);
+            coli_v4_moe_defer = NULL;
             if (result && error && error_size && !error[0])
                 snprintf(error, error_size,
                          "target prefill failed layer=%d offset=%d batch=%d",
                          layer_id, offset, chunk);
         }
+        /* One dispatch for the entire prompt, then the deferred combine. Nothing has written `next`
+         * yet this layer: in defer mode block_window skips both the dispatch and the combine, and
+         * on the grouped path those are its only writers of outputs_hc. */
+        if (!result && whole_prompt) {
+            result = coli_v4_block_window_layer_finish(
+                next, &layer, config, experts, wp_branch,
+                wp_states, wp_norm, wp_post, wp_comb, tokens, batch);
+            if (result && error && error_size && !error[0])
+                snprintf(error, error_size,
+                         "whole-prompt MoE failed layer=%d batch=%d", layer_id, batch);
+        }
         coli_v4_layer_free(engine, &layer);
-        if (result) return -1;
+        if (result) { COLI_V4_WP_FREE(); return -1; }
         float *swap = state; state = next; next = swap;
         for (int item = 0; item < batch; item++)
             v4_mainh_tap(config, layer_id, state + (size_t)item * hd,
@@ -10017,6 +10130,8 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     }
     *state_ptr = state;
     *next_ptr = next;
+    COLI_V4_WP_FREE();
+#undef COLI_V4_WP_FREE
     return 0;
 }
 

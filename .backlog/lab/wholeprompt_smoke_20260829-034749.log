@@ -1,0 +1,8 @@
+tok/s A/B  tokens=40  N=1  prompt=p256.txt
+  run1 wp_off                 ttft=  59.229s decode=  23.311s tok/s=1.6730   md5=c43906361980a053b6afa170fa8eddcf
+  run1 wp_on                  ttft=  49.248s decode=  23.999s tok/s=1.6251   md5=d06053793d8f66d4f69a3f7c810441e1
+
+SUMMARY (median tok/s)
+  wp_off                   1.6730 tok/s  baseline            deterministic  md5=c43906361980a053b6afa170fa8eddcf 
+  wp_on                    1.6251 tok/s  -2.86% tok/s        deterministic  md5=d06053793d8f66d4f69a3f7c810441e1 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.vlkhl2

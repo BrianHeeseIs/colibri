@@ -6083,3 +6083,69 @@ length-dependent. Six runs at p064, 40 tokens, champion vs the `KERNELS=all` CPU
 Note p064 is exactly ONE 64-token chunk, so this also confirms the two wins are **not** chunk-count
 dependent: `METAL_ATTN` and `rows16` both fire within a single chunk. By the same token it means
 whole-prompt MoE (#10) is **inert by construction at p064** and can only be measured at p256+.
+
+## E119. #10 whole-prompt MoE IMPLEMENTED — -17.4% TTFT, decode free. New champion.
+
+The only report item that needed code. `COLI_V4_MOE_WHOLE_PROMPT=1`, default OFF.
+
+### What made it small
+The report scoped this as a large restructure. It was not, because of a structural fact found while
+reading rather than assumed: **`target_batch`'s chunk loop already sits INSIDE the layer loop**
+(:10027-10046), `state`/`next` are whole-prompt buffers, and the ping-pong swap happens only after
+every chunk of that layer. So the dispatch could be hoisted with no re-nesting. And the `batch<=64`
+contract that E108 documents binds **attention and the matmul entries, not `coli_v4_moe_grouped_batch`**,
+which has no batch cap — so attention stays chunked at 64 and the contract is never touched.
+
+Implementation: a defer context (`ColiV4MoEDefer`, declared in `deepseek_v4_internal.h`) points at
+this chunk's slice of whole-prompt buffers owned by `target_batch`. In defer mode
+`coli_v4_block_window_batch_ref` runs only step A (attention post + FFN norm) into those slices and
+skips both the dispatch and the combine; `coli_v4_block_window_layer_finish` then runs ONE dispatch
+over the whole prompt plus the deferred combine. Route-ahead is skipped in defer mode — it is
+same-chunk machinery, confirmed both by reading and empirically (its loader gate is
+`n_unique <= capacity`, and `pin_slots_per_layer=16` against per-chunk `n_unique` of 170-188 means it
+can never fire here anyway).
+
+### Default OFF is bit-for-bit unchanged — verified, not asserted
+`wp_off` produced md5 `c43906361980a053b6afa170fa8eddcf` on all 3 runs: **exactly** the E116 champion
+hash. The new code is inert when the flag is unset.
+
+### Engagement proven before believing the timings (E101 rule)
+| | groups | Metal rows | `metal_row_share` | CPU rows | CPU ms | Metal ms |
+|---|---|---|---|---|---|---|
+| OFF | 3550 | 33721 | 71.0% | 13751 | 10034.8 | 8279.6 |
+| ON | **3095** | 42275 | **89.1%** | 5197 | **3807.9** | 8292.4 |
+
+Groups get FEWER and BIGGER, exactly the union effect E117 predicted (N=1 groups 4556 -> 1446,
+N=2 2415 -> 944). 8554 rows move CPU->GPU. **CPU time falls 6227 ms while Metal time is FLAT
+(+13 ms)** — the extra rows ride inside dispatches that are merely wider, which is precisely why this
+is worth doing and why lowering `MIN_N` would not have achieved it.
+
+### Result (p256, 40 tokens, N=3)
+| arm | TTFT median [range] | decode median | tok/s | md5 (3 runs) |
+|---|---|---|---|---|
+| `wp_off` | 59.307 [59.063, 59.613] | 23.185 | 1.6821 | `c4390636...` 3/3 |
+| **`wp_on`** | **48.970 [48.783, 49.235]** | 23.185 | 1.6821 | `d0605379...` 3/3 |
+
+- **TTFT -17.43%**, ranges non-overlapping.
+- **decode +0.00%** — identical medians, ranges overlap. The gain is free on the decode axis.
+- Each arm deterministic 3/3: a deterministic difference, not nondeterminism.
+- Text is paraphrase-level with meaning retained (`wp_on` reverts to the pre-`rows16` phrasing).
+  **`taskcheck` PASS**: both arms `11111` (5/5), stable 2/2.
+
+### Cumulative, against the E114 `cpu_only` baseline
+**TTFT -48.19%** (94.524 -> 48.970 s), **net wall @40 tokens -38.49%** (117.30 -> 72.16 s),
+tok/s -1.75%.
+
+### Costs and limits
+- Memory is prompt-proportional: `states` is ~21 MB at 184 tokens but ~235 MB at 2048. If that bites,
+  the next step is to tile only the deferred finish pass, never the attention contract.
+- **Inert by construction at p064** (one 64-token chunk), so it can only be measured at p256+.
+- Guards per Oracle: fails if `state == next`, since `coli_v4_hc_post` reads every residual row while
+  overwriting output rows and would silently corrupt on aliasing.
+
+### New champion
+```bash
+COLI_V4_METAL=0 COLI_V4_KERNELS=all COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 \
+COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED_ROWS16=1 \
+COLI_V4_MOE_WHOLE_PROMPT=1
+```

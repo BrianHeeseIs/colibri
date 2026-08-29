@@ -122,6 +122,20 @@ present-but-wrong seed corrupts results silently. Sync from the durable copy bef
 `.backlog/lab/tokps.sh` and `.backlog/lab/taskcheck.sh` verify the md5 and abort loudly.
 
 ## Fastest known setting
+**SUPERSEDED 2026-08-29 (E114-E119).** The fastest known setting is now the GPU-prefill stack:
+```bash
+COLI_V4_METAL=0 COLI_V4_KERNELS=all COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 \
+COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED_ROWS16=1 \
+COLI_V4_MOE_WHOLE_PROMPT=1
+```
+Against the `KERNELS=all` CPU arm below: **TTFT -48.2%, net wall @40 tokens -38.5%, tok/s -1.75%**
+at p256 (N=3-5, non-overlapping ranges). `COLI_V4_METAL=0` still disables single-token decode Metal;
+prefill attention, batched MoE and the whole-prompt dispatch are gated independently. Do NOT combine
+with `COLI_V4_PREFILL_PREFETCH=1` (deadlocks, E113). Output is not token-identical to the CPU arm;
+capability was gated with `taskcheck` (5/5) at every step. The section below is retained because it
+remains the fastest DETERMINISTIC-ish reference and the basis of every comparison.
+
+## Fastest known CPU-only setting (historical baseline)
 **`COLI_V4_KERNELS=all`, with Metal OFF** — measured -10.4 / -18.0 / -20.2 % TTFT and
 +16.7 / +12.1 / +20.1 % tok/s at p064 / p256 / p512. Keep it **OFF** for golden, bit-exactness
 differentials, and regression triage: its output is nondeterministic at short prompts (two variants
