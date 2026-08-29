@@ -5967,3 +5967,58 @@ COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1
 `COLI_V4_METAL=0` still disables single-token decode Metal; prefill attention and batched MoE are
 gated independently. Adding `METAL_ATTN=1` is free on the decode axis and bit-exact, so unlike
 `KERNELS=all` it carries no reproducibility cost.
+
+## E116. `COLI_V4_MOE_BATCHED_ROWS16=1` — -7.3% TTFT, capability identical. E97's revert was wrong.
+
+Report item #7. Like #8, this needed **no code**: `COLI_V4_MOE_BATCHED_ROWS16` is an existing flag
+(deepseek_v4.c:5100). `coli_v4_moe_layout_batchable` (:5195) admits `block_rows==1` always but
+`block_rows==16` only when the flag is set; otherwise those groups are refused and fall to CPU.
+rows16 == the hot-pinned experts (`COLI_V4_PIN_SLOTS`, :8442). The in-code comment at :5497 justifies
+the default-off as "rows16 has no such [bit-exactness] proof, so it keeps the CPU path" — that is the
+E97 reasoning AGENTS.md records as mistaken.
+
+**Engagement proven first** (`COLI_V4_MOE_GROUPED_STATS=1`, `--max-tokens 1`):
+
+| | groups | Metal rows | `metal_row_share` | CPU rows | CPU ms | Metal ms |
+|---|---|---|---|---|---|---|
+| rows16=0 | 2881 | 25093 | 52.9% | 22379 | 15775.0 | 6773.2 |
+| rows16=1 | 3550 | 33721 | **71.0%** | 13751 | 10072.8 | 8315.3 |
+
+8628 rows move CPU->GPU; CPU work falls 5702 ms against 1542 ms added on Metal, predicting ~4.2 s.
+**Measured saving was 4.68 s** — the counter model held.
+
+Six runs, p256, 40 tokens, on top of the E115 stack:
+
+| arm | TTFT median [range] | decode median | tok/s | md5 (3 runs) |
+|---|---|---|---|---|
+| `attn` | 63.944 [63.790, 64.020] | 23.169 | 1.6833 | `9a5cb002...` 3/3 |
+| **`attn_rows16`** | **59.265 [58.922, 59.395]** | 23.185 | 1.6821 | `c4390636...` 3/3 |
+
+- **TTFT -7.32%**, ranges non-overlapping.
+- **decode +0.07%, ranges overlap** — flat, unresolved and immaterial.
+- **Each arm reproduced its own md5 3/3.** This is a *deterministic difference*, not nondeterminism —
+  the distinction AGENTS.md requires before using the word "breaks".
+
+### The md5 differs. The text was read, per AGENTS.md, before drawing any conclusion.
+```
+attn        : "You have accurately described the core mechanics of Mixture of Experts (MoE) in
+               transformers, and you've pinpointed the exact optimization opportunity during prefill."
+attn_rows16 : "You've provided an excellent description of the core mechanics of Mixture of Experts
+               (MoE) within the Transformer architecture, and you've correctly identified the key
+               optimization opportunity during the prefill phase."
+```
+Same claim, different wording. **This divergence is larger than E97's** (which was one token in sixty,
+`FFN layers.`/`FFN layer.`) — it is paraphrase-level, so it is recorded as such rather than as
+near-identity. Meaning is retained, which is this project's stated bar.
+
+**Capability gate: `taskcheck` PASS.** Both arms `11111` (5/5), stable 2/2. Capability identical.
+
+### New champion
+```bash
+COLI_V4_METAL=0 COLI_V4_KERNELS=all COLI_V4_MOE_GROUPED=1 COLI_V4_MOE_BATCHED=1 \
+COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED_ROWS16=1
+```
+Against the E114 `cpu_only` baseline: **TTFT -37.30%** (94.524 -> 59.265 s), **net wall @40 tokens
+-29.71%** (117.30 -> 82.45 s), tok/s -1.75%. Break-even ~3400 generated tokens.
+Note `METAL_VARIANT=simd_exact_cold` targets cold experts while rows16 are the hot pins — they are
+disjoint expert sets, which is why the two gains compose additively rather than competing.

@@ -1,0 +1,25 @@
+v4_kernels active=attn_sparse,router
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/Users/cptn/workbench/ai/colibri/models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_cli mode=chat memory=limited target_only=1
+v4_dense_resident layers=43 bytes=6.267GiB
+1. 391
+2. Canberra
+3. 6
+4. Au
+5. Yes<｜end▁of▁sentence｜>
+v4_tokens prompt=73 generated=22 total=95 expert_requests=14973 hits=10049 misses=4894 hit_rate=67.114 bytes=65429569536 target_only=1
+generated_text=1. 391
+2. Canberra
+3. 6
+4. Au
+5. Yes
+timing time_to_first_token=26.846s after_first=12.504s
+v4_rows16 packed_slots=755
+v4_direct reads=4894 flock_reads=0 fallbacks=0 payload_bytes=61580771328
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=429 metal_fp8_upload_mb=1.1
+metal_fp8_ms total=2768.6 memcpy_in=11.1 dispatch_wait=2724.6 memcpy_out=32.7
+fp8_qdq_ms=463.8 fp8_qdq_melems=54.6

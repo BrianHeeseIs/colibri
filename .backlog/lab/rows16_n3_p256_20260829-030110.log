@@ -1,0 +1,12 @@
+tok/s A/B  tokens=40  N=3  prompt=p256.txt
+  run1 attn                   ttft=  63.944s decode=  23.412s tok/s=1.6658   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run1 attn_rows16            ttft=  59.265s decode=  23.031s tok/s=1.6934   md5=c43906361980a053b6afa170fa8eddcf
+  run2 attn                   ttft=  64.020s decode=  23.169s tok/s=1.6833   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run2 attn_rows16            ttft=  59.395s decode=  23.416s tok/s=1.6655   md5=c43906361980a053b6afa170fa8eddcf
+  run3 attn                   ttft=  63.790s decode=  22.973s tok/s=1.6976   md5=9a5cb00223b4beaad728e0e7e46f8173
+  run3 attn_rows16            ttft=  58.922s decode=  23.185s tok/s=1.6821   md5=c43906361980a053b6afa170fa8eddcf
+
+SUMMARY (median tok/s)
+  attn                     1.6833 tok/s  baseline            deterministic  md5=9a5cb00223b4beaad728e0e7e46f8173 
+  attn_rows16              1.6821 tok/s  -0.07% tok/s        deterministic  md5=c43906361980a053b6afa170fa8eddcf 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.vo4zkM

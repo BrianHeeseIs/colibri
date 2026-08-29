@@ -1,0 +1,11 @@
+task-level correctness gate  tokens=120  N=2  checks=5
+  run1 attn           correctness=11111 (5/5)
+  run1 attn_rows16    correctness=11111 (5/5)
+  run2 attn           correctness=11111 (5/5)
+  run2 attn_rows16    correctness=11111 (5/5)
+
+VERDICT
+  attn           vectors=11111          stable=2/2
+  attn_rows16    vectors=11111          stable=2/2
+  PASS - capability identical across arms (vector 11111)
+  transcripts: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//taskcheck.tDVoQH
