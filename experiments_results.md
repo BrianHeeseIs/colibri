@@ -6316,3 +6316,47 @@ floor), while `expert_wait` rises monotonically by 66% and total decode wall get
 Whatever E107 measured, raising pins does not convert into decode time here. **Do not re-run this**;
 if the claim is revisited, instrument which kernel each expert call actually takes rather than
 inferring it from the pin count.
+
+## E124. NEON fp8 matvec: BIT-EXACT but WORTHLESS — the kernel is load-bound, not compute-bound
+
+Acting on E123, I wrote a NEON fast path for `coli_fp8_matvec_ref`, mirroring `matmul_fp8`'s structure
+exactly: same `o+=4` blocking, same per-128-block float accumulator, same double-precision scale
+accumulation, with the four scalar accumulators `acc0..acc3` becoming the four lanes of one vector so
+each lane performs precisely the sequence its scalar counterpart did. `vmulq`+`vaddq` rather than
+`vfmaq`, deliberately, so the two roundings are preserved.
+
+**It is bit-exact — and that is verified, not argued:** with the kernel enabled,
+`bench/golden.sh` PASS (sacred md5 `5d04890413ff539e802985ce8c727814`) and the default-path hash is
+`cc09015d089d9a25d10d75753f9e849a`, unchanged. So this is a clean measurement of the kernel alone.
+
+**It buys nothing.** p256, 40 tokens, `COLI_V4_PROFILE=1`:
+
+| | `attn_out` | `attn_qkv` | `attention` | decode wall |
+|---|---|---|---|---|
+| scalar | 5014.5 | 2508.8 | 8729.0 | 23235.2 |
+| NEON | 5055.1 | 2523.2 | 8796.5 | 23513.5 |
+
+Every number is marginally **worse**, all within noise. Replacing eight scalar FP ops per iteration
+with two vector ops moved nothing.
+
+### Why — and the correction this forces to E123
+E123 called the AVX2 path "a port of an algorithm already present". **That was wrong**, and the error
+matters. The inner loop's cost is not arithmetic, it is loads: per iteration it does four `E4M3_LUT`
+lookups plus four weight-byte loads from four **different rows**, i.e. four separate cache lines,
+against one activation load. Widening the arithmetic cannot help a loop that is waiting on memory.
+
+The AVX2 path is not merely "the same thing with SIMD" — it is gated on `block_rows == 8` and indexes
+`data + (tile*columns + column)*8`, a layout in which **eight output rows' bytes are contiguous**.
+Its speed comes from the interleaved layout, and the SIMD follows from it. Our weights use
+`block_rows == 128` (row-major), so that path is unavailable regardless of instruction set.
+
+The neutral kernel was **reverted** rather than left behind a flag: it is not a stepping stone,
+because a layout-aware kernel would be structured completely differently and would reuse none of it.
+
+### What would actually work (for whoever picks this up)
+1. **Repack fp8 weights row-interleaved** (the `block_rows == 8` layout), then write the NEON kernel
+   against that. This is the real lever and it is a weight-layout change, not a kernel tweak.
+2. **Decode e4m3 arithmetically in-register** (bit manipulation instead of `E4M3_LUT`), removing four
+   dependent table loads per iteration. Handles subnormals/NaN via selects; changes no ordering.
+Either is a substantial piece of work. Do not attempt another drop-in SIMD port of the current loop —
+that experiment is done, and this entry is the receipt.
