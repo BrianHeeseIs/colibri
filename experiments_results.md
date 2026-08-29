@@ -6191,3 +6191,40 @@ E119a predicted from counters alone that the benefit scales with prompt length. 
   improvement**. Decode remains untouched by this change, consistent with p256's +0.00%.
 
 Practical reading: at p512 this single flag removes 30 seconds of wall clock from the first token.
+
+## E121. The engine now ships the champion stack by default
+
+Operator decision. Every performance gate validated in E114-E120 now defaults **ON**:
+`KERNELS=all`, `MOE_GROUPED`, `MOE_BATCHED`, `MOE_BATCHED_ROWS16`, `MOE_WHOLE_PROMPT`, `METAL_ATTN`,
+and `METAL_VARIANT=simd_exact_cold`. `COLI_V4_METAL` deliberately stays **OFF** — it gates
+single-token DECODE Metal, measured slower here (E99). Individual flags still override, so
+`COLI_V4_MOE_BATCHED=0` disables exactly that gate.
+
+**`COLI_V4_BASELINE=1` restores every historical default in one move.**
+
+### The golden problem, and why the sacred md5 was NOT re-pinned
+Shipping the champion by default changes the engine's default output, so `bench/golden.sh` would
+have failed. AGENTS.md calls its md5 sacred and forbids editing the expected value to make something
+pass. Re-pinning it would also have destroyed what it tests — the deterministic reference path.
+
+Instead the gate was **split**:
+- `bench/golden.sh` now pins `COLI_V4_BASELINE=1` and keeps guarding the reference path. Its md5 is
+  unchanged and still sacred.
+- `bench/golden_default.sh` is new and guards the SHIPPING path against `bench/GOLDEN_DEFAULT_MD5`.
+  That value is explicitly **not** sacred: re-record it deliberately when a default changes, and say
+  why. On a mismatch it prints the generated text and reminds the reader that a changed md5 is not
+  proof of breakage.
+
+### Verified, not assumed
+| check | result |
+|---|---|
+| Bare run, **no perf env at all** | `metal_fp8_dispatches=644`, `rows16=1`, groups 3095, `metal_row_share=89.1%` — **identical to the champion arm of E119** |
+| `COLI_V4_BASELINE=1` | dispatches 0, `rows16=0`, groups 0, share 0.0% — historical path fully restored |
+| `bench/golden.sh` | **PASS**, md5 `5d04890413ff539e802985ce8c727814` (sacred value intact) |
+| `bench/golden_default.sh` | **PASS on re-run**, md5 `cc09015d089d9a25d10d75753f9e849a` |
+| build | clean, no warnings; Metal seam present |
+
+### What a future session must internalise
+The engine's default output is **no longer token-identical** to the historical CPU arm. It is
+capability-equivalent (`taskcheck` 5/5 at every step, E115/E116/E119), not byte-equal. For any
+bit-exactness differential, regression triage, or bisect, set `COLI_V4_BASELINE=1` first.
