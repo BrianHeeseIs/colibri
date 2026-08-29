@@ -6022,3 +6022,42 @@ Against the E114 `cpu_only` baseline: **TTFT -37.30%** (94.524 -> 59.265 s), **n
 -29.71%** (117.30 -> 82.45 s), tok/s -1.75%. Break-even ~3400 generated tokens.
 Note `METAL_VARIANT=simd_exact_cold` targets cold experts while rows16 are the hot pins — they are
 disjoint expert sets, which is why the two gains compose additively rather than competing.
+
+## E117. #10 precondition VALIDATED — whole-prompt scope nearly doubles MoE group size
+
+Report item #10 (decouple MoE from the 64-token chunk so it runs over the whole prompt) was gated on
+a precondition: does whole-prompt scope actually produce bigger expert groups? Answered with **no new
+code** — a previous session left `COLI_V4_MOE_GROUPED_DUMP` (deepseek_v4.c:5352), which prints each
+chunk's sorted unique expert ids and changes no behaviour.
+
+The enlargement factor needs no knowledge of `topk` or token count, because both cancel:
+`factor = SUM(n_unique per chunk) / |union of ids across chunks|`.
+
+One run, p256, `--max-tokens 1`, champion stack. 129 dump lines = **43 MoE layers x 3 chunks**
+(184 tokens = 64+64+56). `topk=6`, confirmed independently: total routed rows from the
+`moe_batched` counters, 33721 metal + 13751 cpu = 47472, and 47472 / (43 x 184) = 6.000 exactly.
+
+| scope | mean group size | min | max |
+|---|---|---|---|
+| chunk (64 tokens) | **4.14** | 2.02 | 5.41 |
+| whole prompt (184 tokens) | **7.97** | 4.80 | 10.72 |
+
+- **Enlargement factor 1.942x** (per-layer range 1.746 - 2.394).
+- **Layers whose mean group clears `MIN_N=4`: 29/43 at chunk scope -> 43/43 at whole-prompt scope.**
+- Union touches on average only 142.1 of 256 experts per layer (range 103 - 230), which is why the
+  union is so much smaller than the sum: the three chunks route to heavily overlapping expert sets.
+
+### This independently reproduces E62
+E62 measured 4.14 -> 7.99 by a different route; this run gives **4.14 -> 7.97**. Two independent
+measurements agreeing to two decimal places also cross-validates the `topk=6` inference above.
+
+### Why this matters, and what it is NOT
+The gain mechanism is that dispatches become **genuinely larger** (mean 8 rows instead of 4), where
+the GPU is measured to win (S=4 gives 1.68-2.41x, S=1 only 0.40x). It is therefore **not** equivalent
+to simply lowering `MIN_N`, which would admit small groups at their small size and dispatch 2 rows
+where the GPU loses. A `MIN_N` sweep would not answer this question and is not run (AGENTS.md already
+records one such sweep as wasted).
+
+Precondition met: #10 is worth implementing. Current `metal_row_share` is 71.0% with `rows16=1` and
+`rejects=0`, so every remaining CPU row is there purely because its group is below `MIN_N=4` — exactly
+the population this change moves.

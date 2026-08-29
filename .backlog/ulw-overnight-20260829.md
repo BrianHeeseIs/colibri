@@ -79,3 +79,15 @@ Engagement counter is free: `metal_row_share=%` in the `moe_batched` stats line 
 prints `rows16=%d`. Interaction to watch: champion uses METAL_VARIANT=simd_exact_COLD while rows16
 are the HOT pins, so the two may target disjoint expert sets.
 => All three report items (#7, #8, #10): only #10 needs code.
+
+## Progress 2026-08-29 03:25
+DONE: E114 (N=5 resolves decode regression +1.94% real, determinism = interaction not either flag),
+E115 (#8 METAL_ATTN=1: -21.0% TTFT, BIT-EXACT, no code needed), E116 (#7 ROWS16=1: -7.3% TTFT,
+row share 52.9->71.0%, taskcheck 5/5, no code needed).
+CHAMPION: METAL=0 KERNELS=all MOE_GROUPED=1 MOE_BATCHED=1 METAL_VARIANT=simd_exact_cold
+          METAL_ATTN=1 MOE_BATCHED_ROWS16=1
+          => vs cpu_only: TTFT -37.3%, net wall@40 -29.7%, tok/s -1.75%, break-even ~3400 tokens.
+REMAINING: #10 whole-prompt MoE (only item needing code).
+NEXT STEP CHOSEN: instrumentation-only patch to measure the whole-prompt group histogram BEFORE
+restructuring. Reason: the restructure touches the hottest path; the report's own precondition was
+to validate the route-union shape (E62 saw 4.14 -> 7.99 mean group size). Measure, then decide.
