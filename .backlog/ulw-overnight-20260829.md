@@ -125,3 +125,28 @@ to validate the route-union shape (E62 saw 4.14 -> 7.99 mean group size). Measur
 STATUS: Oracle (bg_b79439b7) consulted on semantic safety, aliasing, numerical identity, dense layers,
 and buffer ownership. Implementation BLOCKED until it returns (own rule: never ship a decision Oracle
 was asked to make).
+
+## Oracle verdict on #10 (bg_b79439b7, 4m24s) — design APPROVED with guards
+1. Semantically safe. No same-layer later chunk reads `next`; swap is after all chunks (:10011-10015).
+2. **Biggest real risk is ALIASING, not scheduling.** `coli_v4_hc_post` (:1486-1494) is NOT in-place
+   safe: it reads all `residual[source,*]` while overwriting `output[destination,*]`. If deferred
+   `states` aliases `state` or `next`, the finish pass reads clobbered residual rows. Add hard guards:
+   fail if `state == next`, fail if deferred scratch aliases either.
+3. Routeahead: **skip it entirely in defer mode.** Oracle independently reached my empirical
+   conclusion - it is same-chunk machinery (`routeahead_build` recomputes from the current chunk at
+   :4655-4676; `moe_token_pipeline` consumes it for the same item/layer at :4829-4858), NOT a
+   next-chunk dependency. In the grouped branch cached routes are not even fed to
+   `coli_v4_moe_grouped_batch`. Skipping changes no semantics.
+4. Ownership: `target_batch` owns ONE whole-prompt scratch bundle, heap, allocated once and reused
+   every layer, freed in its own cleanup. NOT the engine (breaks the `engine==NULL` callers).
+   `block_window_batch_ref` keeps cleaning only its chunk-local temps.
+5. Bit-exactness: expect NO. Pre/post HC buffers stay exact if the split is right; divergence enters
+   at the grouped MoE output because groups cross the CPU->Metal threshold and dispatch shape changes.
+   So a diff in HC buffers = real bug; a diff only in final text = reassociation.
+6. Preserve rounding points exactly: `state` round at :5919, `normalized_hc_pre` internal rounds
+   :3681-3685.
+7. Effort: medium, 1-2 days for production quality.
+
+DECISION: attempt behind `COLI_V4_MOE_WHOLE_PROMPT` (default OFF) so the existing path stays
+bit-for-bit and a non-converging attempt costs nothing. Timeboxed; if it does not converge, leave the
+flag off, tree green, and hand over the design + this verdict.

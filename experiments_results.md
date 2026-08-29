@@ -6061,3 +6061,25 @@ records one such sweep as wasted).
 Precondition met: #10 is worth implementing. Current `metal_row_share` is 71.0% with `rows16=1` and
 `rejects=0`, so every remaining CPU row is there purely because its group is below `MIN_N=4` — exactly
 the population this change moves.
+
+## E118. Champion generalizes to p064 — TTFT -34.3%
+
+Everything in E114-E116 was measured at p256 only, and AGENTS.md warns effects here are
+length-dependent. Six runs at p064, 40 tokens, champion vs the `KERNELS=all` CPU arm.
+
+| arm | TTFT median [range] | decode median | tok/s | md5 (3 runs) |
+|---|---|---|---|---|
+| `cpu_only` | 39.518 [39.074, 39.561] | 23.533 | 1.6572 | `0cbfb727...` 3/3 |
+| **`champion`** | **25.953 [25.947, 26.162]** | 23.576 | 1.6542 | `c6935196...` 3/3 |
+
+- **TTFT -34.33%**, ranges non-overlapping. Comparable to the -37.30% seen at p256, so the win is
+  not an artefact of one prompt length.
+- **decode +0.18%, ranges overlap** — flat, as at p256.
+- Both arms deterministic 3/3. The hashes differ between arms, which is expected: `rows16` changes
+  the text deterministically (E116) and its capability was gated there (`taskcheck` 5/5).
+- **Net wall @40 tokens 63.05 -> 49.53 s, -21.45%** (smaller than p256's -29.71% only because TTFT is
+  a smaller share of the wall at a shorter prompt — model load dominates more).
+
+Note p064 is exactly ONE 64-token chunk, so this also confirms the two wins are **not** chunk-count
+dependent: `METAL_ATTN` and `rows16` both fire within a single chunk. By the same token it means
+whole-prompt MoE (#10) is **inert by construction at p064** and can only be measured at p256+.

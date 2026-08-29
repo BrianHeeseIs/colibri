@@ -1,0 +1,12 @@
+tok/s A/B  tokens=40  N=3  prompt=p064.txt
+  run1 cpu_only               ttft=  39.561s decode=  23.866s tok/s=1.6341   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run1 champion               ttft=  26.162s decode=  23.576s tok/s=1.6542   md5=c69351961ae8e9f9e2215a3fad107510
+  run2 cpu_only               ttft=  39.074s decode=  23.215s tok/s=1.6799   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run2 champion               ttft=  25.947s decode=  23.511s tok/s=1.6588   md5=c69351961ae8e9f9e2215a3fad107510
+  run3 cpu_only               ttft=  39.518s decode=  23.533s tok/s=1.6572   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run3 champion               ttft=  25.953s decode=  23.891s tok/s=1.6324   md5=c69351961ae8e9f9e2215a3fad107510
+
+SUMMARY (median tok/s)
+  cpu_only                 1.6572 tok/s  baseline            deterministic  md5=0cbfb727ed2acda5feb8cf6b8de2112b 
+  champion                 1.6542 tok/s  -0.18% tok/s        deterministic  md5=c69351961ae8e9f9e2215a3fad107510 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.NMRyo2
