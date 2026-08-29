@@ -1,0 +1,16 @@
+tok/s A/B  tokens=40  N=5  prompt=p256.txt
+  run1 rows16_off             ttft=  49.824s decode=  23.126s tok/s=1.6864   md5=d06053793d8f66d4f69a3f7c810441e1
+  run1 rows16_on              ttft=  48.909s decode=  24.634s tok/s=1.5832   md5=d06053793d8f66d4f69a3f7c810441e1
+  run2 rows16_off             ttft=  49.742s decode=  23.595s tok/s=1.6529   md5=d06053793d8f66d4f69a3f7c810441e1
+  run2 rows16_on              ttft=  48.924s decode=  21.315s tok/s=1.8297   md5=d06053793d8f66d4f69a3f7c810441e1
+  run3 rows16_off             ttft=  49.646s decode=  23.403s tok/s=1.6665   md5=d06053793d8f66d4f69a3f7c810441e1
+  run3 rows16_on              ttft=  49.083s decode=  22.369s tok/s=1.7435   md5=d06053793d8f66d4f69a3f7c810441e1
+  run4 rows16_off             ttft=  49.513s decode=  23.217s tok/s=1.6798   md5=d06053793d8f66d4f69a3f7c810441e1
+  run4 rows16_on              ttft=  48.872s decode=  23.934s tok/s=1.6295   md5=d06053793d8f66d4f69a3f7c810441e1
+  run5 rows16_off             ttft=  49.306s decode=  23.188s tok/s=1.6819   md5=d06053793d8f66d4f69a3f7c810441e1
+  run5 rows16_on              ttft=  48.931s decode=  25.543s tok/s=1.5268   md5=d06053793d8f66d4f69a3f7c810441e1
+
+SUMMARY (median tok/s)
+  rows16_off               1.6798 tok/s  baseline            deterministic  md5=d06053793d8f66d4f69a3f7c810441e1 
+  rows16_on                1.6295 tok/s  -2.99% tok/s        deterministic  md5=d06053793d8f66d4f69a3f7c810441e1 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.3iZD1a

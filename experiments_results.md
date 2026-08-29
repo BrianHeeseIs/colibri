@@ -5302,7 +5302,16 @@ but the rows are strided by I bytes so the four byte-loads are not contiguous �
 problem to solve, and it should be prototyped in `validation/` against `matmul_fp8` before any
 engine is touched.
 
-## E104. The FP8 scalar kernel is NOT leaving easy SIMD on the table — E103's premise refuted
+## E104. [SUPERSEDED BY E125 — the conclusion below is WRONG] The FP8 scalar kernel is NOT leaving easy SIMD on the table
+
+> **RETRACTION (E125).** This entry's conclusion — "there is no bit-exact arm64 kernel that beats the
+> current scalar code" — is FALSE, and was disproven by measurement. Its dichotomy assumed that
+> decoding 16 weights per step requires vectorising across COLUMNS within one row, which would break
+> summation order. It does not: the 16 weights can be 16 different OUTPUT ROWS at the same column,
+> which preserves per-row serial order exactly while decoding 16 wide. E104 tested only 4-row packing
+> and ran single-threaded. The working kernel is +10.18% tok/s and bit-exact — see E125.
+> The measurements below are still accurate for the two candidates E104 actually tried.
+
 
 E103 observed that `matmul_fp8` (`c/quant.h:502`) has no arm64 SIMD path — only a dead
 `#ifdef __AVX2__` — and inferred a large win was available across ~29% of decode. `validation/fp8_neon_probe.c`
@@ -6360,3 +6369,89 @@ because a layout-aware kernel would be structured completely differently and wou
    dependent table loads per iteration. Handles subnormals/NaN via selects; changes no ordering.
 Either is a substantial piece of work. Do not attempt another drop-in SIMD port of the current loop —
 that experiment is done, and this entry is the receipt.
+
+## E125. Decode moves at last: NEON rows16 fp8 matvec, +10.18% tok/s, BIT-EXACT. E104 REFUTED.
+
+The first decode improvement in this project. Every prior win (E114-E122) was prefill; tok/s had
+never moved off ~1.67.
+
+### E104 is refuted, and the false premise is worth naming
+E104 (`experiments_results.md:5305`) concluded: *"There is no bit-exact arm64 kernel that beats the
+current scalar code."* Its dichotomy was:
+- bit-exact => lane-per-row => only **4** weights decoded per vector step => arithmetic decode loses
+  to the LUT;
+- beat the LUT => decode **16** at once => must vectorise ACROSS COLUMNS within one row => summation
+  order changes => not bit-exact.
+
+**The second premise is false.** The 16 weights decoded per step can be **16 different OUTPUT ROWS at
+the same column** (a 16-row interleave) rather than 16 columns of one row. Each lane still owns one
+output row and accumulates serially over ascending columns, so the reference order is preserved
+*exactly* while the decode is 16 wide. Both properties hold at once.
+
+E104 tested only 4-row packing (its candidate B), which caps the decode at 4/step, and ran
+**single-threaded** while the real `matmul_fp8` is `#pragma omp parallel for`.
+
+### The kernel
+- **Layout:** 16-row interleave, so one column's 16 weights are exactly one `vld1q_u8`.
+- **Decode:** e4m3 -> f16 by REINTERPRET, not arithmetic and not table:
+  `h = ((b & 0x80) << 8) | ((b & 0x7F) << 7)` gives `h == e4m3 / 256`, then `vcvt_f32_f16`.
+  Exact for every non-NaN code including subnormals (e4m3 subnormal `m*2^-9` lands on the f16
+  subnormal `m*2^-17`; f16's smallest is `2^-24`). The `2^8` folds into the block scale — exact,
+  power of two — so there is no per-element multiply.
+  **e4m3 NaN (0x7F/0xFF) maps to a FINITE f16** and needs an explicit compare+select.
+- **MAC:** `vfmaq`. The engine's scalar loop is FMA-contracted by clang at `-O3`, which is why the
+  fused form is what reproduces it bit-for-bit. This was verified in-engine, not assumed.
+
+Rejected variants, all measured: row-interleave alone **1.04x**; arithmetic bit-twiddle decode
+(the PyTorch/MLX approach) **0.70x**; 2-column unroll **0.98x** and not bit-exact. The LUT is not the
+bottleneck people assume — it is 1 KB, L1-resident, and M3 retires it at roughly one per cycle. It
+only loses to something that is nearly free, which the reinterpret is and arithmetic decode is not.
+
+### The integration blocker, and why the obvious design failed
+The same weight bytes are read by decode (`coli_fp8_matvec_ref`) AND prefill
+(`coli_fp8_matmul_batch_ref`, which validates `block_rows` and returns -1 for anything but 128/8),
+plus Metal prefill attention, `deepseek_v4_dspark.inc`, and a second attention implementation.
+
+A **side-by-side packed copy** was implemented first and it worked, bit-exactly — but it cost
+**+4.0 GB peak RSS** (87.8 -> 91.8 GB on a 128 GB host already holding ~88 GB), and that pressure
+ate the entire compute win:
+
+| design | peak RSS | decode |
+|---|---|---|
+| off | 87.8 GB | 23.345 s |
+| shadow copy, 8 GB budget | **91.8 GB** | 23.853 s (**worse**) |
+| shadow copy, 512 MB budget | 88.3 GB | 23.094 s (parity) |
+| **in-place permute** | **87.6 GB** | **20.941 s** |
+
+At N=5 the shadow-copy arm was **-2.99% tok/s** with a 20% run-to-run spread — its best run beat
+every baseline run while its worst was far worse, which is the signature of memory pressure rather
+than of a slow kernel. The fix was to permute **in place** and have the layout-unaware prefill path
+restore row-major order on demand; in a normal generation prefill precedes decode so that restore
+fires zero times.
+
+### Result (p256, 40 tokens, N=5)
+| arm | decode median [range] | tok/s | TTFT median [range] |
+|---|---|---|---|
+| `rows16_off` | 23.417 [23.243, 23.871] | 1.6655 | 49.515 [49.196, 49.730] |
+| **`rows16_on`** | **21.253 [21.040, 21.401]** | **1.8350** | 48.846 [48.599, 49.008] |
+
+- **tok/s +10.18%**, decode **-9.24%**, ranges **non-overlapping on both axes**.
+- TTFT also improves slightly (token 1 runs the faster kernel), so S4 is satisfied with room.
+- **Output md5 identical across all 10 runs**, and both golden gates PASS with the kernel enabled:
+  `5d04890413ff539e802985ce8c727814` (sacred) and `cc09015d089d9a25d10d75753f9e849a`.
+
+### Honest gap between prediction and outcome
+The microbench predicted +23% and delivered +10.18%. The kernel itself does hit 2.09-2.28x at the
+real shapes, and the engine profile confirms `attn_out` -26.7% and `attn_qkv` -31.3% — but those
+phases also contain rope, bf16 rounding and the **serial** activation QDQ, none of which the kernel
+touches, and they are only a third of decode. A kernel-level speedup never converts one-for-one.
+
+### Default
+**ON by default** — bit-exact, zero memory cost, so unlike the prefill gates it carries no
+reproducibility price. `COLI_V4_BASELINE=1` forces it off with everything else.
+
+### Still open
+`expert_forward` is 32.2% of decode and uses the mxfp4 path, which already has a NEON rows16 kernel;
+it was not touched here. `COLI_V4_PIN_SLOTS` remains dead (E123). The 12 OpenMP regions entered per
+layer per token, and the fact that DeepSeek-V4 never adopted `c/omp_tune.h` (so it runs 16 threads
+including the 4 efficiency cores, against that header's own P-cores-only policy), are both untested.

@@ -13593,8 +13593,13 @@ static int coli_v4_fp8_rows16_enabled(void) {
     if (coli_v4_fp8_rows16_force >= 0) return coli_v4_fp8_rows16_force;
     static int cached = -1;   /* benign race: both racers compute the same value */
     if (cached < 0) {
+        /* Default ON: +10.18% tok/s at N=5 with non-overlapping ranges, BIT-EXACT (both golden
+         * gates unchanged) and zero extra memory. Unlike the prefill gates this costs nothing in
+         * reproducibility. COLI_V4_BASELINE=1 still forces it off with everything else. */
+        const char *b = getenv("COLI_V4_BASELINE");   /* this unit does not see the shared inline */
+        const int baseline = b && *b && atoi(b) != 0;
         const char *v = getenv("COLI_V4_FP8_ROWS16");
-        cached = (v && *v) ? (atoi(v) != 0) : 0;   /* default OFF until measured */
+        cached = (v && *v) ? (atoi(v) != 0) : !baseline;
     }
     return cached;
 }
