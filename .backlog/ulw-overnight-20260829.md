@@ -91,3 +91,37 @@ REMAINING: #10 whole-prompt MoE (only item needing code).
 NEXT STEP CHOSEN: instrumentation-only patch to measure the whole-prompt group histogram BEFORE
 restructuring. Reason: the restructure touches the hottest path; the report's own precondition was
 to validate the route-union shape (E62 saw 4.14 -> 7.99 mean group size). Measure, then decide.
+
+## #10 design recon (03:50-04:15) — findings BEFORE implementing
+
+1. **Loop nesting is already layer-major, chunk-minor** (`target_batch` :9989-10018). The chunk loop is
+   INSIDE the layer loop, `state`/`next` are whole-prompt buffers, and the swap happens only after all
+   chunks of that layer. So #10 needs NO re-nesting — it is a contained change, much smaller than the
+   report implied.
+
+2. **MoE is already ONE call per chunk** (`coli_v4_moe_grouped_batch`, :5945), sandwiched between two
+   per-item loops: (A) hc_post + ffn norm -> `ffn_normalized_batch`, (B) the MoE, (C) hc_post combine
+   into `outputs_hc`. #10 = hoist (B) out of the chunk loop and run (C) over the whole prompt.
+
+3. **`coli_v4_moe_grouped_batch` has no batch cap** — the `batch<=64` contract lives on the CALLER
+   (:5729) and on attention/matmul (4 sites, E108). Keeping attention chunked at 64 and widening only
+   the MoE therefore leaves that contract untouched. This is the key enabling fact.
+
+4. **The route-cache/loader coupling I feared DOES NOT EXIST in the champion config.** The block at
+   :5973 is not a next-chunk prefetch, it is per-chunk teardown (`loader_batch_finish` +
+   `route_cache_destroy`) of an async expert loader the MoE consumes. But:
+   - the whole route_cache path is gated on ROUTEAHEAD, which only runs under
+     `COLI_V4_PREFILL_PREFETCH` — unset here, and E113 proved it DEADLOCKS with GPU prefill anyway.
+     Confirmed empirically: no `v4_prefill_routeahead active` line in a champion-stack run.
+   - even if enabled, the loader starts only when `n_unique <= capacity`, and measured
+     `pin_slots_per_layer=16` vs per-chunk `n_unique` of 170-188. The gate can never pass at prefill;
+     it would take the `v4_prefill_loader fallback` branch.
+   => Two independent reasons deferring the MoE cannot starve a loader. Risk retired.
+
+5. Buffers needed at whole-prompt scope (184 tok, d=7168, hc=4, hd=28672): states 21 MB,
+   ffn_normalized 5.3 MB, ffn_branch 5.3 MB, ffn_post 2.9 KB, ffn_comb 11.8 KB. At 2048 tokens states
+   grows to ~235 MB — must be documented, and argues for allocating per-layer rather than per-call.
+
+STATUS: Oracle (bg_b79439b7) consulted on semantic safety, aliasing, numerical identity, dense layers,
+and buffer ownership. Implementation BLOCKED until it returns (own rule: never ship a decision Oracle
+was asked to make).
