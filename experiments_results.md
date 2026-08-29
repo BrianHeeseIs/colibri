@@ -6267,3 +6267,52 @@ default, so E119/E120's numbers stand unchanged. Confirmed: `bench/golden_defaul
 
 Raise the tile if you have the memory — the win grew from -17.4% at p256 to -25.9% at p512, so larger
 tiles keep paying.
+
+## E123. Decode profiled — 32% of it is a SCALAR fp8 matvec with an x86-only fast path
+
+First decode-axis work in this project. Everything in E114-E122 was prefill; tok/s never moved.
+Profile at p256, 39 decode tokens, 23360 ms wall, 99.3% accounted (`COLI_V4_PROFILE=1`):
+
+| phase | ms | share | calls |
+|---|---|---|---|
+| attention (parent) | 8787.8 | 37.6% | 1677 |
+| &nbsp;&nbsp;`attn_out` | **5046.9** | **21.6%** | 1677 |
+| &nbsp;&nbsp;`attn_qkv` | **2530.6** | **10.8%** | 1677 |
+| &nbsp;&nbsp;`attn_sparse` | 1141.2 | 4.9% | 1677 |
+| `expert_forward` | 7528.7 | 32.2% | 10062 |
+| `shared_expert` | 1619.8 | 6.9% | 1677 |
+| `head` | 1432.2 | 6.1% | 39 |
+| `expert_wait` | 1320.5 | 5.7% | 20124 |
+
+1677 = 39 tokens x 43 layers; 10062 = x6, independently reconfirming `topk=6`.
+
+### `KERNELS=all` covers only two kernels
+`COLI_V4_KERNEL_LIST` (deepseek_v4.c:58) contains exactly `attn_sparse` and `router` — together 5.4%
+of decode. Every large phase above has **no optimised kernel variant at all**.
+
+### The finding
+`attn_out` (:2089/:2093) and `attn_qkv` (:1928/:1938) both go through `coli_fp8_matvec_ref`, so
+**32.4% of decode is one function**. That function has an 8-wide SIMD fast path — guarded by
+`#ifdef __AVX2__` (:13599), **x86 only**. On this aarch64 host it falls through to `matmul_fp8`
+(quant.h:502), which is a **pure scalar loop**: `acc0 += e4m3_decode(w0[i])*xv`, four output rows
+unrolled, no intrinsics. quant.h does contain 68 NEON references, but they serve mxfp4, not fp8.
+
+So the single biggest decode cost on an Apple-silicon host runs the reference scalar path while the
+x86 build gets SIMD. **A NEON fp8 matvec is the largest decode lever available**, and it is a port of
+an algorithm already present rather than a new one.
+
+### Dead lever recorded along the way: `COLI_V4_PIN_SLOTS`
+The in-code comment at :8519 advertises raising pins as converting ~55% of decode expert calls from
+scalar to NEON "at zero steady-state memory cost" (E107). Measured, one run each at p256:
+
+| pins | `expert_forward` | `expert_wait` | decode wall |
+|---|---|---|---|
+| 16 (default) | 7509.4 | 1334.7 | 23290.1 |
+| 64 | 7748.5 | 1675.6 | 23671.7 |
+| 158 | 7684.5 | 2216.3 | 24387.9 |
+
+`expert_forward` is **flat across a 10x increase in pins** (spread 3.2%, inside the 5-13% decode noise
+floor), while `expert_wait` rises monotonically by 66% and total decode wall gets worse at every step.
+Whatever E107 measured, raising pins does not convert into decode time here. **Do not re-run this**;
+if the claim is revisited, instrument which kernel each expert call actually takes rather than
+inferring it from the pin count.
