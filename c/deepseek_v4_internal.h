@@ -567,6 +567,11 @@ typedef struct {
 } ColiV4MoEDefer;
 extern ColiV4MoEDefer *coli_v4_moe_defer;
 int coli_v4_moe_whole_prompt_enabled(void);
+/* Upper bound, in tokens, on how many rows the deferred dispatch buffers may cover at once.
+ * The deferred state costs batch * hc_mult * hidden * 4 B, which is ~21 MB at 184 tokens but grows
+ * without bound (~940 MB at 8192). Tiling caps that while keeping dispatches far wider than the
+ * 64-token chunk, which is where the win comes from. 0 means no bound. */
+int coli_v4_moe_tile_width(void);
 
 /* Runs the hoisted dispatch for one layer plus the deferred hyper-connection combine into
  * `outputs_hc`. Lives in BLOCK_HYBRID because coli_v4_moe_grouped_batch is static there. */

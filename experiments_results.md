@@ -6228,3 +6228,42 @@ Instead the gate was **split**:
 The engine's default output is **no longer token-identical** to the historical CPU arm. It is
 capability-equivalent (`taskcheck` 5/5 at every step, E115/E116/E119), not byte-equal. For any
 bit-exactness differential, regression triage, or bisect, set `COLI_V4_BASELINE=1` first.
+
+## E122. Bounded the deferred buffers (`COLI_V4_MOE_TILE`, default 1024)
+
+With the champion now default (E121), every long-prompt run pays the deferred dispatch buffers, and
+that cost was unbounded: `states` alone is `batch * hc_mult * hidden * 4 B` — ~21 MB at 184 tokens,
+~235 MB at 2048, **~940 MB at 8192**. Oracle's guidance was to tile the deferred FINISH pass only and
+never touch the attention contract; that is what this does.
+
+The dispatch now runs per TILE of at most `COLI_V4_MOE_TILE` tokens (default 1024, `0` = unbounded).
+Buffers are sized to the tile, capping them at ~176 MB regardless of prompt length. Tiling is safe
+for the same reason the whole-prompt form is: a later tile's attention reads `state` and the KV ring,
+never `next`, which only the deferred combine writes.
+
+Implementation note: the tile loop **degenerates to the previous single pass when the deferral is
+off** (`tile_rows = batch`), so the non-deferred path is untouched rather than parallel-maintained.
+
+### Verified monotone, with BOTH endpoints matching known-good references
+p256 (184 tokens), counters only:
+
+| `COLI_V4_MOE_TILE` | groups | Metal rows | `metal_row_share` | CPU rows |
+|---|---|---|---|---|
+| default (>= prompt, single tile) | 3095 | 42275 | **89.1%** | 5197 |
+| 128 | 3396 | 37731 | 79.5% | 9741 |
+| 64 | 3550 | 33721 | **71.0%** | 13751 |
+
+- `TILE=64` reproduces the whole-prompt-**OFF** numbers *exactly* (3550 / 33721 / 71.0% / 13751,
+  cf. E119) — a 64-token tile is one chunk, so it must degenerate to the old path, and it does. That
+  is a correctness proof of the tiling arithmetic, not merely a plausible trend.
+- The single-tile end reproduces E119's 89.1% exactly.
+- Monotone in between, as the union mechanism requires.
+
+### No measured regression
+Every prompt measured in this project (p064/p256/p512, all < 1024 tokens) fits in ONE tile at the
+default, so E119/E120's numbers stand unchanged. Confirmed: `bench/golden_default.sh` **PASS**
+(md5 `cc09015d089d9a25d10d75753f9e849a`, unchanged) and `bench/golden.sh` **PASS**
+(sacred md5 `5d04890413ff539e802985ce8c727814`).
+
+Raise the tile if you have the memory — the win grew from -17.4% at p256 to -25.9% at p512, so larger
+tiles keep paying.

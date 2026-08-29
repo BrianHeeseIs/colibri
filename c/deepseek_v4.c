@@ -5152,6 +5152,21 @@ static int coli_v4_moe_batched_rows16(void) {
  * pointer stays NULL and every path below is bit-for-bit unchanged. */
 ColiV4MoEDefer *coli_v4_moe_defer;   /* declared in deepseek_v4_internal.h */
 
+/* Default 1024 tokens: bounds the deferred buffers at ~176 MB while leaving every prompt measured
+ * so far (p064/p256/p512, all under 1024 tokens) in a SINGLE tile, i.e. bit-for-bit unchanged from
+ * the untiled measurements in E119/E120. Larger tiles keep helping -- the win grew from -17.4% at
+ * p256 to -25.9% at p512 -- so raise this if you have the memory. COLI_V4_MOE_TILE=0 disables the
+ * bound entirely. */
+int coli_v4_moe_tile_width(void) {
+    static int cached = -1;   /* benign race: both racers compute the same value */
+    if (cached < 0) {
+        const char *v = getenv("COLI_V4_MOE_TILE");
+        int n = (v && *v) ? atoi(v) : 1024;
+        cached = n > 0 ? n : 0;
+    }
+    return cached;
+}
+
 int coli_v4_moe_whole_prompt_enabled(void) {
     static int cached = -1;   /* benign race: both racers compute the same value */
     if (cached < 0) {
@@ -10053,6 +10068,7 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     int whole_prompt = coli_v4_moe_whole_prompt_enabled() && batch > 1;
     float *wp_states = NULL, *wp_norm = NULL, *wp_branch = NULL,
           *wp_post = NULL, *wp_comb = NULL;
+    int wp_rows = batch;   /* rows per deferred tile; == batch when unbounded */
     if (whole_prompt) {
         /* coli_v4_hc_post reads every residual row while overwriting output rows, so the deferred
          * state must not alias either ping-pong buffer. Callers do allocate them distinctly; assert
@@ -10063,11 +10079,13 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                          "whole-prompt MoE requires distinct state/next buffers");
             return -1;
         }
-        wp_states = malloc((size_t)batch * hd * sizeof(*wp_states));
-        wp_norm   = malloc((size_t)batch * (size_t)wp_d * sizeof(*wp_norm));
-        wp_branch = malloc((size_t)batch * (size_t)wp_d * sizeof(*wp_branch));
-        wp_post   = malloc((size_t)batch * (size_t)wp_hc * sizeof(*wp_post));
-        wp_comb   = malloc((size_t)batch * (size_t)wp_hc * wp_hc * sizeof(*wp_comb));
+        int bound = coli_v4_moe_tile_width();
+        wp_rows = (bound > 0 && bound < batch) ? bound : batch;
+        wp_states = malloc((size_t)wp_rows * hd * sizeof(*wp_states));
+        wp_norm   = malloc((size_t)wp_rows * (size_t)wp_d * sizeof(*wp_norm));
+        wp_branch = malloc((size_t)wp_rows * (size_t)wp_d * sizeof(*wp_branch));
+        wp_post   = malloc((size_t)wp_rows * (size_t)wp_hc * sizeof(*wp_post));
+        wp_comb   = malloc((size_t)wp_rows * (size_t)wp_hc * wp_hc * sizeof(*wp_comb));
         if (!wp_states || !wp_norm || !wp_branch || !wp_post || !wp_comb) {
             free(wp_comb); free(wp_post); free(wp_branch); free(wp_norm); free(wp_states);
             if (error && error_size)
@@ -10087,41 +10105,50 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                                error, error_size)) { COLI_V4_WP_FREE(); return -1; }
         int result = 0;
         const int chunk_width = coli_v4_prefill_chunk_width();
-        for (int offset = 0; !result && offset < batch; offset += chunk_width) {
-            int chunk = batch - offset;
-            if (chunk > chunk_width) chunk = chunk_width;
+        /* One tile when the deferral is off (tile == batch), so that path is untouched. */
+        const int tile_rows = whole_prompt ? wp_rows : batch;
+        for (int tile = 0; !result && tile < batch; tile += tile_rows) {
+            int tile_len = batch - tile;
+            if (tile_len > tile_rows) tile_len = tile_rows;
+            for (int offset = 0; !result && offset < tile_len; offset += chunk_width) {
+                int chunk = tile_len - offset;
+                if (chunk > chunk_width) chunk = chunk_width;
+                const int global = tile + offset;
 #ifdef COLI_M4_TRACE
-            if (coli_m4_prefill_active)
-                coli_m4_prefill_chunk = m4_chunk_base + offset / chunk_width;
+                if (coli_m4_prefill_active)
+                    coli_m4_prefill_chunk = m4_chunk_base + global / chunk_width;
 #endif
-            ColiV4MoEDefer defer_ctx;
-            if (whole_prompt) {
-                defer_ctx.states         = wp_states + (size_t)offset * hd;
-                defer_ctx.ffn_normalized = wp_norm   + (size_t)offset * (size_t)wp_d;
-                defer_ctx.ffn_post       = wp_post   + (size_t)offset * (size_t)wp_hc;
-                defer_ctx.ffn_comb       = wp_comb   + (size_t)offset * (size_t)wp_hc * wp_hc;
-                coli_v4_moe_defer = &defer_ctx;
+                ColiV4MoEDefer defer_ctx;
+                if (whole_prompt) {
+                    /* Slices are relative to the TILE buffer, not the prompt. */
+                    defer_ctx.states         = wp_states + (size_t)offset * hd;
+                    defer_ctx.ffn_normalized = wp_norm   + (size_t)offset * (size_t)wp_d;
+                    defer_ctx.ffn_post       = wp_post   + (size_t)offset * (size_t)wp_hc;
+                    defer_ctx.ffn_comb       = wp_comb   + (size_t)offset * (size_t)wp_hc * wp_hc;
+                    coli_v4_moe_defer = &defer_ctx;
+                }
+                result = coli_v4_block_window_batch_ref(
+                    next + (size_t)global * hd, attention[layer_id],
+                    &layer, config, experts, state + (size_t)global * hd,
+                    tokens + global, start + global, chunk, error, error_size);
+                coli_v4_moe_defer = NULL;
+                if (result && error && error_size && !error[0])
+                    snprintf(error, error_size,
+                             "target prefill failed layer=%d offset=%d batch=%d",
+                             layer_id, global, chunk);
             }
-            result = coli_v4_block_window_batch_ref(
-                next + (size_t)offset * hd, attention[layer_id],
-                &layer, config, experts, state + (size_t)offset * hd,
-                tokens + offset, start + offset, chunk, error, error_size);
-            coli_v4_moe_defer = NULL;
-            if (result && error && error_size && !error[0])
-                snprintf(error, error_size,
-                         "target prefill failed layer=%d offset=%d batch=%d",
-                         layer_id, offset, chunk);
-        }
-        /* One dispatch for the entire prompt, then the deferred combine. Nothing has written `next`
-         * yet this layer: in defer mode block_window skips both the dispatch and the combine, and
-         * on the grouped path those are its only writers of outputs_hc. */
-        if (!result && whole_prompt) {
-            result = coli_v4_block_window_layer_finish(
-                next, &layer, config, experts, wp_branch,
-                wp_states, wp_norm, wp_post, wp_comb, tokens, batch);
-            if (result && error && error_size && !error[0])
-                snprintf(error, error_size,
-                         "whole-prompt MoE failed layer=%d batch=%d", layer_id, batch);
+            /* Dispatch this tile before starting the next one. Safe for the same reason the
+             * whole-prompt form is: a later tile's attention reads `state` and the KV ring, never
+             * `next`, which only the combine below writes. */
+            if (!result && whole_prompt) {
+                result = coli_v4_block_window_layer_finish(
+                    next + (size_t)tile * hd, &layer, config, experts, wp_branch,
+                    wp_states, wp_norm, wp_post, wp_comb, tokens + tile, tile_len);
+                if (result && error && error_size && !error[0])
+                    snprintf(error, error_size,
+                             "whole-prompt MoE failed layer=%d tile=%d rows=%d",
+                             layer_id, tile, tile_len);
+            }
         }
         coli_v4_layer_free(engine, &layer);
         if (result) { COLI_V4_WP_FREE(); return -1; }
