@@ -3529,6 +3529,36 @@ static inline float sparse_attention_dot_fast(const float *left,
 }
 #endif
 
+/* COLI_V4_SPARSE_OMP: the 64 attention heads below are independent -- each writes only its own
+ * slice of `output` -- but the loop was serial, leaving ~6% of decode single-threaded on a
+ * 16-thread machine. Parallelising over `head` reorders nothing, because every head's internal
+ * accumulation order is untouched.
+ * Two things had to change to make it legal: the `scores` scratch was shared across heads and is
+ * now per-iteration (index_topk is 512, so a 2 KB stack array suffices and nothing is allocated),
+ * and the two `return -1` paths inside the loop became a flag, since returning from inside an
+ * OpenMP region is not allowed. The flag is checked after the loop so both arms still reject the
+ * same inputs -- the unit test asserts that explicitly. */
+static unsigned long long coli_v4_sparse_omp_head_count;
+unsigned long long coli_v4_sparse_omp_heads(void) {
+    return __atomic_load_n(&coli_v4_sparse_omp_head_count, __ATOMIC_RELAXED);
+}
+void coli_v4_sparse_omp_reset(void) {
+    __atomic_store_n(&coli_v4_sparse_omp_head_count, 0ULL, __ATOMIC_RELAXED);
+}
+static int coli_v4_sparse_omp_force = -1;
+void coli_v4_sparse_omp_set(int on) { coli_v4_sparse_omp_force = on ? 1 : 0; }
+static int coli_v4_sparse_omp_enabled(void) {
+    if (coli_v4_sparse_omp_force >= 0) return coli_v4_sparse_omp_force;
+    static int cached = -1;   /* benign race: both racers compute the same value */
+    if (cached < 0) {
+        const char *b = getenv("COLI_V4_BASELINE");
+        const int baseline = b && *b && atoi(b) != 0;
+        const char *v = getenv("COLI_V4_SPARSE_OMP");
+        cached = (v && *v) ? (atoi(v) != 0) : !baseline;
+    }
+    return cached;
+}
+
 int coli_v4_sparse_attention_ref(float *output, const float *queries,
                                  const float *kv, const float *sinks,
                                  const int *indices, int heads,
@@ -3542,6 +3572,53 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
                         ? score_stack
                         : malloc((size_t)topk * sizeof(*scores));
     if (!scores) return -1;
+    if (coli_v4_sparse_omp_enabled() && topk <= (int)(sizeof(score_stack)/sizeof(score_stack[0]))) {
+        int failed = 0;
+        #pragma omp parallel for schedule(static)
+        for (int head = 0; head < heads; head++) {
+            if (__atomic_load_n(&failed, __ATOMIC_RELAXED)) continue;
+            float local[sizeof(score_stack)/sizeof(score_stack[0])];
+            const float *query = queries + (size_t)head * head_dimension;
+            float maximum = -INFINITY;
+            for (int rank = 0; rank < topk; rank++) {
+                int index = indices[rank];
+                if (index < 0) { local[rank] = -INFINITY; continue; }
+                if (index >= kv_count) { __atomic_store_n(&failed, 1, __ATOMIC_RELAXED); break; }
+                const float *key = kv + (size_t)index * head_dimension;
+                float score;
+#if defined(__aarch64__)
+                if (v4_active_kernels & COLI_V4_KERNEL_ATTN_SPARSE)
+                    score = sparse_attention_dot_fast(query, key, head_dimension);
+                else
+#endif
+                    score = sparse_attention_dot_ordered(query, key, head_dimension);
+                score *= softmax_scale;
+                local[rank] = score;
+                if (score > maximum) maximum = score;
+            }
+            if (__atomic_load_n(&failed, __ATOMIC_RELAXED)) continue;
+            if (!isfinite(maximum)) { __atomic_store_n(&failed, 1, __ATOMIC_RELAXED); continue; }
+            float denominator = expf(sinks[head] - maximum);
+            float *head_output = output + (size_t)head * head_dimension;
+            memset(head_output, 0, (size_t)head_dimension * sizeof(*head_output));
+            for (int rank = 0; rank < topk; rank++) {
+                if (indices[rank] < 0) continue;
+                float probability = expf(local[rank] - maximum);
+                denominator += probability;
+                probability = coli_bf16_round(probability);
+                const float *value = kv + (size_t)indices[rank] * head_dimension;
+                for (int column = 0; column < head_dimension; column++)
+                    head_output[column] += probability * value[column];
+            }
+            for (int column = 0; column < head_dimension; column++)
+                head_output[column] = coli_bf16_round(head_output[column] / denominator);
+        }
+        if (scores != score_stack) free(scores);
+        if (failed) return -1;
+        __atomic_fetch_add(&coli_v4_sparse_omp_head_count,
+                           (unsigned long long)heads, __ATOMIC_RELAXED);
+        return 0;
+    }
     for (int head = 0; head < heads; head++) {
         const float *query = queries + (size_t)head * head_dimension;
         float maximum = -INFINITY;
