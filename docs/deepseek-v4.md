@@ -177,6 +177,14 @@ bit-exact**: both golden hashes were reproduced after each landing and no expect
 | E125 fp8 rows16 | 1.8350 | +10.18% |
 | E126/E127 head ILP, hc_norm, fp8 dual, sparse attention | **2.1341** | **+28.1%** |
 
+**Versus the historical engine the figure is larger, and it is a different claim.** E128 measured
+`COLI_V4_BASELINE=1` against shipping defaults directly (p256, N=3, both arms deterministic):
+1.3948 -> 2.1596 tok/s = **+54.83%**, with TTFT -62.4% and net wall at 40 tokens -57.1%. The extra
+over +28.1% is not decode work from these experiments — `COLI_V4_BASELINE=1` also disables
+`KERNELS=all`, so it starts below the 1.6655 CPU arm the table above is measured from, and the TTFT
+share belongs to the E114-E119 prefill stack. Use +54.83% for "what do I get today", +28.1% for
+"what did the decode work buy".
+
 **All four E126/E127 wins were the same defect class**: a fast path compiled only for x86, or a hot
 loop left serial on a 16-thread machine. None needed new numerics. The systematic move for the next
 reader is to grep the decode path for `#ifdef __AVX2__` with no `__aarch64__` sibling, and for hot

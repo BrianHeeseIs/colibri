@@ -147,9 +147,21 @@ COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED_R
 COLI_V4_MOE_WHOLE_PROMPT=1 COLI_V4_FP8_ROWS16=1
 ```
 (All of these are now DEFAULTS; the list is written out only so the stack is explicit.)
-**Decode is now +28.1% since E125** (1.6655 -> 2.1341 tok/s at p256, N=5, all bit-exact). After the
-fp8 kernel below, four more landed in E126/E127 -- `COLI_V4_HEAD_ILP`, `COLI_V4_HC_OMP`,
-`COLI_V4_FP8_DUAL_ROWS16`, `COLI_V4_SPARSE_OMP` -- all default ON.
+**Measured head to head in E128** (p256, N=3, both arms deterministic): `COLI_V4_BASELINE=1` gives
+1.3948 tok/s, shipping defaults give 2.1596 -- **+54.83% tok/s, TTFT -62.4%, net wall @40 tokens
+-57.1%**. Quote THAT as "versus the historical engine".
+
+**Do not quote +54.83% as the decode work.** `COLI_V4_BASELINE=1` also switches off `KERNELS=all`
+(`c/deepseek_v4.c:10693`), so it sits BELOW the CPU arm the decode experiments were measured from.
+The decomposition: **+29.7%** (2.1596/1.6655) is this session's decode work in E125-E127, matching
+the recorded +28.1%; the rest is pre-existing `KERNELS=all` plus the E114-E119 GPU-prefill stack.
+That split is INFERRED -- 1.6655 comes from an earlier session and was not re-measured in E128.
+The TTFT -62.4% is the prefill stack, not decode.
+
+**Decode is +28.1% since E125** (1.6655 -> 2.1341 tok/s at p256, N=5, all bit-exact; endpoint
+reproduced as 2.1596 in E128). After the fp8 kernel below, four more landed in E126/E127 --
+`COLI_V4_HEAD_ILP`, `COLI_V4_HC_OMP`, `COLI_V4_FP8_DUAL_ROWS16`, `COLI_V4_SPARSE_OMP` -- all
+default ON.
 **They were all the same defect: an `#ifdef __AVX2__` fast path with no `__aarch64__` sibling, or a
 hot loop with no `#pragma omp`.** That sweep is now exhausted for decode. Two things NOT to retry:
 raising `COLI_V4_PIN_SLOTS` (the scalar and NEON mxfp4 kernels are within 1.00-1.14x, measured

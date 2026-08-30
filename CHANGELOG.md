@@ -5,9 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-DeepSeek-V4 prefill performance on Apple silicon. Measured against the previous `KERNELS=all` CPU
-arm at p256 (N=3-5, non-overlapping ranges): **time to first token -48.2%, net wall at 40 tokens
--38.5%**, tok/s -1.75%. Full evidence in `experiments_results.md` E114-E124.
+DeepSeek-V4 performance on Apple silicon — prefill and decode. Measured end to end against the
+historical engine (`COLI_V4_BASELINE=1`) at p256, N=3, both arms deterministic: **tok/s +54.83%
+(1.3948 to 2.1596), time to first token -62.4%, net wall at 40 tokens -57.1%**. Full evidence in
+`experiments_results.md` E114-E128.
+
+That headline is the whole stack, not any single change, and it is worth reading twice before it is
+quoted. `COLI_V4_BASELINE=1` also disables `COLI_V4_KERNELS=all`, so it starts below the CPU arm the
+individual experiments were measured from. Referenced to that arm instead, the prefill work
+(E114-E124) is **TTFT -48.2%, net wall -38.5%**, tok/s -1.75%, and the decode work (E125-E127) is
+**tok/s +28.1%** — which is why the combined figure exceeds either one.
 
 ### Added
 
@@ -72,10 +79,14 @@ arm at p256 (N=3-5, non-overlapping ranges): **time to first token -48.2%, net w
   differences are wording-level. Set `COLI_V4_BASELINE=1` when token identity is required.
 - `COLI_V4_PREFILL_PREFETCH=1` deadlocks in combination with the default GPU prefill stack; do not
   enable it.
-- **Decode is unimproved.** Profiling attributes 99.3% of it, with a single scalar fp8 matvec worth
-  32.4%, whose 8-wide SIMD path is compiled for x86 only. A NEON port was written, proved bit-exact
-  and measured neutral — the loop is load-bound rather than compute-bound. The remaining lever is a
-  weight-layout change, recorded in E124.
+- **Where decode stands now.** The weight-layout change this section previously listed as the
+  remaining lever was done in E125 and is the 10.18% above; four more kernels followed in E126-E127.
+  What is left is the routed-expert mxfp4 matrix-vector product, still **41.7% of decode** and
+  untouched. Several avenues are closed by measurement and should not be retried without new
+  evidence: raising `COLI_V4_PIN_SLOTS` (the scalar and NEON mxfp4 kernels are within 1.00-1.14x of
+  each other head to head), `OMP_NUM_THREADS` below sixteen, a drop-in NEON port of the row-major fp8
+  loop, arithmetic e4m3 decoding, and keeping the packed weights as a second copy. The sweep for
+  x86-only fast paths and unparallelised hot loops is exhausted for decode.
 
 ## [1.1.1] — 2026-07-23
 
