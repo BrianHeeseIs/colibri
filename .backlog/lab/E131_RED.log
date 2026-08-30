@@ -1,0 +1,3 @@
+pinsweep_extract: FAIL extractor not present or not executable: .backlog/lab/e131_extract.sh
+pinsweep_extract: 1 checks failed
+rc=1

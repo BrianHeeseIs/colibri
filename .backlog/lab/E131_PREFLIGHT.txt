@@ -1,0 +1,17 @@
+E131 PRE-FLIGHT  2026-08-30T19:13:23Z
+branch: ft-decode-expert-wait-applmtl   HEAD: 0e9e321
+binary md5: 7d454de9ba229e0ea083845a7a9e594b
+metal syms: 1
+engine running: no
+durable seed md5: 599f3d12e9347ef30541bd6f9ba18bde
+AGENTS.md clean: yes
+E130 A0 policy: v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+--- git status ---
+ M .backlog/m3-max-decode-research-2026-08-29.md
+ M claude.md
+ M experiments_results.md
+?? .backlog/lab/E131_PREFLIGHT.txt
+?? .backlog/lab/t1_verify.log
+?? .backlog/m3-max-expert-wait-research-2026-08-30.md
+?? .backlog/m3-max-whole-engine-performance-roadmap-2026-08-30.md
+?? .backlog/ulw-expert-wait-m3max-20260830-142937.md

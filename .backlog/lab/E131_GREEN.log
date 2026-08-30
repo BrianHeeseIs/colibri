@@ -1,0 +1,17 @@
+== KAT: extractor against the committed E130 arm ==
+  ok    store_disk_read_calls              765
+  ok    store_disk_read_ms                 2987.867
+  ok    wait_finish_complete_ms            1488.243
+  ok    finish_slept_calls                 723
+  ok    finish_completed_at_entry          9339
+  ok    start_slept_calls                  0
+  ok    expert_forward_ms                  7485.917
+  ok    decode_wall_ms                     17885.966
+  ok    expert_calls_rows16                4484
+  ok    expert_calls_scalar                10775
+  ok    pin_slots_applied                  16
+== GUARD: verify_applied must reject a clamped arm ==
+  ok    verify_applied 16 (true)           0
+  ok    verify_applied 48 (clamped)        rejected as required (rc=1)
+pinsweep_extract: all checks passed
+rc=0

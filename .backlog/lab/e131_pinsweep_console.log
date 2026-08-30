@@ -1,0 +1,20 @@
+E131 pin sweep  tokens=40 prompt=p256.txt memory_gb=96 binary_md5=7d454de9ba229e0ea083845a7a9e594b
+  A0  rc=0   pins_req=16   text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_A0_20260830-223845.log
+verify_applied: /Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_A0_20260830-223845.log applied pin_slots_per_layer=16
+  A1  rc=0   pins_req=48   text_md5=14675beac7a40ba9249639aac58ca58d log=decode_trace_A1_20260830-223946.log
+verify_applied: /Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_A1_20260830-223946.log applied pin_slots_per_layer=48
+  A2  rc=0   pins_req=96   text_md5=14675beac7a40ba9249639aac58ca58d log=decode_trace_A2_20260830-224050.log
+verify_applied: /Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_A2_20260830-224050.log applied pin_slots_per_layer=96
+  A3  rc=0   pins_req=16   text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_A3_20260830-224155.log
+verify_applied: /Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_A3_20260830-224155.log applied pin_slots_per_layer=16
+
+binary md5 before=7d454de9ba229e0ea083845a7a9e594b after=7d454de9ba229e0ea083845a7a9e594b (unchanged: both golden verdicts still hold)
+
+log                                    pins   misses    disk_ms waitblk_ms     slept  at_entry  expfwd_ms   rows16   scalar
+decode_trace_A0_20260830-223845.lo       16      765   3008.291   1520.264       729      9333   7462.544     4490    10769
+decode_trace_A1_20260830-223946.lo       48      740   2761.625   1772.257       786      9276   7759.977     8222     7037
+decode_trace_A2_20260830-224050.lo       96      726   2670.776   1789.314       686      9376   8007.405    11825     3434
+decode_trace_A3_20260830-224155.lo       16      765   2978.500   1481.836       730      9332   7477.785     4483    10776
+
+text md5 per arm: d06053793d8f66d4f69a3f7c810441e1 14675beac7a40ba9249639aac58ca58d 14675beac7a40ba9249639aac58ca58d d06053793d8f66d4f69a3f7c810441e1
+E131_PINSWEEP: COMPLETE (all arms ran and applied their requested pins)
