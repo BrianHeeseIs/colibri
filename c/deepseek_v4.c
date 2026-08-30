@@ -75,6 +75,16 @@ extern unsigned long long v4_rows16_expert_calls_scalar;
 #include "head_ilp.h"
 #include "indexer_score.h"
 
+/* Decode critical-path trace. This prologue is compiled into EVERY one of the ~26
+ * -DCOLI_V4_UNIT_* objects, so exactly one of them must own the counter storage;
+ * every other unit gets declarations only and reaches the counters through the extern
+ * bridge. Without this split each object would accumulate into a private copy and the
+ * report would print zeros. See the mode-switch note in decode_trace.h. */
+#ifndef COLI_V4_UNIT_GENERATE_STATS
+#define COLI_V4_DECODE_TRACE_DECLS_ONLY
+#endif
+#include "decode_trace.h"
+
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
 
@@ -9617,6 +9627,25 @@ int coli_v4_profile_on;
 static int coli_v4_profile_env = -1;
 static ColiV4ProfilePhase coli_v4_profile[COLI_V4_PROFILE_COUNT];
 
+/* Decode trace: this unit is the single owner of the counter storage (decode_trace.h is
+ * included here in owner mode, and in decl-only mode everywhere else). The gate is a
+ * plain global so the hot-path test costs the same as the existing coli_v4_profile_on
+ * check, rather than a cross-object call. getenv for COLI_V4_DECODE_TRACE appears
+ * exactly once in the engine, in coli_v4_profile_reset_decode below: if consumers
+ * parsed it themselves their enable state could disagree with the owner's. */
+int coli_v4_decode_trace_on;
+static int coli_v4_decode_trace_env = -1;
+
+void coli_v4_decode_trace_note(int stage, uint64_t elapsed_ns) {
+    coli_v4_decode_trace_add(stage, elapsed_ns);
+}
+
+int coli_v4_decode_trace_enabled(void) { return coli_v4_decode_trace_on; }
+
+uint64_t coli_v4_decode_trace_clock_ns(void) {
+    return coli_v4_decode_trace_now_ns();
+}
+
 #ifdef COLI_V4_PREFILL_TRACE
 extern uint64_t coli_v4_prefill_trace_now_ns(void);
 extern void coli_v4_prefill_trace_add(int stage, uint64_t elapsed_ns);
@@ -9662,6 +9691,14 @@ static void coli_v4_profile_reset_decode(void) {
     }
     coli_v4_profile_on = coli_v4_profile_env;
     if (coli_v4_profile_on) memset(coli_v4_profile, 0, sizeof(coli_v4_profile));
+    /* Gated by its own env var, not by COLI_V4_PROFILE, so the default profile output
+     * keeps its historical shape and an ON/OFF pair can be compared on one binary. */
+    if (coli_v4_decode_trace_env < 0) {
+        const char *trace = getenv("COLI_V4_DECODE_TRACE");
+        coli_v4_decode_trace_env = trace && !strcmp(trace, "1");
+    }
+    coli_v4_decode_trace_on = coli_v4_decode_trace_env;
+    if (coli_v4_decode_trace_on) coli_v4_decode_trace_reset();
 }
 
 static void coli_v4_profile_report(int decode_tokens, uint64_t wall_ns) {
@@ -9687,6 +9724,91 @@ static void coli_v4_profile_report(int decode_tokens, uint64_t wall_ns) {
             "v4_profile decode_tokens=%d decode_wall_ms=%.3f accounted_pct=%.1f\n",
             decode_tokens, wall_ns / 1e6,
             wall_ns ? 100.0 * accounted_ns / wall_ns : 0.0);
+}
+
+/* Decode critical-path trace report.
+ *
+ * Deliberately NOT part of the COLI_V4_PROFILE enum: COLI_V4_PROFILE_COUNT stays 16 and
+ * the accounted_pct arithmetic above is untouched, so the profile block remains diffable
+ * against .backlog/lab/profile_post_e125.txt.
+ *
+ * Every line rides the existing "v4_profile " prefix. tokps.sh and taskcheck.sh strip
+ * only a fixed prefix list when extracting generated_text; a new prefix would leak into
+ * the text, change its md5 and manufacture a false "not bit-exact" verdict.
+ *
+ * All tables print even when every value is zero, so a silent all-zero table is visible
+ * as a result rather than as absent output. decode_trace_total_calls is the execution
+ * proof: absent with the trace off, non-zero with it on. */
+static void coli_v4_decode_trace_print_stage(const char *table, int stage,
+                                             int is_counter, uint64_t wall_ns) {
+    uint64_t elapsed = __atomic_load_n(
+        &coli_v4_decode_trace_stages[stage].elapsed_ns, __ATOMIC_RELAXED);
+    uint64_t calls = __atomic_load_n(
+        &coli_v4_decode_trace_stages[stage].calls, __ATOMIC_RELAXED);
+    if (is_counter) {
+        fprintf(stderr,
+                "v4_profile decode_trace table=%s stage=%s count=%llu calls=%llu\n",
+                table, coli_v4_decode_trace_names[stage],
+                (unsigned long long)elapsed, (unsigned long long)calls);
+        return;
+    }
+    fprintf(stderr,
+            "v4_profile decode_trace table=%s stage=%s total_ms=%.3f calls=%llu "
+            "mean_ns=%.1f pct_decode=%.3f\n",
+            table, coli_v4_decode_trace_names[stage], elapsed / 1e6,
+            (unsigned long long)calls, calls ? (double)elapsed / calls : 0.0,
+            coli_v4_decode_trace_pct_parent(elapsed, wall_ns));
+}
+
+void coli_v4_decode_trace_report(int decode_tokens, uint64_t wall_ns) {
+    if (!coli_v4_decode_trace_on) return;
+    fprintf(stderr,
+            "v4_profile decode_trace config decode_tokens=%d decode_wall_ms=%.3f "
+            "stages=%d\n",
+            decode_tokens, wall_ns / 1e6, (int)COLI_V4_DT_COUNT);
+
+    uint64_t wait_ns = 0;
+    for (int stage = COLI_V4_DT_WAIT_START_LOCK;
+         stage <= COLI_V4_DT_WAIT_FINISH_RELEASE; stage++) {
+        coli_v4_decode_trace_print_stage("wait", stage, 0, wall_ns);
+        wait_ns += __atomic_load_n(&coli_v4_decode_trace_stages[stage].elapsed_ns,
+                                   __ATOMIC_RELAXED);
+    }
+    /* This total is the quantity the pre-registered kill criterion is stated against. */
+    fprintf(stderr,
+            "v4_profile decode_trace table=wait stage=total total_ms=%.3f "
+            "pct_decode=%.3f\n",
+            wait_ns / 1e6, coli_v4_decode_trace_pct_parent(wait_ns, wall_ns));
+
+    for (int stage = COLI_V4_DT_START_CALLS;
+         stage <= COLI_V4_DT_FINISH_WAKE_ITERATIONS; stage++)
+        coli_v4_decode_trace_print_stage("wait_counters", stage, 1, wall_ns);
+
+    for (int stage = COLI_V4_DT_STORE_LOCK; stage <= COLI_V4_DT_STORE_PACK; stage++)
+        coli_v4_decode_trace_print_stage("store_nested", stage, 0, wall_ns);
+    fprintf(stderr,
+            "v4_profile decode_trace "
+            "note=store_nested_is_nonadditive_due_to_worker_overlap\n");
+
+    for (int stage = COLI_V4_DT_OMP_HC_PRE_WALL;
+         stage <= COLI_V4_DT_OMP_SPARSE_WALL; stage++)
+        coli_v4_decode_trace_print_stage("omp", stage, 0, wall_ns);
+
+    coli_v4_decode_trace_print_stage("control", COLI_V4_DT_TENSOR_LOOKUP, 0, wall_ns);
+    coli_v4_decode_trace_print_stage("control", COLI_V4_DT_DECODE_ALLOC, 0, wall_ns);
+    coli_v4_decode_trace_print_stage("io", COLI_V4_DT_IO_CROSSCHECK, 0, wall_ns);
+
+    uint64_t total_calls = 0;
+    int nonzero = 0;
+    for (int stage = 0; stage < COLI_V4_DT_COUNT; stage++) {
+        uint64_t calls = __atomic_load_n(
+            &coli_v4_decode_trace_stages[stage].calls, __ATOMIC_RELAXED);
+        total_calls += calls;
+        if (calls) nonzero++;
+    }
+    fprintf(stderr,
+            "v4_profile decode_trace_total_calls=%llu stages_nonzero=%d/%d\n",
+            (unsigned long long)total_calls, nonzero, (int)COLI_V4_DT_COUNT);
 }
 
 #define main coli_v4_first_token_legacy_main
@@ -11423,6 +11545,8 @@ int coli_v4_session_generate(ColiV4Session *session,
                 session->spec_disabled);
     coli_v4_profile_report(generated_count > 0 ? generated_count - 1 : 0,
                            decode_wall_ns);
+    coli_v4_decode_trace_report(generated_count > 0 ? generated_count - 1 : 0,
+                                decode_wall_ns);
 #ifdef COLI_V4_PREFILL_TRACE
     coli_v4_prefill_trace_report();
 #endif
