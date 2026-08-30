@@ -888,14 +888,18 @@ tests/test_decode_trace_link$(EXE): tests/test_decode_trace_link_main.c \
 tests/test_indexer_score$(EXE): tests/test_indexer_score.c indexer_score.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_hc_omp$(EXE): tests/test_hc_omp.c deepseek_v4.c deepseek_v4_internal.h
-	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_MATH deepseek_v4.c $< -o $@ $(LDFLAGS)
+tests/test_hc_omp$(EXE): tests/test_hc_omp.c deepseek_v4.c deepseek_v4_internal.h \
+	tests/decode_trace_owner_stub.c decode_trace.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_MATH deepseek_v4.c \
+		tests/decode_trace_owner_stub.c $< -o $@ $(LDFLAGS)
 
 tests/test_fp8_dual_rows16$(EXE): tests/test_fp8_dual_rows16.c deepseek_v4.c native_quant.h native_quant_dual.h tensor.h quant.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -DCOLI_V4_UNIT_NATIVE_QUANT_DUAL deepseek_v4.c $< -o $@ $(LDFLAGS)
 
-tests/test_sparse_omp$(EXE): tests/test_sparse_omp.c deepseek_v4.c deepseek_v4_internal.h
-	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_SPARSE_ATTENTION -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+tests/test_sparse_omp$(EXE): tests/test_sparse_omp.c deepseek_v4.c deepseek_v4_internal.h \
+	tests/decode_trace_owner_stub.c decode_trace.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_SPARSE_ATTENTION -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c \
+		tests/decode_trace_owner_stub.c $< -o $@ $(LDFLAGS)
 
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units

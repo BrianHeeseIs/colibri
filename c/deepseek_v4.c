@@ -1499,6 +1499,12 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
         return -1;
     }
     if (coli_v4_hc_omp_enabled()) {
+        /* Decode trace, table=omp: master-side wall only. The region body is deliberately
+         * untouched -- per-thread accounting would mean restructuring a numerics-adjacent
+         * hot loop, the highest bit-exactness risk in this work, and it is not needed to
+         * answer "is OpenMP overhead >= 2 percent". */
+        const int dt_omp = coli_v4_decode_trace_on;
+        uint64_t dt_omp_began = dt_omp ? coli_v4_decode_trace_clock_ns() : 0;
         #pragma omp parallel for schedule(static)
         for (int row = 0; row < mix_count; row++) {
             float sum = 0.0f;
@@ -1506,6 +1512,10 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
                 sum += hc_fn[(size_t)row * flattened + column] * input[column];
             mixes[row] = sum * inverse_rms;
         }
+        if (dt_omp)
+            coli_v4_decode_trace_note(
+                COLI_V4_DT_OMP_HC_PRE_WALL,
+                coli_v4_decode_trace_clock_ns() - dt_omp_began);
         __atomic_fetch_add(&coli_v4_hc_omp_row_count,
                            (unsigned long long)mix_count, __ATOMIC_RELAXED);
     } else {
@@ -3627,6 +3637,9 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
     if (!scores) return -1;
     if (coli_v4_sparse_omp_enabled() && topk <= (int)(sizeof(score_stack)/sizeof(score_stack[0]))) {
         int failed = 0;
+        /* Decode trace, table=omp: master-side wall only, region body untouched. */
+        const int dt_omp = coli_v4_decode_trace_on;
+        uint64_t dt_omp_began = dt_omp ? coli_v4_decode_trace_clock_ns() : 0;
         #pragma omp parallel for schedule(static)
         for (int head = 0; head < heads; head++) {
             if (__atomic_load_n(&failed, __ATOMIC_RELAXED)) continue;
@@ -3666,6 +3679,10 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
             for (int column = 0; column < head_dimension; column++)
                 head_output[column] = coli_bf16_round(head_output[column] / denominator);
         }
+        if (dt_omp)
+            coli_v4_decode_trace_note(
+                COLI_V4_DT_OMP_SPARSE_WALL,
+                coli_v4_decode_trace_clock_ns() - dt_omp_began);
         if (scores != score_stack) free(scores);
         if (failed) return -1;
         __atomic_fetch_add(&coli_v4_sparse_omp_head_count,
@@ -10167,11 +10184,18 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
             free(scores); free(raw);
             return -1;
         }
+        /* Decode trace, table=omp: master-side wall only, region body untouched. */
+        const int dt_omp = coli_v4_decode_trace_on;
+        uint64_t dt_omp_began = dt_omp ? coli_v4_decode_trace_clock_ns() : 0;
         #pragma omp parallel for
         for (int row = 0; row < rows; row++) {
             const uint16_t *weight = raw + (size_t)row * d;
             scores[row] = head_bf16_dot(weight, hidden, d);
         }
+        if (dt_omp)
+            coli_v4_decode_trace_note(
+                COLI_V4_DT_OMP_HEAD_WALL,
+                coli_v4_decode_trace_clock_ns() - dt_omp_began);
         for (int row = 0; row < rows; row++)
             if (scores[row] > maximum) {
                 maximum = scores[row];
