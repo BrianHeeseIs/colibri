@@ -1,0 +1,9 @@
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -ffp-contract=off -DCOLI_V4_UNIT_NATIVE_QUANT -DCOLI_V4_UNIT_NATIVE_QUANT_BATCH deepseek_v4.c tests/test_fp4_ilp_edges.c -o tests/test_fp4_ilp_edges -lm -L/opt/homebrew/opt/libomp/lib -lomp
+Undefined symbols for architecture arm64:
+  "_matmul_mxfp4_ilp", referenced from:
+      _main in test_fp4_ilp_edges-394144.o
+      _main in test_fp4_ilp_edges-394144.o
+      _run_pair in test_fp4_ilp_edges-394144.o
+ld: symbol(s) not found for architecture arm64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+make: *** [tests/test_fp4_ilp_edges] Error 1

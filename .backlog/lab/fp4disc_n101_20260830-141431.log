@@ -1,0 +1,33 @@
+MXFP4 recurrence discriminator, median of 101, threads=16
+spread=(max-min)/median; GB/s counts packed weight bytes only
+
+shape gate/up  I=4096 O=2048 packed_weights=4.194 MB
+family   arm                       chains  median_ms     min_ms  spread%      GB/s  ratio_vs_4chains  check
+COLD     reference-current              4      0.251      0.222     38.65     16.71             1.004  reference
+COLD     SELF-CHECK-param               4      0.252      0.217     46.43     16.64             1.000  bit-exact
+COLD     parameterized                  8      0.231      0.211     27.71     18.16             1.091  bit-exact
+COLD     parameterized                 12      0.266      0.237     31.95     15.77             0.947  bit-exact
+COLD     parameterized                 16      0.254      0.236     22.83     16.51             0.992  bit-exact
+ROWS16   reference-current              4      0.211      0.186     41.71     19.88             0.995  reference
+ROWS16   SELF-CHECK-param               4      0.210      0.191     32.38     19.97             1.000  bit-exact
+ROWS16   parameterized                  8      0.209      0.191     37.32     20.07             1.005  bit-exact
+ROWS16   parameterized                 16      0.216      0.193     35.19     19.42             0.972  bit-exact
+CEILING  scale-hoist+FMA               16      0.182      0.161     32.42     23.05             1.154  upper-bound
+
+shape down     I=2048 O=4096 packed_weights=4.194 MB
+family   arm                       chains  median_ms     min_ms  spread%      GB/s  ratio_vs_4chains  check
+COLD     reference-current              4      0.232      0.209     26.72     18.08             1.017  reference
+COLD     SELF-CHECK-param               4      0.236      0.221     38.98     17.77             1.000  bit-exact
+COLD     parameterized                  8      0.227      0.215     41.85     18.48             1.040  bit-exact
+COLD     parameterized                 12      0.265      0.234     39.62     15.83             0.891  bit-exact
+COLD     parameterized                 16      0.252      0.226     43.25     16.64             0.937  bit-exact
+ROWS16   reference-current              4      0.215      0.190     28.37     19.51             0.972  reference
+ROWS16   SELF-CHECK-param               4      0.209      0.188     38.28     20.07             1.000  bit-exact
+ROWS16   parameterized                  8      0.210      0.189     33.81     19.97             0.995  bit-exact
+ROWS16   parameterized                 16      0.205      0.192     30.73     20.46             1.020  bit-exact
+CEILING  scale-hoist+FMA               16      0.174      0.152     55.75     24.11             1.201  upper-bound
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+HARNESS VOID: COLD self-check delta=1.72%, ROWS16 delta=2.79%, semantics=exact
+DO NOT INTERPRET THESE TIMINGS
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

@@ -1,6 +1,9 @@
 /* fp4bench -- is the mxfp4 EXPERT kernel leaving the same win on the table that fp8 was?
  *
  * WHY: post-E125, `expert_forward` is the largest decode phase at 36.0% (7557 ms of 20977).
+ * NOTE (E129, measured after this file was written): the pin COUNT below is right but the CALL
+ * share implied by it is NOT. Measured split is 22.05% rows16 / 77.95% scalar, not ~6%/94% --
+ * pinning selects the HOTTEST experts, so 16 of 256 capture far more than 16/256 of calls.
  * Only the 16 HOT-PINNED experts per layer (of 256) get the rows16 NEON pack; every other resident
  * expert runs the SCALAR matmul_mxfp4 (c/quant.h:1440, no aarch64 SIMD). That is structurally the
  * same gap E125 just closed for fp8.
