@@ -8393,7 +8393,18 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     uint64_t trace_alloc_ns = 0;
     int trace_alloc_calls = 0;
 #endif
+    /* Decode trace, table=store_nested. Mirrors the prefill trace's decomposition of this
+     * same function, but at runtime rather than compile time, and for decode rather than
+     * prefill. Like that one, the nested stages are non-additive: loader workers overlap. */
+    const int dt = coli_v4_decode_trace_on;
+    uint64_t dt_began = dt ? coli_v4_decode_trace_clock_ns() : 0;
+    uint64_t dt_lock_acquired = dt_began;
     pthread_mutex_lock(&state->mutex);
+    if (dt) {
+        dt_lock_acquired = coli_v4_decode_trace_clock_ns();
+        coli_v4_decode_trace_note(COLI_V4_DT_STORE_LOCK,
+                                  dt_lock_acquired - dt_began);
+    }
 #ifdef COLI_V4_PREFILL_TRACE
     uint64_t trace_lock_acquired = trace_prefill
         ? coli_v4_prefill_trace_now_ns() : 0;
@@ -8420,6 +8431,13 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             slot = &slots[i]; slot->references++;
             state->active_leases++;
             slot->used = ++state->clock; state->stats.hits++;
+            uint64_t dt_hit_mark = dt_lock_acquired;
+            if (dt) {
+                uint64_t now = coli_v4_decode_trace_clock_ns();
+                coli_v4_decode_trace_note(COLI_V4_DT_STORE_HIT_SCAN,
+                                          now - dt_lock_acquired);
+                dt_hit_mark = now;
+            }
 #ifdef COLI_V4_PREFILL_TRACE
             uint64_t trace_hit_scan_ns = trace_prefill
                 ? coli_v4_prefill_trace_now_ns() - trace_lock_acquired : 0;
@@ -8446,6 +8464,13 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             }
             else if (policy->pack_mutexes)
                 hot_prepare_slot(policy, state, record, slot, 0);
+            if (dt) {
+                uint64_t now = coli_v4_decode_trace_clock_ns();
+                if (should_pack)
+                    coli_v4_decode_trace_note(COLI_V4_DT_STORE_PACK,
+                                              now - dt_hit_mark);
+                dt_hit_mark = now;
+            }
 #ifdef COLI_V4_PREFILL_TRACE
             uint64_t trace_view_began = trace_prefill
                 ? coli_v4_prefill_trace_now_ns() : 0;
@@ -8456,6 +8481,10 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             hot_fill_view(&view->up, record, slot, V4_W3, policy, state);
             view->lease = slot;
             pthread_mutex_unlock(&state->mutex);
+            if (dt)
+                coli_v4_decode_trace_note(
+                    COLI_V4_DT_STORE_PUBLISH,
+                    coli_v4_decode_trace_clock_ns() - dt_hit_mark);
 #ifdef COLI_V4_PREFILL_TRACE
             if (trace_prefill) {
                 coli_v4_prefill_trace_add(
@@ -8484,6 +8513,13 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         for (int i = 0; i < state->slots_per_layer; i++)
             if (!slots[i].references && (!slot || slots[i].used < slot->used))
                 slot = &slots[i];
+    uint64_t dt_miss_mark = dt_lock_acquired;
+    if (dt) {
+        uint64_t now = coli_v4_decode_trace_clock_ns();
+        coli_v4_decode_trace_note(COLI_V4_DT_STORE_MISS_SELECT,
+                                  now - dt_lock_acquired);
+        dt_miss_mark = now;
+    }
 #ifdef COLI_V4_PREFILL_TRACE
     if (trace_prefill)
         trace_select_ns = coli_v4_prefill_trace_now_ns() - trace_lock_acquired;
@@ -8532,7 +8568,14 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         }
         if (allocation_failed) {
 #else
-        if (posix_memalign((void **)&slot->slab, page, capacity)) {
+        uint64_t dt_alloc_began = dt ? coli_v4_decode_trace_clock_ns() : 0;
+        int dt_allocation_failed =
+            posix_memalign((void **)&slot->slab, page, capacity);
+        if (dt)
+            coli_v4_decode_trace_note(
+                COLI_V4_DT_STORE_SLAB_ALLOC,
+                coli_v4_decode_trace_clock_ns() - dt_alloc_began);
+        if (dt_allocation_failed) {
 #endif
             slot->slab = NULL;
             pthread_mutex_unlock(&state->mutex);
@@ -8587,6 +8630,20 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     uint64_t trace_publish_began = trace_prefill
         ? coli_v4_prefill_trace_now_ns() : 0;
 #endif
+    /* store_disk_read is derived from the disk_t0/disk_t1 pair the store already keeps
+     * for state->disk_sec, so this stage adds ZERO new clock reads to the read path.
+     * io_crosscheck records the same delta at the accumulation site: its total must agree
+     * with both store_disk_read and the store's independently reported disk_sec, which is
+     * what makes it a cross-check rather than the trace confirming itself. */
+    if (dt) {
+        int64_t dt_disk_ns =
+            (int64_t)(disk_t1.tv_sec - disk_t0.tv_sec) * INT64_C(1000000000) +
+            (int64_t)(disk_t1.tv_nsec - disk_t0.tv_nsec);
+        uint64_t dt_disk = dt_disk_ns > 0 ? (uint64_t)dt_disk_ns : 0;
+        coli_v4_decode_trace_note(COLI_V4_DT_STORE_DISK_READ, dt_disk);
+        coli_v4_decode_trace_note(COLI_V4_DT_IO_CROSSCHECK, dt_disk);
+        dt_miss_mark = coli_v4_decode_trace_clock_ns();
+    }
     pthread_mutex_lock(&state->mutex);
     state->disk_sec +=
         (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
@@ -8606,6 +8663,11 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     }
     slot->expert = key.expert; slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
+    if (dt) {
+        uint64_t now = coli_v4_decode_trace_clock_ns();
+        coli_v4_decode_trace_note(COLI_V4_DT_STORE_PUBLISH, now - dt_miss_mark);
+        dt_miss_mark = now;
+    }
 #ifdef COLI_V4_PREFILL_TRACE
     uint64_t trace_publish_ns = trace_prefill
         ? coli_v4_prefill_trace_now_ns() - trace_publish_began : 0;
