@@ -1,0 +1,6 @@
+decode trace prefix contract  tokens=40  prompt=p256.txt  memory_gb=96
+  off   rc=0   generated_text_md5=d06053793d8f66d4f69a3f7c810441e1 log=/Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_off_20260830-192058.log
+  on_1  rc=0   generated_text_md5=d06053793d8f66d4f69a3f7c810441e1 log=/Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_on_1_20260830-192200.log
+  on_2  rc=0   generated_text_md5=d06053793d8f66d4f69a3f7c810441e1 log=/Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_on_2_20260830-192301.log
+logs: /Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_off_20260830-192058.log /Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_on_1_20260830-192200.log /Users/cptn/workbench/ai/colibri/.backlog/lab/decode_trace_on_2_20260830-192301.log
+S6_PREFIX_CONTRACT: PASS

@@ -1,0 +1,12 @@
+seed md5: 599f3d12e9347ef30541bd6f9ba18bde  (expect 599f3d12e9347ef30541bd6f9ba18bde)
+== golden.sh  (sacred, expect 5d04890413ff539e802985ce8c727814) ==
+golden_rc=0
+WARMUP golden max_tokens=1
+RUN golden max_tokens=60
+PASS golden md5=5d04890413ff539e802985ce8c727814
+== golden_default.sh  (shipping, expect cc09015d089d9a25d10d75753f9e849a) ==
+golden_default_rc=0
+RUN golden_default max_tokens=60 (engine defaults, no COLI_V4_BASELINE)
+PASS golden_default md5=cc09015d089d9a25d10d75753f9e849a
+logs: .backlog/lab/e130_golden_20260830-191722.log .backlog/lab/e130_golden_default_20260830-191722.log
+E130_GOLDENS_DONE
