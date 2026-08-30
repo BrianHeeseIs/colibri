@@ -865,6 +865,9 @@ tests/test_fp8_rows16$(EXE): tests/test_fp8_rows16.c deepseek_v4.c native_quant.
 tests/test_head_ilp$(EXE): tests/test_head_ilp.c head_ilp.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_decode_trace$(EXE): tests/test_decode_trace.c decode_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_indexer_score$(EXE): tests/test_indexer_score.c indexer_score.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

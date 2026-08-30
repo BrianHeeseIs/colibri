@@ -1,0 +1,6 @@
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -I/usr/local/opt/openssl@1.1/include -lm -L/opt/homebrew/opt/libomp/lib -lomp  tests/test_decode_trace.c   -o tests/test_decode_trace
+tests/test_decode_trace.c:1:10: fatal error: '../decode_trace.h' file not found
+    1 | #include "../decode_trace.h"
+      |          ^~~~~~~~~~~~~~~~~~~
+1 error generated.
+make: *** [tests/test_decode_trace] Error 1
