@@ -109,6 +109,37 @@ side of it were trustworthy precisely because nothing else was running
 - ONE engine at a time (`pgrep -f '[d]eepseek_v4'`): two engines contend for the same weights and
   the same ~100 GB budget. GPU probes must not run against a live engine — same device.
 
+### Run long engine work through tmux, never directly
+`golden.sh`, `golden_default.sh`, `tokps.sh`, `taskcheck.sh` and any trace run take minutes. Invoked
+directly they hit the tool timeout, get killed mid-flight, and **silently leave the work undone while
+looking like they ran** — this burned several turns on 2026-08-30. Send them to the tmux session
+`colibri-lab`, pane `colibri-lab:0.0`, writing to a durable log, and `touch` a completion-marker file
+as the last action. Poll for the marker in a LATER turn; never `sleep`/poll inside bash.
+`.backlog/lab/run_goldens.sh` is a working example.
+
+### A nonzero rc from golden.sh is often a REFUSAL, not a hash failure
+`golden.sh` and `golden_default.sh` abort with rc=2 and
+`another deepseek_v4 process is already running` / `FATAL: engine already running` when any engine is
+live. That is the one-engine guard doing its job, not a broken build. **Read the log body before
+concluding anything.** A concurrent session shares this host, and `pgrep` can clear a moment before
+their process actually exits — so a launch that passed your own guard can still be refused.
+
+### The stderr prefix strip-list is load-bearing. Adding a new prefix corrupts md5 comparisons
+`.backlog/lab/tokps.sh` and `taskcheck.sh` extract `generated_text` by stripping ONLY lines matching
+`^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal) `. Any stderr line with a
+different prefix **leaks into the extracted text, changes its md5, and manufactures a false
+"not bit-exact" verdict.** New counters must ride an existing prefix — extend the `v4_profile ` or
+`v4_rows16 ` line rather than inventing one.
+**Latent bug, unfixed:** `COLI_V4_PREFILL_TRACE` prints under `v4_prefill_trace `, which is NOT in
+that list. Enabling it during a `tokps.sh` run today would corrupt the comparison.
+
+### Verify from disk. Do not trust a self-report — including your own
+On 2026-08-30 one delegated task reported detailed line numbers and a clean build for work it had
+never performed, and a separate turn narrated a tool result that was never returned. Both looked
+entirely plausible. Before building on any claimed change, confirm it exists:
+`grep -c <symbol> <file>`, `git status`, `git diff --cached --name-only`. A claim with no observed
+tool output behind it is not evidence.
+
 ### MANDATORY: do not run a long benchmark without asking. Size it to the question first.
 Operator rule. Benchmark wall-clock is the scarcest resource in this project; spending it badly is
 worse than not measuring, because it also delays everything behind it.
