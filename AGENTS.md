@@ -91,6 +91,29 @@ They do not move together. `COLI_V4_METAL_ATTN=1` is -15.9 % TTFT but trends *ne
 delta under ~10 % cannot be resolved at n=3, and several apparent effects here reversed when a
 third or fifth point was added.
 
+### The "quiet window" rule is ABOLISHED (operator, 2026-08-30). Push the machine to the max.
+Earlier notepads adopted a rule that no background agents may be in flight while a timing run
+executes — `.backlog/m3-max-decode-research-2026-08-29.md:582` and
+`.backlog/ulw-decode-next-avenues-20260830-004040.md:69` ("RULE ADOPTED FOR THIS SESSION"), after a
+profile taken alongside two explore agents reported a fake 76 % jump. **That rule no longer applies.
+Those notepad lines are superseded by this section; do not reinstate them.** Run agents, builds and
+benchmarks concurrently, and saturate the host whenever it buys wall-clock.
+
+What replaces it is not a quieter machine but a **controlled** one:
+- **Compare arms under comparable load.** An A/B where the ON arm runs under load and the OFF arm
+  runs idle measures the load, not the change. Interleave the arms — `tokps.sh` already alternates
+  per run — rather than running all of one arm then all of the other, so drift lands on both.
+- **Absolute phase numbers taken under load are not comparable to historical ones.** The 76 %
+  inflation was real. A `COLI_V4_PROFILE=1` table captured under load is fine as a within-run
+  breakdown or ratio, but do not diff its absolute ms against a figure recorded earlier under
+  different load without saying so.
+- **Widen N instead of demanding quiet.** Load raises variance; the answer is more samples, not
+  fewer processes.
+- Still true, for a different reason: ONE engine at a time (`pgrep -f '[d]eepseek_v4'`), because two
+  engines contend for the same weights and the same ~100 GB budget, and GPU probes must not run
+  against a live engine because they contend for the same device. Those are correctness
+  constraints, not quiet ones.
+
 ### MANDATORY: do not run a long benchmark without asking. Size it to the question first.
 Operator rule. Benchmark wall-clock is the scarcest resource in this project; spending it badly is
 worse than not measuring, because it also delays everything behind it.
