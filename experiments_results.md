@@ -6828,3 +6828,53 @@ block scale on the cold path (it already hoists — `c/quant.h:1456,1481`), and 
 to rows16 (E123: `expert_wait` +66% while `expert_forward` stayed flat). The remaining decode levers
 are elsewhere: `expert_wait` (~1395 ms, structural — two condvar waits per expert call) and the
 streaming/residency path, not the arithmetic.
+
+## E130 — decode critical-path trace: `expert_wait` is LIVE at 8.47%, and it is disk-miss-driven
+
+Wave 2 of the decode trace. 26 stages wired into the amalgamation, then one run: p256, 40 tokens
+(39 decoded), `--memory-gb 96`, one trace-off control and two trace-on replicates. Binary md5
+`7d454de9ba229e0ea083845a7a9e594b`, `METAL=1`, Metal seam linked. Full working in
+`.backlog/e130-decode-trace-analysis.md`; raw logs `.backlog/lab/decode_trace_{off,on_1,on_2}_20260830-*.log`.
+
+**Both axes.** off 42.891 s TTFT / 2.1738 tok/s; on_1 42.497 / 2.1805; on_2 42.521 / 2.1783. The
+instrument costs 0.26% on tok/s, i.e. nothing measurable. All three arms produced the identical
+`generated_text` md5 `d06053793d8f66d4f69a3f7c810441e1` and `S6_PREFIX_CONTRACT: PASS`. Both
+goldens pass on the instrumented binary: `5d04890413ff539e802985ce8c727814` and
+`cc09015d089d9a25d10d75753f9e849a`.
+
+**The pre-registered kill criterion did NOT fire.** Total main-thread wait is **8.47% of decode
+wall** (on_1 8.445, on_2 8.488) against a 3.0% threshold, so `expert_wait` is LIVE and stays open.
+Reconciliation against the untouched `profiled_expert_load_*` bucket is **R = 0.9994 / 0.9993** —
+the seven new stages sum to the number the old single bucket already reported.
+
+**It is one stage.** `wait_finish_complete_block` is 8.321% of decode wall, **98.5% of all wait**.
+Everything else — slot scan, publish, both locks, release — totals 0.12%. `start_slept_calls = 0`:
+the main thread never once blocked acquiring a loader slot, so loader-pool contention needs no work.
+
+**And it is disk misses, not locking.** `finish_completed_at_entry` = 9339/10062 = **92.8%** of
+finishes found the loader already done and cost nothing; only **723** (7.2%) truly parked, at a mean
+of 2.06 ms each. `store_disk_read` fired **765** times — 723 parks against 765 misses is nearly one
+to one. The main thread blocks when, and only when, an expert misses and must be read from disk.
+This settles the open question in the E127 closing note about whether the condvar parks in that
+wrapper bucket are conditional: they are, and the conditional is a cache miss.
+
+**The biggest number in the trace is disk read, and half of it is already hidden.**
+`store_disk_read` = 2987.867 ms = **16.705% of decode wall**, 765 calls, mean 3.906 ms — nearly
+twice the whole main-thread wait. The main thread absorbs 1488 ms of that 2988 ms, so **the async
+loader already conceals 50.2%**. Two independent attacks follow: cut the 7.6% miss rate, or hide
+more of each miss. `io_crosscheck`, recorded at a different point from the same timespec pair,
+matches `store_disk_read` to the microsecond in both arms.
+
+**Two levers closed for free.** `decode_alloc` is **0.028%** (5070 groups, mean 1.0 us), which
+REFUTES the T2 reading that per-token allocation might matter — do not pursue prebind-and-scratch.
+`tensor_lookup` is **0.017%** (1677 calls, mean 1.8 us) — not worth caching.
+
+**OpenMP**, master-side: hc 1.608% + sparse 1.288% = **2.90%**, above the 2% line the roadmap asked
+about but second-order beside disk. Next after that: `store_pack` at 3.912% (3908 calls).
+
+**Known gap, stated rather than hidden:** `omp_head_wall` recorded 0 calls. The instrumented site is
+the bf16 non-resident head path; the shipping build takes the resident `head_ilp` path, which was
+not wired. The head OMP region is UNMEASURED, not measured-as-zero, so 2.90% is a floor.
+
+**Next experiment** targets `wait_finish_complete_block` / `store_disk_read`. The numbers to beat:
+765 misses, 2987.9 ms of disk read, 50.2% hidden, 1488.2 ms landing on the main thread.
