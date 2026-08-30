@@ -30,3 +30,28 @@ cp .backlog/lab/coli_usage.snapshot /tmp/coli_usage.snapshot
 TOKENS=40 N=5 PROMPT_FILE=.backlog/prefill_prompts/p256.txt .backlog/lab/tokps.sh \
   't16=@=OMP_NUM_THREADS=16' 't12=@=OMP_NUM_THREADS=12'
 ```
+
+## T6 — a better mxfp4 expert kernel (the largest remaining lever, NOT attempted)
+`expert_forward` is 41.7% of decode after tonight's work. Both existing fp4 kernels (scalar and
+NEON rows16) sit at 16-19 GB/s against a measured ~105 GB/s host read ceiling, and they are within
+1.00-1.14x of each other, so **raising `COLI_V4_PIN_SLOTS` is closed** (E107 vindicated by direct
+measurement, E126).
+
+Identified inefficiency, unproven: `neon_rows16_accumulate` (c/deepseek_v4.c:14572) applies the
+block scale PER ELEMENT --
+    sums[g] = vaddq(sums[g], vmulq(vmulq(x, values), scales[g]))
+-- two multiplies and an add, where the scale is constant across each 32-column group. Accumulating
+unscaled with one FMA and applying the scale once per block would be ~1.125 ops/element instead of
+3. Ceiling if it delivered 2x on the phase: **+26% decode**.
+
+Two reasons it is not a quick win:
+1. The no-FMA ordering is DELIBERATE -- it is what makes the CPU rows16 path bit-identical to the
+   Metal kernel (`validation/metal/probe_rows16_parity.m`). Changing it breaks that parity and needs
+   the task-level capability gate rather than golden.
+2. Only ~6% of decode expert calls take the NEON path at all (16 pinned of 256 per layer), so a
+   faster NEON kernel must ALSO be made reachable -- either by a cold-layout permute like E125's or
+   by widening pinning, and pinning costs +66% `expert_wait` (E123).
+
+A valid sizing test must keep the existing `vqtbl1q`/`vqtbl4q` gather and change ONLY where the
+scale is applied; my first attempt replaced the gather with scalar rebuilds and measured 0.83x,
+which says nothing about the hypothesis. Estimated 2-4 h with real risk.
