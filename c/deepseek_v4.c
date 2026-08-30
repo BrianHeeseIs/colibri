@@ -1491,8 +1491,17 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
     for (int index = 0; index < flattened; index++)
         mean_square += input[index] * input[index];
     float inverse_rms = 1.0f / sqrtf(mean_square / flattened + norm_eps);
+    /* Decode trace, table=control. A T2 finding contradicted the roadmap's assumption
+     * that decode allocation is near zero: this pair runs twice per layer, and at 43
+     * layers that is hundreds of malloc/free pairs per token across all sites. */
+    const int dt_alloc = coli_v4_decode_trace_on;
+    uint64_t dt_alloc_began = dt_alloc ? coli_v4_decode_trace_clock_ns() : 0;
     float *mixes = malloc((size_t)mix_count * sizeof(*mixes));
     float *pre = malloc((size_t)hc * sizeof(*pre));
+    if (dt_alloc)
+        coli_v4_decode_trace_note(
+            COLI_V4_DT_DECODE_ALLOC,
+            coli_v4_decode_trace_clock_ns() - dt_alloc_began);
     if (!mixes || !pre) {
         free(mixes);
         free(pre);
@@ -3885,11 +3894,18 @@ static int moe_token(float *output,
     int n = config->n_routed_experts;
     int topk = config->num_experts_per_tok;
     size_t gate_count = (size_t)n * d;
+    const int dt_moe_alloc = coli_v4_decode_trace_on;
+    uint64_t dt_moe_alloc_began =
+        dt_moe_alloc ? coli_v4_decode_trace_clock_ns() : 0;
     float *gate = malloc(gate_count * sizeof(*gate));
     float *route_weights = malloc((size_t)topk * sizeof(*route_weights));
     int *indices = malloc((size_t)topk * sizeof(*indices));
     float *expert_output = malloc((size_t)d * sizeof(*expert_output));
     float *shared_output = malloc((size_t)d * sizeof(*shared_output));
+    if (dt_moe_alloc)
+        coli_v4_decode_trace_note(
+            COLI_V4_DT_DECODE_ALLOC,
+            coli_v4_decode_trace_clock_ns() - dt_moe_alloc_began);
     if (!gate || !route_weights || !indices || !expert_output || !shared_output) {
         free(shared_output); free(expert_output); free(indices);
         free(route_weights); free(gate);
@@ -3911,10 +3927,18 @@ static int moe_token(float *output,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
 
+    /* Decode trace, table=control: tensor_lookup covers the by-name view resolution the
+     * shared expert repeats every layer of every token. */
     ColiTensorView w1, w2, w3;
+    const int dt_view = coli_v4_decode_trace_on;
+    uint64_t dt_view_began = dt_view ? coli_v4_decode_trace_clock_ns() : 0;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
+    if (dt_view)
+        coli_v4_decode_trace_note(
+            COLI_V4_DT_TENSOR_LOOKUP,
+            coli_v4_decode_trace_clock_ns() - dt_view_began);
     if (!result) {
         uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
         result = coli_v4_shared_expert_forward_ref(
@@ -3969,6 +3993,9 @@ static int block_token_impl(float *output_hc,
         return set_error(error, error_size, "invalid block arguments");
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
+    const int dt_blk_alloc = coli_v4_decode_trace_on;
+    uint64_t dt_blk_alloc_began =
+        dt_blk_alloc ? coli_v4_decode_trace_clock_ns() : 0;
     float *residual = malloc(hd * sizeof(*residual));
     float *state = malloc(hd * sizeof(*state));
     float *reduced = malloc((size_t)d * sizeof(*reduced));
@@ -3976,6 +4003,10 @@ static int block_token_impl(float *output_hc,
     float *branch = malloc((size_t)d * sizeof(*branch));
     float *post = malloc((size_t)hc * sizeof(*post));
     float *comb = malloc((size_t)hc * hc * sizeof(*comb));
+    if (dt_blk_alloc)
+        coli_v4_decode_trace_note(
+            COLI_V4_DT_DECODE_ALLOC,
+            coli_v4_decode_trace_clock_ns() - dt_blk_alloc_began);
     if (!residual || !state || !reduced || !normalized || !branch || !post || !comb) {
         free(comb); free(post); free(branch); free(normalized);
         free(reduced); free(state); free(residual);
@@ -5187,10 +5218,18 @@ static int moe_token_pipeline(float *output,
     }
 #endif
 
+    /* Decode trace, table=control: tensor_lookup covers the by-name view resolution the
+     * shared expert repeats every layer of every token. */
     ColiTensorView w1, w2, w3;
+    const int dt_view = coli_v4_decode_trace_on;
+    uint64_t dt_view_began = dt_view ? coli_v4_decode_trace_clock_ns() : 0;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
+    if (dt_view)
+        coli_v4_decode_trace_note(
+            COLI_V4_DT_TENSOR_LOOKUP,
+            coli_v4_decode_trace_clock_ns() - dt_view_began);
     if (!result) {
         uint64_t began = coli_v4_profile_on ? coli_v4_profile_now_ns() : 0;
         result = coli_v4_shared_expert_forward_ref(
@@ -5957,6 +5996,9 @@ static int block_token_pipeline(float *output_hc,
         return set_error(error, error_size, "invalid block arguments");
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
+    const int dt_blk_alloc = coli_v4_decode_trace_on;
+    uint64_t dt_blk_alloc_began =
+        dt_blk_alloc ? coli_v4_decode_trace_clock_ns() : 0;
     float *residual = malloc(hd * sizeof(*residual));
     float *state = malloc(hd * sizeof(*state));
     float *reduced = malloc((size_t)d * sizeof(*reduced));
@@ -5964,6 +6006,10 @@ static int block_token_pipeline(float *output_hc,
     float *branch = malloc((size_t)d * sizeof(*branch));
     float *post = malloc((size_t)hc * sizeof(*post));
     float *comb = malloc((size_t)hc * hc * sizeof(*comb));
+    if (dt_blk_alloc)
+        coli_v4_decode_trace_note(
+            COLI_V4_DT_DECODE_ALLOC,
+            coli_v4_decode_trace_clock_ns() - dt_blk_alloc_began);
     if (!residual || !state || !reduced || !normalized || !branch ||
         !post || !comb) {
         free(comb); free(post); free(branch); free(normalized);
@@ -10127,7 +10173,14 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
      * Each row retains the same scalar accumulation order and the final scan
      * retains vocabulary order, so logits/tie-breaking do not change. */
     if (resident) {
+        const int dt_head_alloc = coli_v4_decode_trace_on;
+        uint64_t dt_head_alloc_began =
+            dt_head_alloc ? coli_v4_decode_trace_clock_ns() : 0;
         float *scores = malloc((size_t)vocab * sizeof(*scores));
+        if (dt_head_alloc)
+            coli_v4_decode_trace_note(
+                COLI_V4_DT_DECODE_ALLOC,
+                coli_v4_decode_trace_clock_ns() - dt_head_alloc_began);
         if (!scores) return -1;
         if (coli_v4_head_ilp_enabled()) {
             const int blocks = vocab / 4;
