@@ -6553,3 +6553,69 @@ Open, unmeasured: both fp4 kernels sit at 16-19 GB/s of the ~105 GB/s ceiling, a
 second the fp4 NEON does ~37.8 G/s against the fp8 rows16 kernel's ~66 G/s despite fp4 packing two
 elements per byte. A genuinely better fp4 kernel may exist, but the bar is the existing NEON one,
 not the scalar one, which makes it far larger and riskier than E125/E126 were.
+
+## E127. Sparse-attention head loop parallelised — and the night's aggregate: +15.27% tok/s
+
+### E127a — `COLI_V4_SPARSE_OMP` (default on)
+`coli_v4_sparse_attention_ref` (:3532) loops the 64 attention heads **serially**, each writing only
+its own slice of `output` — 6% of decode single-threaded on a 16-thread machine. The existing
+fast/ordered dot variants were already SIMD; the *loop around them* was not parallel.
+
+Two things had to change for the pragma to be legal rather than merely faster:
+- the `scores` scratch was **shared across heads** and is now per-iteration. `index_topk` is 512 and
+  the existing stack buffer is exactly 512, so the parallel path allocates **nothing**;
+- the two `return -1` paths **inside** the loop became a flag, since returning from an OpenMP region
+  is not allowed. The flag is checked after the loop so both arms still reject the same inputs — the
+  unit test asserts that directly rather than assuming it, because converting a `return` into a flag
+  is exactly the change that silently stops reporting failures.
+
+No summation is reordered: each head's internal accumulation is untouched.
+
+**attn_sparse 1148.2 -> 245.0 ms (-78.7%, 4.69x); attention 6702.8 -> 5901.8 (-12.0%);
+decode_wall 19106.2 -> 18564.6.** TTFT also fell 45.3 -> 43.0 s.
+
+### E127b — aggregate for the night (p256, 40 tokens, N=5)
+All four of tonight's flags off vs on, against the E125 baseline:
+
+| arm | decode median [range] | tok/s | TTFT median [range] |
+|---|---|---|---|
+| E125 only | 21.065 [20.969, 21.228] | 1.8514 | 48.660 [48.431, 48.847] |
+| **all four on** | **18.275 [18.026, 18.355]** | **2.1341** | **42.953 [42.705, 43.054]** |
+
+**tok/s +15.27%**, decode **-13.2%**, **TTFT -11.7%**, ranges **non-overlapping on both axes**, and
+the output md5 was **identical across all 10 runs**. Both golden gates PASS with every flag on.
+
+### Cumulative
+| stage | tok/s | vs start |
+|---|---|---|
+| before E125 | 1.6655 | — |
+| E125 (fp8 rows16) | 1.8350 | +10.18% |
+| **E126 + E127 (head ILP, hc_norm, fp8 dual, sparse)** | **2.1341** | **+28.1%** |
+
+Decode phase table, start of session -> now (p256, 39 tokens):
+| phase | before | after |
+|---|---:|---:|
+| decode_wall | 20977.5 | 18564.6 |
+| attention | 6697.6 | 5901.8 |
+| &nbsp;&nbsp;attn_sparse | 1139.9 | 245.0 |
+| head | 1399.6 | ~527 |
+| shared_expert | 1372.6 | 965.1 |
+| hc_norm | 1092.4 | ~402 |
+| **expert_forward** | 7557.1 | **7748** (untouched; now 41.7%) |
+
+Every step was bit-exact — the sacred golden md5 `5d04890413ff539e802985ce8c727814` and the shipping
+`cc09015d089d9a25d10d75753f9e849a` were reproduced after each landing, and no expected value was
+ever edited.
+
+### The pattern worth remembering
+All four wins were the SAME defect class: **a fast path compiled only for x86, or a hot loop left
+serial on a 16-thread machine**. None required new numerics — three reused existing kernels or
+existing idioms, and the fourth was a loop restructuring. The systematic move is to grep the decode
+path for `#ifdef __AVX2__` without an `__aarch64__` sibling, and for hot loops with no `#pragma omp`.
+
+### Null result: `OMP_NUM_THREADS`
+16 threads 18987.5 ms, 12 threads 19175.6 (worse), 10 threads 18704.8 (better). Spread 2.5%, inside
+the 5-13% decode noise floor and below the 3% adoption bar, so **no resolvable difference — keeping
+the default 16**. Not escalated to N=5 (that is backlog B3, ~45 min, for an effect that cannot exceed
+~2.5%). This also contradicts `c/omp_tune.h`'s P-cores-only policy for this workload: the four
+efficiency cores are not hurting here.

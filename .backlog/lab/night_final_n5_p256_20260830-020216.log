@@ -1,0 +1,16 @@
+tok/s A/B  tokens=40  N=5  prompt=p256.txt
+  run1 e125_only              ttft=  48.799s decode=  21.065s tok/s=1.8514   md5=d06053793d8f66d4f69a3f7c810441e1
+  run1 night_all              ttft=  42.705s decode=  18.200s tok/s=2.1429   md5=d06053793d8f66d4f69a3f7c810441e1
+  run2 e125_only              ttft=  48.660s decode=  21.158s tok/s=1.8433   md5=d06053793d8f66d4f69a3f7c810441e1
+  run2 night_all              ttft=  43.054s decode=  18.026s tok/s=2.1635   md5=d06053793d8f66d4f69a3f7c810441e1
+  run3 e125_only              ttft=  48.566s decode=  20.969s tok/s=1.8599   md5=d06053793d8f66d4f69a3f7c810441e1
+  run3 night_all              ttft=  42.953s decode=  18.319s tok/s=2.1289   md5=d06053793d8f66d4f69a3f7c810441e1
+  run4 e125_only              ttft=  48.847s decode=  21.228s tok/s=1.8372   md5=d06053793d8f66d4f69a3f7c810441e1
+  run4 night_all              ttft=  42.959s decode=  18.275s tok/s=2.1341   md5=d06053793d8f66d4f69a3f7c810441e1
+  run5 e125_only              ttft=  48.431s decode=  21.016s tok/s=1.8557   md5=d06053793d8f66d4f69a3f7c810441e1
+  run5 night_all              ttft=  42.829s decode=  18.355s tok/s=2.1248   md5=d06053793d8f66d4f69a3f7c810441e1
+
+SUMMARY (median tok/s)
+  e125_only                1.8514 tok/s  baseline            deterministic  md5=d06053793d8f66d4f69a3f7c810441e1 
+  night_all                2.1341 tok/s  +15.27% tok/s       deterministic  md5=d06053793d8f66d4f69a3f7c810441e1 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.WsTMJa
