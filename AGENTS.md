@@ -91,6 +91,60 @@ They do not move together. `COLI_V4_METAL_ATTN=1` is -15.9 % TTFT but trends *ne
 delta under ~10 % cannot be resolved at n=3, and several apparent effects here reversed when a
 third or fifth point was added.
 
+## The decode critical path is MEASURED now (E130). Do not re-derive it from phase totals
+`COLI_V4_DECODE_TRACE=1` (with `COLI_V4_PROFILE=1`) decomposes decode into 26 stages under the
+`v4_profile ` prefix. Measured at p256 / 40 tokens, two replicates agreeing to 0.61 %, and the
+instrument costs 0.26 % of tok/s — it is free, so profile before guessing.
+
+| finding | number | consequence |
+|---|---|---|
+| main-thread wait | **8.47 % of decode wall** | `expert_wait` is LIVE; the old "4.4 %, no I/O stall" premise is DEAD |
+| `wait_finish_complete_block` | 8.32 % | **98.5 % of all wait is ONE stage** — a condvar park |
+| `store_disk_read` | **16.7 %** of decode wall, 765 calls, mean 3.9 ms | largest single stage in the whole trace |
+| loader already hides | **50.2 %** of disk time | the async loader works; half the read is already concealed |
+| `finish_completed_at_entry` | 9339 / 10062 = **92.8 %** | most finishes cost nothing |
+| `finish_slept_calls` | 723 (7.2 %) vs **765** disk reads | ~1:1 — **the main thread parks if and only if an expert misses** |
+| `start_slept_calls` | **0** | the loader pool was NEVER exhausted |
+| `decode_alloc` | **0.028 %** | per-token allocation is DEAD. Do not pursue prebind-and-scratch |
+| `tensor_lookup` | **0.017 %** | by-name view resolution is DEAD. Not worth caching |
+| OpenMP master-side | hc 1.61 % + sparse 1.29 % = **2.90 %** | real but second-order beside disk |
+
+**`start_slept_calls = 0` retires the loader-lane family on better evidence than before.** Adding
+worker threads cannot help when the pool is never the constraint. The old rejection reasoned from
+"expert_wait is only 4.4 %", which E130 shows was wrong; the lever is still dead, for a new reason.
+
+**The two live attacks** are therefore: cut the **7.6 % miss rate** (765 of 10062 lookups), or hide
+more of each miss than the 50.2 % already hidden. Any candidate must move one of those numbers.
+
+**Known gap:** `omp_head_wall` records 0 calls because the instrumented head site is the
+non-resident bf16 path while the shipping build takes resident `head_ilp`. That region is
+UNMEASURED, not zero, so 2.90 % is a floor.
+
+### Instrumenting the amalgamation: storage must have exactly ONE owner
+`deepseek_v4.c` is compiled ~26 times, once per `-DCOLI_V4_UNIT_*`. Anything with internal linkage
+in the shared prologue (lines 1-80) therefore exists **once per object**, so a counter written in
+one unit is invisible to a report in another and the report prints a plausible table of ZEROS.
+`c/decode_trace.h` solves this with a mode switch: owner mode (default, and
+`COLI_V4_UNIT_GENERATE_STATS`) holds the storage; `COLI_V4_DECODE_TRACE_DECLS_ONLY` gives every
+other unit the extern bridge and NO local adder, so the wrong call is a compile error rather than
+silent data loss. `c/tests/test_decode_trace_link*` enforces it across two translation units.
+Tests that link a SINGLE unit (`test_hc_omp`, `test_sparse_omp`) need
+`c/tests/decode_trace_owner_stub.c` on their link line or they fail with undefined bridge symbols.
+
+### `make -C c check` STARTS WITH `make clean` and DELETES your built binaries
+Its target is `clean; portable; test`. It removed `c/deepseek_v4` and the unit-test binaries
+mid-session. **Run it BEFORE the `METAL=1` build, never after**, then rebuild and re-verify
+`nm c/deepseek_v4 | grep -c coli_v4_metal_expert_forward_batch` > 0. It also ABORTS at the
+pre-existing `tests/test_fp8_passthrough` link failure (undefined `_coli_fp8_minprod_enabled`,
+arm64), so it never reaches the later tests — compare "aborts at the same point with the same
+error set", not "same full failure set".
+
+### The expert store's shipping implementation is `lookup_hot`, not `coli_expert_lookup`
+`coli_expert_lookup` (`c/expert_store.h:76`) is a `static inline` vtable wrapper. The implementation
+the shipping build installs is `lookup_hot`, bound via the `hot_operations` vtable in
+`coli_deepseek_v4_expert_store_open`. A plain `lookup` sits beside it and is NOT the decode path;
+instrumenting that one yields an empty table that looks like an idle path.
+
 ### MANDATORY: no background agents in flight while a timing run executes
 **This is a measurement-integrity rule, not a rule about machine noise.** A `COLI_V4_PROFILE=1`
 profile taken while two explore agents were running reported `decode_wall` 28500 ms and
