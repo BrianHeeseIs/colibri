@@ -868,6 +868,23 @@ tests/test_head_ilp$(EXE): tests/test_head_ilp.c head_ilp.h
 tests/test_decode_trace$(EXE): tests/test_decode_trace.c decode_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Two-translation-unit guard for the decode trace: the owner object holds the counters,
+# the consumer object is built the way every non-owner COLI_V4_UNIT_* object is built
+# (-DCOLI_V4_DECODE_TRACE_DECLS_ONLY) and may reach the counters only through the extern
+# bridge. Objects are compiled separately because the two modes need different -D flags.
+# -Werror=implicit-function-declaration keeps a missing bridge a hard error rather than a
+# warning that links anyway and passes for the wrong reason.
+tests/test_decode_trace_link$(EXE): tests/test_decode_trace_link_main.c \
+	tests/test_decode_trace_link_owner.c tests/test_decode_trace_link_consumer.c decode_trace.h
+	$(CC) $(CFLAGS) -Werror=implicit-function-declaration \
+		-c tests/test_decode_trace_link_owner.c -o tests/test_decode_trace_link_owner.o
+	$(CC) $(CFLAGS) -Werror=implicit-function-declaration -DCOLI_V4_DECODE_TRACE_DECLS_ONLY \
+		-c tests/test_decode_trace_link_consumer.c -o tests/test_decode_trace_link_consumer.o
+	$(CC) $(CFLAGS) -Werror=implicit-function-declaration -DCOLI_V4_DECODE_TRACE_DECLS_ONLY \
+		-c tests/test_decode_trace_link_main.c -o tests/test_decode_trace_link_main.o
+	$(CC) tests/test_decode_trace_link_owner.o tests/test_decode_trace_link_consumer.o \
+		tests/test_decode_trace_link_main.o -o $@ $(LDFLAGS)
+
 tests/test_indexer_score$(EXE): tests/test_indexer_score.c indexer_score.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
