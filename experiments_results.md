@@ -6619,3 +6619,17 @@ the 5-13% decode noise floor and below the 3% adoption bar, so **no resolvable d
 the default 16**. Not escalated to N=5 (that is backlog B3, ~45 min, for an effect that cannot exceed
 ~2.5%). This also contradicts `c/omp_tune.h`'s P-cores-only policy for this workload: the four
 efficiency cores are not hurting here.
+
+### E127c — the night's gain generalizes across prompt length
+p064, 40 tokens, N=5, same two arms:
+
+| arm | tok/s | vs p256 result |
+|---|---|---|
+| E125 only | 1.8161 | — |
+| **all four on** | **2.0558** | **+13.20%** (p256 gave +15.27%) |
+
+Both arms deterministic, md5 identical. The gain is slightly smaller at the shorter prompt, with a
+coherent mechanism: `attn_sparse` scales with the number of KV candidates, so at p064 (64 tokens)
+that phase is a smaller share of decode than at p256 (184 tokens) and its 4.69x contributes less.
+Everything else is per-token work and carries over unchanged. Cost 10 min, so this did not need the
+p512 sweep parked in the backlog.

@@ -1,0 +1,16 @@
+tok/s A/B  tokens=40  N=5  prompt=p064.txt
+  run1 e125_only              ttft=  24.765s decode=  21.350s tok/s=1.8267   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run1 night_all              ttft=  23.354s decode=  18.882s tok/s=2.0655   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run2 e125_only              ttft=  24.847s decode=  21.474s tok/s=1.8161   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run2 night_all              ttft=  23.298s decode=  19.010s tok/s=2.0516   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run3 e125_only              ttft=  24.956s decode=  21.204s tok/s=1.8393   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run3 night_all              ttft=  23.288s decode=  18.822s tok/s=2.0720   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run4 e125_only              ttft=  24.937s decode=  21.515s tok/s=1.8127   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run4 night_all              ttft=  23.377s decode=  18.971s tok/s=2.0558   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run5 e125_only              ttft=  25.318s decode=  21.547s tok/s=1.8100   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+  run5 night_all              ttft=  23.480s decode=  19.153s tok/s=2.0362   md5=0cbfb727ed2acda5feb8cf6b8de2112b
+
+SUMMARY (median tok/s)
+  e125_only                1.8161 tok/s  baseline            deterministic  md5=0cbfb727ed2acda5feb8cf6b8de2112b 
+  night_all                2.0558 tok/s  +13.20% tok/s       deterministic  md5=0cbfb727ed2acda5feb8cf6b8de2112b 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.CxKc5d
