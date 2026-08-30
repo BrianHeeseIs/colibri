@@ -4489,10 +4489,23 @@ static void dual_expert_loader_init(void) {
     if (available) atexit(dual_expert_loader_shutdown);
 }
 
+/* Decode trace, table=wait. This is the first half of what coli_v4_profile bills as the
+ * single COLI_V4_PROFILE_EXPERT_WAIT bucket (see profiled_expert_load_start below, which
+ * is deliberately left untouched so the decomposition can be reconciled against it).
+ * Every added statement is gated on coli_v4_decode_trace_on, so the default build reads
+ * one global and does nothing else. */
 static int dual_expert_load_start(ExpertLoadHandle *handle,
                                   ExpertLoadJob *job) {
+    const int trace = coli_v4_decode_trace_on;
+    uint64_t mark = trace ? coli_v4_decode_trace_clock_ns() : 0;
+    int slept = 0;
     pthread_once(&dual_loader_once, dual_expert_loader_init);
     pthread_mutex_lock(&dual_loader_pool.mutex);
+    if (trace) {
+        uint64_t now = coli_v4_decode_trace_clock_ns();
+        coli_v4_decode_trace_note(COLI_V4_DT_WAIT_START_LOCK, now - mark);
+        mark = now;
+    }
     int selected = -1;
     while (selected < 0) {
         int available = 0;
@@ -4502,14 +4515,33 @@ static int dual_expert_load_start(ExpertLoadHandle *handle,
             available++;
             if (!slot->job && !slot->pending) { selected = i; break; }
         }
+        if (trace) {
+            uint64_t now = coli_v4_decode_trace_clock_ns();
+            coli_v4_decode_trace_note(COLI_V4_DT_WAIT_START_SCAN, now - mark);
+            mark = now;
+        }
         if (!available ||
             (selected < 0 && available < DUAL_EXPERT_LOADER_COUNT)) {
             pthread_mutex_unlock(&dual_loader_pool.mutex);
+            if (trace) {
+                coli_v4_decode_trace_note(COLI_V4_DT_START_CALLS, UINT64_C(1));
+                if (slept)
+                    coli_v4_decode_trace_note(COLI_V4_DT_START_SLEPT_CALLS,
+                                              UINT64_C(1));
+            }
             return -1;
         }
-        if (selected < 0)
+        if (selected < 0) {
             pthread_cond_wait(&dual_loader_pool.idle,
                               &dual_loader_pool.mutex);
+            slept = 1;
+            if (trace) {
+                uint64_t now = coli_v4_decode_trace_clock_ns();
+                coli_v4_decode_trace_note(COLI_V4_DT_WAIT_START_IDLE_BLOCK,
+                                          now - mark);
+                mark = now;
+            }
+        }
     }
     DualExpertLoaderSlot *slot = &dual_loader_pool.slots[selected];
     slot->job = job;
@@ -4519,22 +4551,66 @@ static int dual_expert_load_start(ExpertLoadHandle *handle,
     handle->loader_slot = selected;
     pthread_cond_broadcast(&dual_loader_pool.ready);
     pthread_mutex_unlock(&dual_loader_pool.mutex);
+    if (trace) {
+        coli_v4_decode_trace_note(COLI_V4_DT_WAIT_START_PUBLISH,
+                                  coli_v4_decode_trace_clock_ns() - mark);
+        coli_v4_decode_trace_note(COLI_V4_DT_START_CALLS, UINT64_C(1));
+        if (slept)
+            coli_v4_decode_trace_note(COLI_V4_DT_START_SLEPT_CALLS, UINT64_C(1));
+    }
     return 0;
 }
 
+/* Decode trace, table=wait. Second half of the COLI_V4_PROFILE_EXPERT_WAIT bucket.
+ * completed_at_entry distinguishes "the loader was already done" from "the main thread
+ * genuinely blocked", which is the distinction the 3% kill criterion turns on: only the
+ * latter is time the main thread could have spent computing. */
 static int dual_expert_load_finish(ExpertLoadHandle *handle) {
     if (!handle->active || handle->loader_slot < 0 ||
         handle->loader_slot >= DUAL_EXPERT_LOADER_COUNT) return -1;
+    const int trace = coli_v4_decode_trace_on;
+    uint64_t mark = trace ? coli_v4_decode_trace_clock_ns() : 0;
     pthread_mutex_lock(&dual_loader_pool.mutex);
     DualExpertLoaderSlot *slot =
         &dual_loader_pool.slots[handle->loader_slot];
-    while (!slot->completed)
+    if (trace) {
+        uint64_t now = coli_v4_decode_trace_clock_ns();
+        coli_v4_decode_trace_note(COLI_V4_DT_WAIT_FINISH_LOCK, now - mark);
+        mark = now;
+    }
+    int completed_at_entry = slot->completed ? 1 : 0;
+    int wakes = 0;
+    while (!slot->completed) {
         pthread_cond_wait(&dual_loader_pool.complete,
                           &dual_loader_pool.mutex);
+        wakes++;
+    }
+    if (trace) {
+        uint64_t now = coli_v4_decode_trace_clock_ns();
+        coli_v4_decode_trace_note(COLI_V4_DT_WAIT_FINISH_COMPLETE_BLOCK,
+                                  now - mark);
+        mark = now;
+    }
     slot->job = NULL;
     pthread_cond_broadcast(&dual_loader_pool.idle);
     pthread_mutex_unlock(&dual_loader_pool.mutex);
     handle->active = 0;
+    if (trace) {
+        coli_v4_decode_trace_note(COLI_V4_DT_WAIT_FINISH_RELEASE,
+                                  coli_v4_decode_trace_clock_ns() - mark);
+        coli_v4_decode_trace_note(COLI_V4_DT_FINISH_CALLS, UINT64_C(1));
+        ColiV4DecodeTraceWaitClass wait_class =
+            coli_v4_decode_trace_classify_wait(completed_at_entry, wakes);
+        if (wait_class == COLI_V4_DT_NO_SLEEP) {
+            coli_v4_decode_trace_note(COLI_V4_DT_FINISH_COMPLETED_AT_ENTRY,
+                                      UINT64_C(1));
+        } else {
+            coli_v4_decode_trace_note(COLI_V4_DT_FINISH_SLEPT_CALLS, UINT64_C(1));
+            if (wait_class == COLI_V4_DT_FALSE_WAKE)
+                coli_v4_decode_trace_note(COLI_V4_DT_FINISH_WAKE_ITERATIONS,
+                                          (uint64_t)wakes);
+        }
+    }
     return 0;
 }
 #endif
