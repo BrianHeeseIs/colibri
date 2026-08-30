@@ -6633,3 +6633,51 @@ coherent mechanism: `attn_sparse` scales with the number of KV candidates, so at
 that phase is a smaller share of decode than at p256 (184 tokens) and its 4.69x contributes less.
 Everything else is per-token work and carries over unchanged. Cost 10 min, so this did not need the
 p512 sweep parked in the backlog.
+
+### E127d — indexer loops parallelised (`COLI_V4_INDEXER_OMP`, default on)
+The indexer's head-weight loop (64 x 4096) and candidate-scoring loop (count x 64 x 128) both ran
+serially. Each writes one independent output per iteration with its inner sums untouched, so
+parallelising over the outer index is bit-exact. The scoring loop was extracted to
+`c/indexer_score.h` so the shipped code is exactly what the unit test covers.
+
+**indexer 616.7 -> 472.4 ms (-23.4%).** Stated honestly: that is ~0.8% of decode and
+**decode_wall did not move outside single-run noise** (18564.6 -> 18600.6). Kept because it is free
+and bit-exact, not because it is measurable end to end. No N=5 was spent on it — a 15-minute run
+cannot resolve 0.8% against a 5-13% noise floor.
+
+The frozen copy of this function in the `INDEXER_SNAPSHOT` unit is deliberately unchanged: it is a
+reference for state-copy testing, not a hot path.
+
+Test note: the unit test passed immediately (both branches compute the same thing), so its
+sensitivity was proven separately by injecting a regrouped inner sum and confirming it fails 467 of
+512 rows.
+
+## Decode optimisation: where it stands, and what is closed
+
+| phase | session start | now | status |
+|---|---:|---:|---|
+| `expert_forward` | 7557.1 | ~7748 | **untouched, 41.7% — the only large lever left** |
+| `attention` | 6697.6 | 5901.8 | attn_out/attn_qkv done in E125; attn_sparse done in E127 |
+| `head` | 1399.6 | ~527 | done (E126a) |
+| `expert_wait` | 1320.5 | ~1395 | structural (condvar, 2 per expert call) — untouched |
+| `shared_expert` | 1619.8 | 965.1 | done (E125 + E126c) |
+| `hc_norm` | 1089.8 | ~402 | done (E126b) |
+| `indexer` | 734.0 | 472.4 | done (E127d) |
+| `compressor` | 560.2 | ~557 | projection/pooling already parallel |
+| **decode_wall** | **20977.5** | **~18565** | **tok/s 1.6655 -> 2.1341, +28.1%** |
+
+**Closed by measurement — do not re-open without new evidence:**
+- Raising `COLI_V4_PIN_SLOTS`: the scalar and NEON mxfp4 kernels are within 1.00-1.14x head-to-head
+  (E126), so full coverage caps at ~+3.5% before the +66% `expert_wait` it costs.
+- `OMP_NUM_THREADS` 12 or 10 vs 16: null, 2.5% spread, inside the noise floor.
+- Drop-in NEON for the row-major fp8 loop: neutral (E124) — the win needed the rows16 layout.
+- Arithmetic e4m3 decode: 0.70x, the 1 KB LUT is L1-resident and retires ~1/cycle.
+- Side-by-side packed weights: +4 GB RSS reverses the gain (E125) — permute in place.
+- The `#ifdef __AVX2__`-without-`__aarch64__` sweep is **exhausted for decode**: the only remaining
+  sites are an `immintrin.h` include guard and the prefill batch path.
+
+**Open, needs a decision:** a better mxfp4 expert kernel. See `.backlog/benchmark-backlog.md` T6 —
+the identified inefficiency is that `neon_rows16_accumulate` applies the block scale per element
+(2 muls + 1 add) where the scale is constant across each 32-column group. Hoisting it would be
+~1.125 ops/element instead of 3. Two blockers: the unfused ordering is what makes the CPU path
+bit-identical to the Metal kernel, and only ~6% of decode expert calls reach the NEON path at all.

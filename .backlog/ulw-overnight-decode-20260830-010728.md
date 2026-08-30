@@ -110,3 +110,17 @@ scale-lane indexing was wrong too. So V2 measures MY BAD DECODE, not the hoisted
    change ONLY where the scale is applied, which needs the engine's static NeonRows16Tables.
 Same run also re-measured scalar vs existing NEON at 1.00-1.08x (previously 1.03-1.14x), which
 further confirms that raising pin coverage is not a lever.
+
+## FINAL STATE (operator asleep; all questions banked below)
+Landed tonight, each bit-exact with both golden gates reproduced:
+  E126a head ILP           head    1399.6 -> 524.4 ms
+  E126b hc_norm omp        hc_norm 1092.4 -> 398.3 ms
+  E126c fp8 dual rows16    shared  1372.6 -> 965.1 ms
+  E127a sparse attn omp    sparse  1148.2 -> 245.0 ms
+  E127d indexer omp        indexer  616.7 -> 472.4 ms (below decode_wall resolution, kept anyway)
+MEASURED AGGREGATE  p256 N=5: tok/s 1.8514 -> 2.1341 (+15.27%), TTFT -11.7%, non-overlapping, md5 identical
+                    p064 N=5: +13.20% (generalises; smaller because attn_sparse scales with context)
+SESSION TOTAL       1.6655 -> 2.1341 tok/s = +28.1%
+Branch ft-decode-apple-metal, pushed to fork, tree clean, 5 unit tests + both goldens green.
+
+## I am now blocked on operator input for the only large remaining lever.
