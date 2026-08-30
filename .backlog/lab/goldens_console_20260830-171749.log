@@ -1,0 +1,6 @@
+seed md5: 599f3d12e9347ef30541bd6f9ba18bde
+== golden.sh (expect 5d04890413ff539e802985ce8c727814) ==
+golden_rc=2
+== golden_default.sh (expect cc09015d089d9a25d10d75753f9e849a) ==
+golden_default_rc=2
+ALL_GOLDENS_DONE
