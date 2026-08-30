@@ -147,6 +147,14 @@ COLI_V4_METAL_VARIANT=simd_exact_cold COLI_V4_METAL_ATTN=1 COLI_V4_MOE_BATCHED_R
 COLI_V4_MOE_WHOLE_PROMPT=1 COLI_V4_FP8_ROWS16=1
 ```
 (All of these are now DEFAULTS; the list is written out only so the stack is explicit.)
+**Decode is now +28.1% since E125** (1.6655 -> 2.1341 tok/s at p256, N=5, all bit-exact). After the
+fp8 kernel below, four more landed in E126/E127 -- `COLI_V4_HEAD_ILP`, `COLI_V4_HC_OMP`,
+`COLI_V4_FP8_DUAL_ROWS16`, `COLI_V4_SPARSE_OMP` -- all default ON.
+**They were all the same defect: an `#ifdef __AVX2__` fast path with no `__aarch64__` sibling, or a
+hot loop with no `#pragma omp`.** That sweep is now exhausted for decode. Two things NOT to retry:
+raising `COLI_V4_PIN_SLOTS` (the scalar and NEON mxfp4 kernels are within 1.00-1.14x, measured
+head-to-head), and `OMP_NUM_THREADS=12` (null at N=1, 2.5% spread, inside the noise floor).
+
 **Decode moved for the first time in E125**: `COLI_V4_FP8_ROWS16` is +10.18% tok/s, bit-exact, and
 free of memory cost. Note what did NOT work, so it is not retried: a drop-in NEON port is neutral
 (E124), arithmetic e4m3 decode is 0.70x, and keeping the packed weights as a SECOND copy costs +4 GB

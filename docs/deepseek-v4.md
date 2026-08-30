@@ -107,6 +107,10 @@ Metal environment variable a silent no-op — check with
 | `COLI_V4_MOE_GROUPED_STATS=1` | off | print group counts, `metal_row_share` and the group-size histogram |
 | `COLI_V4_FP8_ROWS16` | **on** | NEON rows16 fp8 matvec for DECODE attention projections. Bit-exact, +10.18% tok/s (E125) |
 | `COLI_V4_FP8_ROWS16_MAXMB` | 8192 | legacy cap from the rejected shadow-copy design; the in-place permute uses no extra memory |
+| `COLI_V4_HEAD_ILP` | **on** | four vocabulary rows in flight in the LM head. Bit-exact, head phase -62% (E126) |
+| `COLI_V4_HC_OMP` | **on** | parallelise the hyper-connection mix matvec. Bit-exact, phase -63% (E126) |
+| `COLI_V4_FP8_DUAL_ROWS16` | **on** | rows16 kernel for the fp8 dual matvec (shared-expert gate/up). Bit-exact (E126) |
+| `COLI_V4_SPARSE_OMP` | **on** | parallelise the 64-head sparse-attention loop. Bit-exact, phase -79% (E127) |
 | `COLI_V4_BASELINE=1` | off | restore every historical default in one move |
 
 **Two different `ROWS16` knobs — do not confuse them.** `COLI_V4_METAL_ROWS16` gates the
@@ -161,6 +165,28 @@ differences are wording-level. Two gates enforce this split:
   **not** sacred — re-record it deliberately when a default changes, and say why.
 
 For bit-exactness differentials, regression triage or bisecting, set `COLI_V4_BASELINE=1` first.
+
+### Decode: +28% across E125-E127
+Decode went from 1.6655 to 2.1341 tok/s at p256 (N=5, non-overlapping ranges), and TTFT improved as
+a side effect because several of these kernels are also on the prefill per-item path. **Every step is
+bit-exact**: both golden hashes were reproduced after each landing and no expected value was edited.
+
+| stage | tok/s | vs start |
+|---|---|---|
+| before E125 | 1.6655 | — |
+| E125 fp8 rows16 | 1.8350 | +10.18% |
+| E126/E127 head ILP, hc_norm, fp8 dual, sparse attention | **2.1341** | **+28.1%** |
+
+**All four E126/E127 wins were the same defect class**: a fast path compiled only for x86, or a hot
+loop left serial on a 16-thread machine. None needed new numerics. The systematic move for the next
+reader is to grep the decode path for `#ifdef __AVX2__` with no `__aarch64__` sibling, and for hot
+loops with no `#pragma omp`. That sweep is now **exhausted for decode** — the remaining AVX2-only
+sites are an `immintrin.h` include guard and the prefill batch path.
+
+Largest remaining phase is `expert_forward` at ~41.7%, and it is **not** a coverage problem: the
+scalar and NEON mxfp4 kernels measure within 1.00-1.14x of each other, so raising
+`COLI_V4_PIN_SLOTS` is closed (E107 vindicated by direct measurement in E126). See
+`.backlog/benchmark-backlog.md` T6 for the identified inefficiency and why it is not a quick win.
 
 ### Decode: +10.18% from a NEON fp8 kernel (E125)
 Decode profiling (E123) accounts for 99.3% of it: `attn_out` 21.6%, `expert_forward` 32.2%,

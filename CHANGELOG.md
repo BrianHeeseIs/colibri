@@ -54,6 +54,17 @@ arm at p256 (N=3-5, non-overlapping ranges): **time to first token -48.2%, net w
   on demand and in practice never has to. Bit-exact: both golden hashes are unchanged and the output
   hash was identical across all ten measurement runs.
 
+- **Decode is a further 15.3% faster** (`COLI_V4_HEAD_ILP`, `COLI_V4_HC_OMP`,
+  `COLI_V4_FP8_DUAL_ROWS16`, `COLI_V4_SPARSE_OMP`, all on by default, all bit-exact). Four separate
+  cases of the same defect: a vectorised path compiled only for x86, or a hot loop left serial on a
+  sixteen-thread machine. The vocabulary head now keeps four accumulator chains in flight, which
+  matters because it was latency-bound on a four-thousand-deep dependency chain rather than starved
+  of bandwidth; the hyper-connection normalisation and the sixty-four-head sparse attention loop are
+  parallelised; and the shared expert's gate and up projections reuse the existing rows16 kernel.
+  Together with the earlier fp8 work this takes decode from 1.6655 to 2.1341 tokens per second at
+  p256, and time to first token also improves since several of these run on the prefill path too.
+  Both golden hashes are unchanged throughout.
+
 ### Notes
 
 - **The default output is no longer token-identical to the historical CPU arm.** It is
