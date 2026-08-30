@@ -70,6 +70,7 @@ enum {
 };
 
 #include "head_ilp.h"
+#include "indexer_score.h"
 
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
@@ -3363,6 +3364,21 @@ static int apply_position_rope(float *queries,
     return 0;
 }
 
+static unsigned long long coli_v4_indexer_omp_count;
+unsigned long long coli_v4_indexer_omp_candidates(void) {
+    return __atomic_load_n(&coli_v4_indexer_omp_count, __ATOMIC_RELAXED);
+}
+static int coli_v4_indexer_omp_enabled(void) {
+    static int cached = -1;   /* benign race: both racers compute the same value */
+    if (cached < 0) {
+        const char *b = getenv("COLI_V4_BASELINE");
+        const int baseline = b && *b && atoi(b) != 0;
+        const char *v = getenv("COLI_V4_INDEXER_OMP");
+        cached = (v && *v) ? (atoi(v) != 0) : !baseline;
+    }
+    return cached;
+}
+
 int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
                          int index_capacity, const float *query_rank,
                          const float *input, int position,
@@ -3422,23 +3438,47 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
         }
     }
     float weight_scale = 1.0f / sqrtf((float)(dimension * heads));
-    for (int head = 0; !result && head < heads; head++) {
-        float sum = 0.0f;
-        const uint16_t *row = raw_weights + (size_t)head * state->config->hidden_size;
-        for (int column = 0; column < state->config->hidden_size; column++)
-            sum += coli_bf16_decode(row[column]) * input[column];
-        head_weights[head] = sum * weight_scale;
-    }
-    for (int candidate = 0; !result && candidate < state->count; candidate++) {
-        const float *key = state->compressed + (size_t)candidate * dimension;
-        float score = 0.0f;
-        for (int head = 0; head < heads; head++) {
-            const float *query = queries + (size_t)head * dimension;
-            float dot = 0.0f;
-            for (int i = 0; i < dimension; i++) dot += query[i] * key[i];
-            score += fmaxf(dot, 0.0f) * head_weights[head];
+    /* COLI_V4_INDEXER_OMP: both loops below write one independent output per iteration and their
+     * inner sums are untouched, so parallelising over the outer index is bit-exact. They were
+     * serial, ~3% of decode single-threaded on a 16-thread machine. The scoring loop is shared with
+     * c/indexer_score.h so the shipped code is exactly what the unit test covers.
+     * NOTE: the INDEXER_SNAPSHOT unit carries a frozen copy of this function and is deliberately
+     * left unchanged -- it exists as a reference for state-copy testing, not as a hot path. */
+    const int indexer_omp = coli_v4_indexer_omp_enabled();
+    if (!result) {
+        const int hidden = state->config->hidden_size;
+        if (indexer_omp) {
+            #pragma omp parallel for schedule(static)
+            for (int head = 0; head < heads; head++) {
+                float sum = 0.0f;
+                const uint16_t *row = raw_weights + (size_t)head * hidden;
+                for (int column = 0; column < hidden; column++)
+                    sum += coli_bf16_decode(row[column]) * input[column];
+                head_weights[head] = sum * weight_scale;
+            }
+        } else {
+            for (int head = 0; head < heads; head++) {
+                float sum = 0.0f;
+                const uint16_t *row = raw_weights + (size_t)head * hidden;
+                for (int column = 0; column < hidden; column++)
+                    sum += coli_bf16_decode(row[column]) * input[column];
+                head_weights[head] = sum * weight_scale;
+            }
         }
-        scores[candidate] = (IndexScore){score, candidate};
+    }
+    if (!result && state->count > 0) {
+        float *raw_scores = malloc((size_t)state->count * sizeof(*raw_scores));
+        if (!raw_scores) result = -1;
+        else {
+            coli_v4_indexer_scores(raw_scores, queries, state->compressed, head_weights,
+                                   state->count, heads, dimension, indexer_omp);
+            for (int candidate = 0; candidate < state->count; candidate++)
+                scores[candidate] = (IndexScore){raw_scores[candidate], candidate};
+            free(raw_scores);
+            if (indexer_omp)
+                __atomic_fetch_add(&coli_v4_indexer_omp_count,
+                                   (unsigned long long)state->count, __ATOMIC_RELAXED);
+        }
     }
     if (!result) qsort(scores, (size_t)state->count, sizeof(*scores), descending_score);
     int selected = state->count;

@@ -865,6 +865,9 @@ tests/test_fp8_rows16$(EXE): tests/test_fp8_rows16.c deepseek_v4.c native_quant.
 tests/test_head_ilp$(EXE): tests/test_head_ilp.c head_ilp.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_indexer_score$(EXE): tests/test_indexer_score.c indexer_score.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_hc_omp$(EXE): tests/test_hc_omp.c deepseek_v4.c deepseek_v4_internal.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_MATH deepseek_v4.c $< -o $@ $(LDFLAGS)
 
