@@ -69,6 +69,9 @@ enum {
 #undef COLI_V4_KERNEL_ALL_BIT
 };
 
+extern unsigned long long v4_rows16_expert_calls_rows16;
+extern unsigned long long v4_rows16_expert_calls_scalar;
+
 #include "head_ilp.h"
 #include "indexer_score.h"
 
@@ -8079,6 +8082,8 @@ static uint64_t v4_direct_reads;
 static uint64_t v4_direct_flock_reads;
 static uint64_t v4_direct_payload_bytes;
 static uint64_t v4_direct_fallbacks;
+unsigned long long v4_rows16_expert_calls_rows16;
+unsigned long long v4_rows16_expert_calls_scalar;
 
 static int v4_pread_full_try(int fd, void *destination, size_t length,
                              uint64_t offset) {
@@ -8574,8 +8579,14 @@ static void destroy_hot(ColiExpertStore *store) {
     V4ExpertStoreState *state = store ? store->state : NULL;
     if (policy) {
         hot_usage_save(policy, state);
-        fprintf(stderr, "v4_rows16 packed_slots=%llu\n",
-                (unsigned long long)policy->packed_slots);
+        fprintf(stderr,
+                "v4_rows16 packed_slots=%llu expert_calls_rows16=%llu "
+                "expert_calls_scalar=%llu\n",
+                (unsigned long long)policy->packed_slots,
+                (unsigned long long)__atomic_load_n(
+                    &v4_rows16_expert_calls_rows16, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(
+                    &v4_rows16_expert_calls_scalar, __ATOMIC_RELAXED));
         fprintf(stderr,
                 "v4_direct reads=%llu flock_reads=%llu fallbacks=%llu "
                 "payload_bytes=%llu\n",
@@ -8972,10 +8983,15 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
         output, expert, input, route_weight, swiglu_limit);
 #else
     if (!expert || expert->gate.block_rows != 16 ||
-        expert->down.block_rows != 16 || expert->up.block_rows != 16)
+        expert->down.block_rows != 16 || expert->up.block_rows != 16) {
+        __atomic_fetch_add(&v4_rows16_expert_calls_scalar, UINT64_C(1),
+                           __ATOMIC_RELAXED);
         return coli_v4_expert_forward_v17_fallback(
             output, expert, input, route_weight, swiglu_limit);
+    }
     if (!output || !input || swiglu_limit < 0.0f) return -1;
+    __atomic_fetch_add(&v4_rows16_expert_calls_rows16, UINT64_C(1),
+                       __ATOMIC_RELAXED);
     size_t intermediate = (size_t)expert->gate.rows;
     size_t output_size = (size_t)expert->down.rows;
     float *gate = malloc(intermediate * sizeof(*gate));

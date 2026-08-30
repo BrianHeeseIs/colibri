@@ -191,10 +191,21 @@ reader is to grep the decode path for `#ifdef __AVX2__` with no `__aarch64__` si
 loops with no `#pragma omp`. That sweep is now **exhausted for decode** — the remaining AVX2-only
 sites are an `immintrin.h` include guard and the prefill batch path.
 
-Largest remaining phase is `expert_forward` at ~41.7%, and it is **not** a coverage problem: the
-scalar and NEON mxfp4 kernels measure within 1.00-1.14x of each other, so raising
-`COLI_V4_PIN_SLOTS` is closed (E107 vindicated by direct measurement in E126). See
-`.backlog/benchmark-backlog.md` T6 for the identified inefficiency and why it is not a quick win.
+Largest remaining phase is `expert_forward` at ~41.7%, and **the whole expert-arithmetic lever is now
+closed (E129)**. It is not a coverage problem — the scalar and NEON mxfp4 kernels measure within
+1.00-1.14x of each other, so raising `COLI_V4_PIN_SLOTS` stays closed (E107, vindicated by direct
+measurement in E126). It is not a kernel-design problem either:
+
+- A ceiling arm that abandons Metal bit-parity entirely — block scale hoisted, FMA, reassociation,
+  16 accumulator chains — measures only **1.154x / 1.201x** on the two real expert shapes.
+- Widening accumulator chains, the mechanism that gave the LM head 2.7x in E126a, is **flat** here:
+  4/8/12/16 chains give 1.00/1.09/0.95/0.99, non-monotone.
+- Against a **measured** kernel split of 22.05% NEON / 77.95% scalar — not the ~6% previously
+  inferred from pin counts — that ceiling is worth **+4.88% decode**, or +6.26% even if both kernels
+  were rewritten. The decode noise floor is 5-13%.
+
+The remaining decode levers are elsewhere: `expert_wait` (~1395 ms, structural — two condvar waits
+per expert call) and the streaming/residency path, not the expert arithmetic.
 
 ### Decode: +10.18% from a NEON fp8 kernel (E125)
 Decode profiling (E123) accounts for 99.3% of it: `attn_out` 21.6%, `expert_forward` 32.2%,

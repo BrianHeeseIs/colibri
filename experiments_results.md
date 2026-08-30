@@ -6676,11 +6676,12 @@ sensitivity was proven separately by injecting a regrouped inner sum and confirm
 - The `#ifdef __AVX2__`-without-`__aarch64__` sweep is **exhausted for decode**: the only remaining
   sites are an `immintrin.h` include guard and the prefill batch path.
 
-**Open, needs a decision:** a better mxfp4 expert kernel. See `.backlog/benchmark-backlog.md` T6 —
-the identified inefficiency is that `neon_rows16_accumulate` applies the block scale per element
-(2 muls + 1 add) where the scale is constant across each 32-column group. Hoisting it would be
-~1.125 ops/element instead of 3. Two blockers: the unfused ordering is what makes the CPU path
-bit-identical to the Metal kernel, and only ~6% of decode expert calls reach the NEON path at all.
+**~~Open, needs a decision:~~ CLOSED by E129 below.** This paragraph proposed a better mxfp4 expert
+kernel on the grounds that `neon_rows16_accumulate` applies the block scale per element where it is
+constant across each 32-column group. Two of its numbers were later measured and are wrong: the
+"~6% of decode expert calls reach the NEON path" is actually **22.05%**, and the implied ceiling is
+**1.15-1.20x**, worth +4.88% — inside the decode noise floor. Retained as the record of what was
+believed before measurement; act on E129, not on this.
 
 ## E128 — B4 headline validation: `COLI_V4_BASELINE=1` vs shipping defaults (2026-08-30)
 
@@ -6720,3 +6721,110 @@ Report it as a decomposition, not one number:
 
 The TTFT -62.4% belongs almost entirely to the E114-E119 prefill stack, not to any decode work in
 this session. Do not quote it as a decode result.
+
+## E129 — P0 mxfp4 expert kernel: CLOSED. The ceiling is ~1.2x and the coverage figure was wrong
+
+Target A (give the cold/scalar MXFP4 path an aarch64 SIMD/ILP kernel) was selected over B (fix the
+rows16 NEON kernel) and C (permute all experts to rows16). No kernel was written: two measurements
+taken before implementation closed the lever. Harness `.backlog/lab/kbench/fp4disc.c`.
+
+### Finding 1 — the recorded "~6% of decode expert calls reach NEON" is WRONG. Measured: 22.05%
+
+`benchmark-backlog.md:10,63` and `experiments_results.md:6683` all state ~6%, derived from "16
+pinned experts of 256 per layer" = 6.25%. E123 (`:6326`) had explicitly demanded this be measured
+rather than inferred. Counter added to `coli_v4_expert_forward_ref`, emitted on the existing
+`v4_rows16` line (p256, 20 tokens):
+
+```
+v4_rows16 packed_slots=761 expert_calls_rows16=2227 expert_calls_scalar=7872
+```
+
+| path | calls | share |
+|---|---:|---:|
+| rows16 NEON | 2227 | **22.05%** |
+| scalar cold | 7872 | **77.95%** |
+| total | 10099 | cross-checks against E123's ~10062 expert calls |
+
+**Off by 3.5x.** The inference assumed uniform routing. Pinning selects the HOTTEST experts, so 16
+of 256 capture 22% of calls, not 6.25% — routing skew is this engine's founding premise and the
+inference contradicted it. Any future "coverage" claim must come from this counter.
+
+### Finding 2 — the accumulator-recurrence hypothesis is REFUTED
+
+Hypothesis (mine): both kernels keep only 4 dependent accumulator chains where saturation needs
+~12-16, so widening ILP would pay — as it did for the LM head in E126a (2.7x). Oracle's counter was
+that low GB/s cannot distinguish recurrence from permute/TBL uop pressure, since any backend-bound
+kernel shows low bandwidth. Oracle was right.
+
+The discriminator holds the decode/TBL path byte-for-byte constant and varies ONLY chain count
+(`ratio_vs_4chains`, median of 101, both real expert shapes):
+
+| family | 4 | 8 | 12 | 16 |
+|---|---:|---:|---:|---:|
+| COLD gate/up | 1.000 | 1.091 | 0.947 | 0.992 |
+| COLD down | 1.000 | 1.040 | 0.891 | 0.937 |
+| ROWS16 gate/up | 1.000 | 1.005 | — | 0.972 |
+| ROWS16 down | 1.000 | 0.995 | — | 1.020 |
+
+Flat, non-monotone, and 12 chains is consistently *worse*. Both families sit under 1.10x, which is
+the plan's "P — permute/uop primary" branch. **Adding accumulator chains buys nothing here.** The
+LM-head lesson does not transfer to this kernel.
+
+### Finding 3 — the whole lever's ceiling is ~1.2x, which cannot clear the noise floor
+
+The CEILING arm abandons parity deliberately — block scale hoisted, FMA, reassociation permitted,
+16 chains — to bound the entire lever: **1.154x (gate/up), 1.201x (down)**.
+
+Amdahl against decode wall 18565 ms, `expert_forward` 7748 ms, matmul fraction ~0.9, and the
+**measured** coverage above:
+
+| target | coverage | K=1.15 | K=1.20 |
+|---|---:|---:|---:|
+| A cold/scalar | 77.95% | +3.82% | +4.88% |
+| B rows16 | 22.05% | +1.08% | +1.38% |
+| A+B, everything | 100% | +4.90% | **+6.26%** |
+
+The decode noise floor is **5-13%**. Even rewriting BOTH kernels, abandoning Metal bit-parity, and
+hitting the measured ceiling lands at +6.26% — at the floor's lower edge. And kernel microbenchmarks
+over-predict in situ here by recorded factors of 2.39x, 2.15x and 3.58x, so the real figure would be
+smaller still. **P0 is closed.**
+
+### Harness honesty
+
+`fp4disc` VOIDED itself by its own 2% self-check gate (COLD 1.72%, ROWS16 2.79% at N=101). The gate
+existed because the previous probe (fp4bench V2) silently measured its own bad decode at 0.83x, and
+it worked as intended. Two caveats stated rather than hidden:
+- Per-arm spread is 22-56% and did **not** shrink from N=15 to N=101, so it is systematic, not
+  sample-limited. The 4.194 MB working set is cache-resident, unlike experts streamed from a
+  137 GiB store — this microbench does not reproduce the in-situ memory regime.
+- Medians nonetheless reproduce across the two independent runs to within 2-4%, so the medians are
+  usable as central tendency. The conclusions above rest on a flat sweep and a ~1.2x ceiling, both
+  far larger than that reproducibility, not on any single pair of arms.
+
+### Finding 4 — two ue8m0 decoders in this codebase DISAGREE (latent, unresolved)
+
+- `mx4_scale` (`c/quant.h:1437`), the `(s<<23)` bit trick: `s=0 -> +0.0f`, `s=255 -> +inf`.
+- `coli_e8m0_decode` (`c/deepseek_v4.c:13503`): returns **NaN** for `0xff`.
+
+Same input byte, different value, one engine. The MXFP4 kernels follow `mx4_scale`. Not exercised by
+any current gate. Left open deliberately — it is a correctness question, not a performance one, and
+does not belong to a closed perf item.
+
+### What was kept and what was discarded
+
+- **Kept:** the kernel-split counter. It permanently retires E123's demand, and both golden gates
+  PASS with it compiled in (`5d04890413ff539e802985ce8c727814`, `cc09015d089d9a25d10d75753f9e849a`)
+  — it rides the `v4_rows16 ` prefix that `tokps.sh`/`taskcheck.sh` already filter, so it cannot
+  leak into `generated_text` and fake a bit-exactness verdict.
+- **Kept:** `.backlog/lab/kbench/fp4disc.c`, the artefact behind Findings 2 and 3.
+- **Discarded:** `c/tests/test_fp4_ilp.c` and `test_fp4_ilp_edges.c`. Both were authored test-first
+  and confirmed RED against the missing `matmul_mxfp4_ilp` symbol, which will now never exist;
+  keeping them would break `make check` for a kernel that is not coming.
+
+### Do not re-open without new evidence
+
+Raising `COLI_V4_PIN_SLOTS` (E123/E126), widening accumulator chains (this entry), hoisting the
+block scale on the cold path (it already hoists — `c/quant.h:1456,1481`), and permuting all experts
+to rows16 (E123: `expert_wait` +66% while `expert_forward` stayed flat). The remaining decode levers
+are elsewhere: `expert_wait` (~1395 ms, structural — two condvar waits per expert call) and the
+streaming/residency path, not the arithmetic.

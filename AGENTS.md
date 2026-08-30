@@ -91,6 +91,24 @@ They do not move together. `COLI_V4_METAL_ATTN=1` is -15.9 % TTFT but trends *ne
 delta under ~10 % cannot be resolved at n=3, and several apparent effects here reversed when a
 third or fifth point was added.
 
+### MANDATORY: no background agents in flight while a timing run executes
+**This is a measurement-integrity rule, not a rule about machine noise.** A `COLI_V4_PROFILE=1`
+profile taken while two explore agents were running reported `decode_wall` 28500 ms and
+`expert_forward` 13290 ms — **a fake 76 % jump**. `ps -Ao pcpu -r` showed the agent host at 235 %
+CPU with load average 5.72, against an engine that takes 16 OpenMP threads. The E125 numbers either
+side of it were trustworthy precisely because nothing else was running
+(`.backlog/m3-max-decode-research-2026-08-29.md:582`,
+`.backlog/ulw-decode-next-avenues-20260830-004040.md:69`).
+
+- Before ANY timing run — `tokps.sh`, `ab.sh`, `golden.sh`, a profile, a kbench arm — confirm no
+  agents, builds or other jobs are in flight. Let background tasks finish first.
+- This binds **timing** work only. Pure authoring, exploration, reading and building may still run
+  fully parallel; parallelise those freely.
+- A number captured under load is not merely noisy, it is **wrong by up to 76 %**, and it is not
+  comparable to anything else in the ledger. If load was present, the run is void — rerun it.
+- ONE engine at a time (`pgrep -f '[d]eepseek_v4'`): two engines contend for the same weights and
+  the same ~100 GB budget. GPU probes must not run against a live engine — same device.
+
 ### MANDATORY: do not run a long benchmark without asking. Size it to the question first.
 Operator rule. Benchmark wall-clock is the scarcest resource in this project; spending it badly is
 worse than not measuring, because it also delays everything behind it.

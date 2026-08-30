@@ -1,0 +1,44 @@
+/Applications/Xcode.app/Contents/Developer/usr/bin/make clean
+python3 tools/clean.py
+clean: removed 37 files/dirs
+/Applications/Xcode.app/Contents/Developer/usr/bin/make portable
+/Applications/Xcode.app/Contents/Developer/usr/bin/make colibri ARCH=
+make[2]: Circular colibri <- colibri dependency dropped.
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function colibri.c    -o colibri -lm -L/opt/homebrew/opt/libomp/lib -lomp
+/Applications/Xcode.app/Contents/Developer/usr/bin/make test
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_serve_sentinel.c -o tests/test_serve_sentinel -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_ue8m0.c -o tests/test_ue8m0 -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_json.c -o tests/test_json -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_tok_o200k.c -o tests/test_tok_o200k -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_tok_kimi_tiny.c -o tests/test_tok_kimi_tiny -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DST_PREAD_CHUNK=7 tests/test_st_pread.c -o tests/test_st_pread -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_st_shape.c -o tests/test_st_shape -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_st.c -o tests/test_st -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_st_mirror.c -o tests/test_st_mirror -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_tier.c -o tests/test_tier -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_grammar.c -o tests/test_grammar -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_ablate.c -o tests/test_ablate -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_schema_gbnf.c -o tests/test_schema_gbnf -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_spec_decode_state.c -o tests/test_spec_decode_state -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_decode_batch.c -o tests/test_decode_batch -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_idot.c -o tests/test_idot -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_i4_grouped.c -o tests/test_i4_grouped -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_stops.c -o tests/test_stops -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_topp.c -o tests/test_topp -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_sample_nan.c -o tests/test_sample_nan -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_temp_env.c -o tests/test_temp_env -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_kv_alloc.c -o tests/test_kv_alloc -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_e8_kernel.c -o tests/test_e8_kernel -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_rans.c -o tests/test_rans -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_int3.c -o tests/test_int3 -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_int3_load.c -o tests/test_int3_load -lm -L/opt/homebrew/opt/libomp/lib -lomp
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function tests/test_fp8_passthrough.c -o tests/test_fp8_passthrough -lm -L/opt/homebrew/opt/libomp/lib -lomp
+Undefined symbols for architecture arm64:
+  "_coli_fp8_minprod", referenced from:
+      _matmul_fp8.omp_outlined in test_fp8_passthrough-c853c9.o
+  "_coli_fp8_minprod_enabled", referenced from:
+      _matmul_fp8.omp_outlined in test_fp8_passthrough-c853c9.o
+ld: symbol(s) not found for architecture arm64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+make[1]: *** [tests/test_fp8_passthrough] Error 1
+make: *** [check] Error 2

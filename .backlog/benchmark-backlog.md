@@ -1,14 +1,30 @@
 # Backlog — gated work and parked benchmark runs
 
-## P0 — mxfp4 expert kernel  *** REQUIRES EXPLICIT OPERATOR PERMISSION TO START ***
-Operator decision 2026-08-30: **highest priority next step, but GATED. Do not begin — not even the
-sizing probe — without asking again.** Full detail in the T6 section below.
-One-line summary: `expert_forward` is 41.7% of decode; `neon_rows16_accumulate`
-(c/deepseek_v4.c:14572) applies the block scale PER ELEMENT (2 muls + 1 add) although the scale is
-constant across each 32-column group, so hoisting it would be ~1.125 ops/element instead of 3.
-Ceiling if it delivered 2x on the phase: **+26% decode**. Two blockers: the unfused ordering is what
-keeps the CPU path bit-identical to the Metal kernel, and only ~6% of decode expert calls reach the
-NEON path at all. Estimated 2-4 h, real risk, gated on taskcheck rather than golden.
+## P0 — mxfp4 expert kernel  *** CLOSED 2026-08-30, see E129. DO NOT RE-OPEN ***
+Ran under operator permission. **No kernel was written — two measurements taken first closed it.**
+
+1. **The "~6% of decode expert calls reach NEON" figure in this entry was WRONG.** It was inferred
+   from "16 pinned of 256 per layer" = 6.25%. Measured with a new counter: **22.05%** (rows16 2227,
+   scalar 7872, total 10099). Off by 3.5x — the inference assumed uniform routing, but pinning
+   selects the HOTTEST experts, which is this engine's whole premise.
+2. **The "+26% ceiling" in this entry was never reachable.** It assumed 2x on the phase. A ceiling
+   arm that abandons parity entirely (scale hoisted + FMA + reassociation + 16 chains) measures
+   **1.154x / 1.201x**. Against the measured coverage that is **+4.88% decode** for the cold path
+   and **+6.26% even if both kernels were rewritten** — at or under the 5-13% decode noise floor,
+   before the 2.15-3.58x probe-to-real dilution recorded on this host.
+3. Widening accumulator chains — the mechanism that gave the LM head 2.7x in E126a — is **flat**
+   here: 4/8/12/16 chains give 1.00/1.09/0.95/0.99, non-monotone, 12 consistently worse.
+4. The cold path **already hoists the block scale** (`c/quant.h:1456,1481`), so the inefficiency
+   named in this entry only ever existed on the rows16 kernel, which serves the minority of calls.
+
+Kept from the attempt: the kernel-split counter (both golden gates pass with it in) and
+`.backlog/lab/kbench/fp4disc.c`. Remaining decode levers are `expert_wait` (~1395 ms, structural)
+and the streaming/residency path — not the expert arithmetic.
+
+### Open, spun out of P0: two ue8m0 decoders disagree (correctness, not performance)
+`mx4_scale` (`c/quant.h:1437`) gives `s=255 -> +inf`; `coli_e8m0_decode` (`c/deepseek_v4.c:13503`)
+returns **NaN** for `0xff`. Same byte, same engine, different value. The MXFP4 kernels follow
+`mx4_scale`. No current gate exercises it. Unresolved.
 
 # Benchmark backlog — parked runs
 Operator rule (2026-08-30): anything over ~25 min is parked here rather than run, so the operator
@@ -43,7 +59,11 @@ TOKENS=40 N=5 PROMPT_FILE=.backlog/prefill_prompts/p256.txt .backlog/lab/tokps.s
   't16=@=OMP_NUM_THREADS=16' 't12=@=OMP_NUM_THREADS=12'
 ```
 
-## T6 — a better mxfp4 expert kernel (the largest remaining lever, NOT attempted)
+## T6 — a better mxfp4 expert kernel  *** SUPERSEDED / CLOSED by E129, see P0 above ***
+**Everything below this banner is the PRE-MEASUREMENT reasoning and two of its numbers are now
+known wrong: the "~6%" coverage (measured 22.05%) and the "+26% ceiling" (measured 1.15-1.20x, worth
++4.88%). Retained only as the record of what was believed before it was measured. Do not act on it.**
+
 `expert_forward` is 41.7% of decode after tonight's work. Both existing fp4 kernels (scalar and
 NEON rows16) sit at 16-19 GB/s against a measured ~105 GB/s host read ceiling, and they are within
 1.00-1.14x of each other, so **raising `COLI_V4_PIN_SLOTS` is closed** (E107 vindicated by direct
