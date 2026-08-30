@@ -1,0 +1,12 @@
+tok/s A/B  tokens=40  N=3  prompt=p256.txt
+  run1 baseline               ttft= 112.713s decode=  27.961s tok/s=1.3948   md5=fedd5e192e75de75c53579e93df6fab1
+  run1 shipping               ttft=  42.404s decode=  18.059s tok/s=2.1596   md5=d06053793d8f66d4f69a3f7c810441e1
+  run2 baseline               ttft= 112.079s decode=  27.890s tok/s=1.3984   md5=fedd5e192e75de75c53579e93df6fab1
+  run2 shipping               ttft=  42.361s decode=  18.216s tok/s=2.1410   md5=d06053793d8f66d4f69a3f7c810441e1
+  run3 baseline               ttft= 113.880s decode=  28.074s tok/s=1.3892   md5=fedd5e192e75de75c53579e93df6fab1
+  run3 shipping               ttft=  42.321s decode=  18.031s tok/s=2.1629   md5=d06053793d8f66d4f69a3f7c810441e1
+
+SUMMARY (median tok/s)
+  baseline                 1.3948 tok/s  baseline            deterministic  md5=fedd5e192e75de75c53579e93df6fab1 
+  shipping                 2.1596 tok/s  +54.83% tok/s       deterministic  md5=d06053793d8f66d4f69a3f7c810441e1 
+logs: /var/folders/1d/rcgfz6r173x3prprltqtzg280000gn/T//tokps.rHki7o

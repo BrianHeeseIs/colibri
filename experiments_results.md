@@ -6681,3 +6681,42 @@ the identified inefficiency is that `neon_rows16_accumulate` applies the block s
 (2 muls + 1 add) where the scale is constant across each 32-column group. Hoisting it would be
 ~1.125 ops/element instead of 3. Two blockers: the unfused ordering is what makes the CPU path
 bit-identical to the Metal kernel, and only ~6% of decode expert calls reach the NEON path at all.
+
+## E128 — B4 headline validation: `COLI_V4_BASELINE=1` vs shipping defaults (2026-08-30)
+
+First direct measurement of the full stack against the historical engine. Every decode figure quoted
+before this was a CHAIN of A/Bs (E125 +10.18%, then E126/E127 +15.27%, composed to +28.1%); the
+composition had never been measured end to end.
+
+`TOKENS=40 PROMPT_FILE=p256.txt .backlog/lab/tokps.sh 'baseline=@=COLI_V4_BASELINE=1' 'shipping=@='`
+**N=3, not the usual N=5** — deliberate: the effect is >50%, several times the 5-13% decode noise
+floor, so N=3 resolves it and costs 10 minutes instead of 17. N>=5 remains required for sub-10%
+claims.
+
+| arm | TTFT (median) | decode (median) | tok/s | range | md5 |
+|---|---:|---:|---:|---|---|
+| `COLI_V4_BASELINE=1` | 112.713 s | 27.961 s | **1.3948** | 1.3892-1.3984 | `fedd5e19...` 3/3 |
+| shipping defaults | 42.361 s | 18.059 s | **2.1596** | 2.1410-2.1629 | `d0605379...` 3/3 |
+
+- **tok/s +54.83%**, ranges non-overlapping by a wide margin.
+- **TTFT -62.4%** (112.713 -> 42.361 s). **Net wall @40 tokens -57.1%** (140.674 -> 60.420 s).
+- Determinism control passes: each arm reproduced its OWN md5 3/3. The two arms differ from each
+  other, which is expected and already gated — these are capability-equivalent, not token-identical
+  (taskcheck 5/5 at every step in E115/E116/E119/E125). A changed md5 here is not a defect.
+
+**The chained +28.1% claim holds, but the headline is NOT +28.1%.** The endpoint reproduces: 2.1596
+here versus 2.1341 chained, inside the decode noise band. The gap in the totals is explained by
+`c/deepseek_v4.c:10693` — `if (!kernel_environment && !coli_v4_baseline_mode()) kernel_environment
+= "all";` — so `COLI_V4_BASELINE=1` ALSO disables `KERNELS=all`. The +28.1% figure was measured from
+the `KERNELS=all` CPU arm (1.6655), which already carried that win; `BASELINE=1` sits below it at
+1.3948.
+
+Report it as a decomposition, not one number:
+- **+54.83%** = what a user gets today versus the historical engine. Measured here, both arms, N=3.
+- **+29.7%** (2.1596/1.6655) = this session's decode work, referenced to the prior-session
+  `KERNELS=all` intermediate. Consistent with the recorded +28.1%.
+- The remainder is pre-existing `KERNELS=all` plus the E114-E119 GPU-prefill defaults. **Not measured
+  in this run** — 1.6655 comes from an earlier session, so treat that split as inferred, not proven.
+
+The TTFT -62.4% belongs almost entirely to the E114-E119 prefill stack, not to any decode work in
+this session. Do not quote it as a decode result.

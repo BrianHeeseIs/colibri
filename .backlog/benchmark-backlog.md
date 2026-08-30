@@ -69,8 +69,13 @@ scale is applied; my first attempt replaced the gather with scalar rebuilds and 
 which says nothing about the hypothesis. Estimated 2-4 h with real risk.
 
 
-## B4 — headline validation: COLI_V4_BASELINE=1 vs shipping defaults  (~20 min, PARKED)
-Operator decision 2026-08-30: backlog for now, ask again later or tomorrow.
+## B4 — headline validation: COLI_V4_BASELINE=1 vs shipping defaults  (DONE 2026-08-30, E128)
+**RUN AND RECORDED — see E128 in `experiments_results.md`.** Ran at N=3 not N=5 (effect >50%, far
+above the 5-13% decode noise floor; 10 min instead of 17). Result: 1.3948 -> 2.1596 tok/s
+**+54.83%**, TTFT -62.4%, net wall @40 tokens -57.1%, each arm deterministic 3/3.
+Outcome: the chained +28.1% endpoint REPRODUCES (2.1596 vs 2.1341), but the totals differ because
+`COLI_V4_BASELINE=1` also disables `KERNELS=all` (`c/deepseek_v4.c:10693`). Report as a
+decomposition, never as one number. Log: `.backlog/lab/B4_headline_baseline_vs_shipping_*.log`.
 
 **Why it is worth running.** Every figure quoted so far is a CHAIN of A/Bs (E125 +10.18%, then
 E126/E127 +15.27%, composed to +28.1%). That composition has never been measured directly. This run
