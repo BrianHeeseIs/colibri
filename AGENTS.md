@@ -178,6 +178,17 @@ live. That is the one-engine guard doing its job, not a broken build. **Read the
 concluding anything.** A concurrent session shares this host, and `pgrep` can clear a moment before
 their process actually exits — so a launch that passed your own guard can still be refused.
 
+**FALSE POSITIVE, diagnosed 2026-08-30 — the guard can match YOUR OWN caller.** Every harness guards
+with `pgrep -f '[d]eepseek_v4'`. That pattern matches the full command line of ANY process, and the
+`[d]` trick only stops pgrep matching *itself* — it does nothing about a sibling. So a pre-flight
+that runs `nm c/deepseek_v4` or `md5 -q c/deepseek_v4` in the SAME shell invocation that then
+dispatches the run will still be alive when the harness checks, and the harness refuses with
+`FATAL: engine already running` while no engine exists. This cost two dispatches before it was
+spotted. **Dispatch from a command whose text never contains the binary name**: do the pre-flight in
+one call, let it exit, then send the tmux keys in a separate call. To check for a real engine
+without poisoning your own cmdline, build the pattern at runtime or match the model directory
+instead.
+
 ### The stderr prefix strip-list is load-bearing. Adding a new prefix corrupts md5 comparisons
 `.backlog/lab/tokps.sh` and `taskcheck.sh` extract `generated_text` by stripping ONLY lines matching
 `^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal) `. Any stderr line with a
@@ -267,8 +278,37 @@ reproduced as 2.1596 in E128). After the fp8 kernel below, four more landed in E
 default ON.
 **They were all the same defect: an `#ifdef __AVX2__` fast path with no `__aarch64__` sibling, or a
 hot loop with no `#pragma omp`.** That sweep is now exhausted for decode. Two things NOT to retry:
-raising `COLI_V4_PIN_SLOTS` (the scalar and NEON mxfp4 kernels are within 1.00-1.14x, measured
-head-to-head), and `OMP_NUM_THREADS=12` (null at N=1, 2.5% spread, inside the noise floor).
+raising `COLI_V4_PIN_SLOTS`, and `OMP_NUM_THREADS=12` (null at N=1, 2.5% spread, inside the noise
+floor).
+
+**`COLI_V4_PIN_SLOTS` is now dead on BOTH axes, each retired by a different measurement — say which
+one you mean, so it is not re-opened a third time on a fresh rationale.**
+- As a **kernel-coverage** lever: the scalar and NEON mxfp4 kernels are within 1.00-1.14x,
+  measured head-to-head. This is the original rejection and it never touched cache behaviour.
+- As a **miss-rate** lever (E131): raising it is ACTIVELY HARMFUL. It really does shield hot experts
+  from LRU eviction (`c/deepseek_v4.c:8573` skips pinned slots in the victim loop) — misses fell
+  765 -> 740 -> 726 at 16/48/96 pins and disk time fell up to 11.2%. But pinning also forces rows16
+  packing at lookup, and that work runs while `state->mutex` is held, which is the same mutex the
+  loader needs to publish. Pack +152%, lock +121%, hit_scan +1588%. The main thread delays the very
+  loads it then blocks on, so `wait_finish_complete_block` ROSE 16.6%/17.7% despite fewer misses,
+  and tok/s fell **-3.15% / -4.22%**. Full working in `.backlog/E131-pin-slots-miss-rate.md`.
+
+**The expert-wait avenue has a hard ceiling of +9.04% tok/s** — that is what eliminating EVERY park
+would buy (`decode_sec 17.941 - 1.488 = 16.453`, `39/16.453 = 2.3704` vs `2.1738`). It sits inside
+the 5-13% decode noise floor, so on this path the COUNTERS are the evidence and tok/s can only
+corroborate. Do not plan a resolution-grade tok/s run against a sub-noise-floor ceiling.
+
+**Loader depth is rejected on arithmetic, no run needed.** Mean expert compute is
+`7485.917/10062 = 0.744 ms`. Going from depth 3 to 6 only gains at fan-out positions 4 and 5, mean
+`2.232/6 = 0.372 ms` per miss; `765 x 0.372 = 284.6 ms = +1.62% tok/s`. That independently
+corroborates the recorded "lanes 3/6/10 within ~1%". E130's `start_slept_calls = 0` also proves the
+pool was never the constraint, so raising the compile-time count would confound a dead variable
+with a ~1.6% one.
+
+**Flag, not a finding (confounded):** in E131 driving rows16 coverage 29.4% -> 77.5% made
+`expert_forward` **slower** by 7.30%. That cuts against the standing "45% ceiling / widen rows16
+coverage" lever. Pins move coverage and lock pressure together, so this needs a dedicated
+experiment before it is treated as settled.
 
 **Decode moved for the first time in E125**: `COLI_V4_FP8_ROWS16` is +10.18% tok/s, bit-exact, and
 free of memory cost. Note what did NOT work, so it is not retried: a drop-in NEON port is neutral
