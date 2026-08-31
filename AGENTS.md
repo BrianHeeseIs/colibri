@@ -107,7 +107,7 @@ instrument costs 0.26 % of tok/s — it is free, so profile before guessing.
 | `start_slept_calls` | **0** | the loader pool was NEVER exhausted |
 | `decode_alloc` | **0.028 %** | per-token allocation is DEAD. Do not pursue prebind-and-scratch |
 | `tensor_lookup` | **0.017 %** | by-name view resolution is DEAD. Not worth caching |
-| OpenMP master-side | hc 1.61 % + sparse 1.29 % = **2.90 %** | real but second-order beside disk |
+| OpenMP master-side | hc 1.63 % + head 2.78 % + sparse 1.31 % = **5.72 %** | head was UNMEASURED until E134 wired it |
 
 **`start_slept_calls = 0` retires the loader-lane family on better evidence than before.** Adding
 worker threads cannot help when the pool is never the constraint. The old rejection reasoned from
@@ -116,9 +116,32 @@ worker threads cannot help when the pool is never the constraint. The old reject
 **The two live attacks** are therefore: cut the **7.6 % miss rate** (765 of 10062 lookups), or hide
 more of each miss than the 50.2 % already hidden. Any candidate must move one of those numbers.
 
-**Known gap:** `omp_head_wall` records 0 calls because the instrumented head site is the
-non-resident bf16 path while the shipping build takes resident `head_ilp`. That region is
-UNMEASURED, not zero, so 2.90 % is a floor.
+**Gap CLOSED 2026-08-30 (E134).** `omp_head_wall` used to record 0 calls because the only
+instrumented head site was the non-resident bf16 path while the shipping build takes resident
+`head_ilp` — so the region was UNMEASURED, not zero, and the old 2.90 % was a floor. The resident
+path is now wired: **495.967 ms over 39 calls = 2.78 % of decode wall**, which makes OpenMP
+master-side **5.72 %**, nearly double the previously recorded figure. Both goldens re-verified after
+the change. This is the general lesson: a counter reading zero means "not wired" until you have
+proved the path executes.
+
+## E132 / E133 / E134 (2026-08-30) — three levers resolved, one instrument gap closed
+- **`COLI_V4_HOT_PACK_UNLOCKED` is a REAL, BIT-EXACT decode win, and its old rejection measured the
+  wrong axis.** It removes **91.92 %** of main-thread lock time (`store_lock` 454.331 → 36.711 ms),
+  with every validity precondition passing and output byte-identical. The prior "-0.05 %, worthless"
+  verdict was a **p064 TTFT** A/B taken before any decode instrument existed. BUT the payoff is only
+  **-1.58 % decode wall / +1.60 % tok/s**, because `wait_finish_complete_block` ROSE 6.24 %: freeing
+  the lock makes the main thread reach the finish barrier sooner, so saved lock time converts into
+  wait time. **Disk, not the lock, is the binding constraint.** Still default OFF.
+- **Cache SIZE is at its knee at `--memory-gb 96`.** p256 misses by slots: 74 → 2364 (+209 %),
+  164 → 765, 186 → 705 (-7.8 %), 183 → 718 (-6.1 %). Steep below, flat above; raising it is not a
+  lever, lowering it is a cliff. **Cache-size conclusions do NOT transfer between prompt lengths** —
+  an earlier p064 sweep showed halving cost 0.22 % and was used to infer capacity indifference; at
+  p256 the same halving costs 11.1 %. Always state the length. Also: 120 GiB yields FEWER slots than
+  108 GiB (183 vs 186), so the planner is non-monotonic near the ceiling.
+- **`COLI_V4_PREWARM` now reports what it did** (`v4_hot_policy prewarm=ran partial=0`). It
+  previously printed only on partial failure, so "requested but silently skipped" was
+  indistinguishable from "ran and did not help" — which forced an INDETERMINATE verdict once. With
+  the line in place it is a measured weak null: misses -4.05 %, not the -10 % needed.
 
 ### Instrumenting the amalgamation: storage must have exactly ONE owner
 `deepseek_v4.c` is compiled ~26 times, once per `-DCOLI_V4_UNIT_*`. Anything with internal linkage
@@ -190,13 +213,16 @@ without poisoning your own cmdline, build the pattern at runtime or match the mo
 instead.
 
 ### The stderr prefix strip-list is load-bearing. Adding a new prefix corrupts md5 comparisons
-`.backlog/lab/tokps.sh` and `taskcheck.sh` extract `generated_text` by stripping ONLY lines matching
-`^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal) `. Any stderr line with a
-different prefix **leaks into the extracted text, changes its md5, and manufactures a false
-"not bit-exact" verdict.** New counters must ride an existing prefix — extend the `v4_profile ` or
-`v4_rows16 ` line rather than inventing one.
-**Latent bug, unfixed:** `COLI_V4_PREFILL_TRACE` prints under `v4_prefill_trace `, which is NOT in
-that list. Enabling it during a `tokps.sh` run today would corrupt the comparison.
+`.backlog/lab/tokps.sh`, `taskcheck.sh`, `decodetrace.sh`, `pinsweep.sh`, `envsweep.sh` and both
+`bench/golden*.sh` extract `generated_text` by stripping ONLY lines matching
+`^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal|v4_prefill_trace) `.
+Any stderr line with a different prefix **leaks into the extracted text, changes its md5, and
+manufactures a false "not bit-exact" verdict.** New counters must ride an existing prefix — extend
+the `v4_profile ` or `v4_rows16 ` line rather than inventing one.
+**FIXED 2026-08-30:** `v4_prefill_trace` was missing from that list, so enabling
+`COLI_V4_PREFILL_TRACE` during a `tokps.sh` run would silently corrupt the comparison. It is now in
+all seven harnesses. The golden hashes are unaffected, because the trace is compile-time gated and
+emits nothing in the shipping build — re-verified against both recorded hashes after the change.
 
 ### Verify from disk. Do not trust a self-report — including your own
 On 2026-08-30 one delegated task reported detailed line numbers and a clean build for work it had
