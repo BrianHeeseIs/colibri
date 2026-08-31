@@ -8002,8 +8002,21 @@ extern int coli_v4_prefill_trace_mode(void);
 #endif
 
 static void hot_pack_unlocked_init(void) {
+    /* Default ON since E132. Packing moves out of state->mutex, which is the mutex the loader
+     * needs to publish a completed read, and that removes 91.92% of main-thread lock time
+     * (store_lock 454.331 -> 36.711 ms at p256). Output was byte-identical across all seven
+     * arms and both goldens were unchanged.
+     * The throughput gain is small and honestly reported: decode wall -1.58%, tok/s +1.60%,
+     * the latter INSIDE the 5-13% decode noise floor. wait_finish_complete_block actually ROSE
+     * 6.24%, because freeing the lock makes the main thread reach the finish barrier sooner and
+     * wait longer for a disk read that has not landed. Disk, not the lock, is the constraint.
+     * The lock-time collapse is the measured result; the tok/s number is corroboration.
+     * COLI_V4_BASELINE=1 still forces it OFF with every other historical default, which is what
+     * keeps the sacred golden reproducible; an explicit COLI_V4_HOT_PACK_UNLOCKED beats both. */
     const char *enabled = getenv("COLI_V4_HOT_PACK_UNLOCKED");
-    hot_pack_unlocked_value = enabled && *enabled && atoi(enabled) != 0;
+    hot_pack_unlocked_value = (enabled && *enabled)
+        ? (atoi(enabled) != 0)
+        : !coli_v4_baseline_mode();
 }
 
 static int hot_pack_unlocked(void) {

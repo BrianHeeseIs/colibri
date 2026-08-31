@@ -1,0 +1,6 @@
+e136 pack-policy gate   binary_md5=7083f237a0df3d14130ad284395b23a2
+  ok    arm1  COLI_V4_PACK_GATE_NOOP=1                       pack=unlocked
+  ok    arm2  COLI_V4_BASELINE=1                             pack=locked
+  ok    arm3  COLI_V4_HOT_PACK_UNLOCKED=0                    pack=locked
+  ok    arm4  COLI_V4_BASELINE=1 COLI_V4_HOT_PACK_UNLOCKED=1 pack=unlocked
+e136_pack_default: all 4 arms passed
