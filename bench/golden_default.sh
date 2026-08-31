@@ -24,7 +24,7 @@ got=$(md5 -q "$DURABLE")
 pgrep -f '[d]eepseek_v4' >/dev/null && { echo "FATAL: engine already running" >&2; exit 2; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/goldendef.XXXXXX")
-ext(){ awk '/^generated_text=/{f=1} f&&!/^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal) /{print} /^timing /{f=0}' "$1"; }
+ext(){ awk '/^generated_text=/{f=1} f&&!/^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal|v4_prefill_trace) /{print} /^timing /{f=0}' "$1"; }
 
 cp "$DURABLE" /tmp/coli_usage.snapshot; cp "$DURABLE" "$MODEL/.coli_usage"
 echo "RUN golden_default max_tokens=$TOKENS (engine defaults, no COLI_V4_BASELINE)"

@@ -26,7 +26,7 @@ COMPLETION_MARKER=${COMPLETION_MARKER:-$ROOT/.backlog/lab/E131_PINSWEEP_DONE}
 [[ -f $DURABLE ]] || { echo "FATAL: durable seed missing: $DURABLE" >&2; exit 2; }
 got=$(md5 -q "$DURABLE")
 [[ $got == "$SEED_MD5" ]] || { echo "FATAL: seed hash $got != $SEED_MD5" >&2; exit 2; }
-pgrep -f '[d]eepseek_v4' >/dev/null && { echo "FATAL: engine already running" >&2; exit 2; }
+pgrep -x "$(basename "$BIN")" >/dev/null && { echo "FATAL: engine already running" >&2; exit 2; }
 rm -f "$COMPLETION_MARKER" || { echo "FATAL: cannot clear marker" >&2; exit 2; }
 
 BIN_MD5_BEFORE=$(md5 -q "$BIN")
@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
   NAMES+=("${1%%=@=*}"); PINS+=("${rest%%=@=*}"); ENVS+=("${rest#*=@=}"); shift
 done
 
-ext() { awk '/^generated_text=/{f=1} f&&!/^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal) /{print} /^timing /{f=0}' "$1"; }
+ext() { awk '/^generated_text=/{f=1} f&&!/^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal|v4_prefill_trace) /{print} /^timing /{f=0}' "$1"; }
 
 printf 'E131 pin sweep  tokens=%s prompt=%s memory_gb=%s binary_md5=%s\n' \
        "$TOKENS" "$(basename "$PROMPT_FILE")" "$MEMGB" "$BIN_MD5_BEFORE"

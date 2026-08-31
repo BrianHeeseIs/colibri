@@ -27,7 +27,7 @@ set -- \
 declare -a NAMES=() ENVS=()
 while [[ $# -gt 0 ]]; do NAMES+=("${1%%=@=*}"); ENVS+=("${1#*=@=}"); shift; done
 
-ext() { awk '/^generated_text=/{f=1} f&&!/^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal) /{print} /^timing /{f=0}' "$1"; }
+ext() { awk '/^generated_text=/{f=1} f&&!/^(timing|v4_rows16|v4_direct|v4_tokens|v4_profile|v4_kernels|v4_metal|v4_prefill_trace) /{print} /^timing /{f=0}' "$1"; }
 
 printf 'decode trace prefix contract  tokens=%s  prompt=%s  memory_gb=%s\n' \
        "$TOKENS" "$(basename "$PROMPT_FILE")" "$MEMGB"
