@@ -32,6 +32,9 @@ This is not hypothetical. Both of these were lost mid-session on this machine:
 ## DEFAULTS CHANGED 2026-08-29 — the engine now ships the champion stack
 As of E114-E119 the performance gates default **ON**: `KERNELS=all`, `MOE_GROUPED`, `MOE_BATCHED`,
 `MOE_BATCHED_ROWS16`, `MOE_WHOLE_PROMPT`, `METAL_ATTN`, and `METAL_VARIANT=simd_exact_cold`.
+**Added 2026-08-31 (E136): `HOT_PACK_UNLOCKED` also defaults ON** — it moves expert packing out of
+`state->mutex` and removes 91.92 % of main-thread lock time. The engine now reports which policy is
+live as `pack=locked|unlocked` on the `v4_hot_policy ` line, so the state is never silent.
 `COLI_V4_METAL` still defaults **OFF** — it gates single-token DECODE Metal, which is slower here
 (E99). Any individual flag still overrides the default (`COLI_V4_MOE_BATCHED=0` disables just that).
 
@@ -131,7 +134,10 @@ proved the path executes.
   verdict was a **p064 TTFT** A/B taken before any decode instrument existed. BUT the payoff is only
   **-1.58 % decode wall / +1.60 % tok/s**, because `wait_finish_complete_block` ROSE 6.24 %: freeing
   the lock makes the main thread reach the finish barrier sooner, so saved lock time converts into
-  wait time. **Disk, not the lock, is the binding constraint.** Still default OFF.
+  wait time. **Disk, not the lock, is the binding constraint.**
+  **DEFAULT ON as of E136 (2026-08-31).** `COLI_V4_BASELINE=1` still forces it off with every other
+  historical default, which is what keeps the sacred golden reproducible; that property is asserted
+  directly by `.backlog/lab/e136_pack_default.sh` arm 2 rather than inferred from a trace run.
 - **Cache SIZE is at its knee at `--memory-gb 96`.** p256 misses by slots: 74 → 2364 (+209 %),
   164 → 765, 186 → 705 (-7.8 %), 183 → 718 (-6.1 %). Steep below, flat above; raising it is not a
   lever, lowering it is a cliff. **Cache-size conclusions do NOT transfer between prompt lengths** —

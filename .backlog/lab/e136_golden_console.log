@@ -1,0 +1,11 @@
+binary md5: 7083f237a0df3d14130ad284395b23a2
+expected sacred:   5d04890413ff539e802985ce8c727814
+expected shipping: cc09015d089d9a25d10d75753f9e849a
+== golden.sh (BASELINE=1; pack must be locked) ==
+golden_rc=0
+PASS golden md5=5d04890413ff539e802985ce8c727814
+== golden_default.sh (shipping; pack now unlocked by default) ==
+golden_default_rc=0
+PASS golden_default md5=cc09015d089d9a25d10d75753f9e849a
+logs: .backlog/lab/e136_golden_20260831-124946.log .backlog/lab/e136_golden_default_20260831-124946.log
+E136_GOLDEN_DONE
