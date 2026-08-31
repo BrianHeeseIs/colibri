@@ -1,0 +1,6 @@
+e136 pack-policy gate   binary_md5=0d36668a19a0078aa506968ca9e13d21
+  FAIL  arm1  COLI_V4_PACK_GATE_NOOP=1                       expected=unlocked actual=locked (rc=0)
+  ok    arm2  COLI_V4_BASELINE=1                             pack=locked
+  ok    arm3  COLI_V4_HOT_PACK_UNLOCKED=0                    pack=locked
+  ok    arm4  COLI_V4_BASELINE=1 COLI_V4_HOT_PACK_UNLOCKED=1 pack=unlocked
+e136_pack_default: 1 of 4 arms failed

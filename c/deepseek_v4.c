@@ -8974,10 +8974,19 @@ int COLI_V4_ROWS16_STORE_OPEN(
     policy->next = hot_policies; hot_policies = policy;
     pthread_mutex_unlock(&hot_policies_mutex);
     (*output)->ops = &hot_operations;
+    /* pack= reports whether packing runs inside state->mutex (locked) or outside it via the
+     * per-slot pack mutexes (unlocked). Without it the pack policy is invisible, which is the
+     * same silent-state class that forced an INDETERMINATE verdict on COLI_V4_PREWARM: the only
+     * other evidence is store_lock collapsing under COLI_V4_DECODE_TRACE.
+     * Appended to the END of this existing line on purpose. It is md5-safe because this line is
+     * emitted at store open, well before generated_text=, and the harness ext() functions only
+     * begin capturing ON that marker -- NOT because v4_hot_policy is stripped, which it is not.
+     * Do not move this fprintf after generation, and do not invent a new prefix for it. */
     fprintf(stderr,
             "v4_hot_policy pin_slots_per_layer=%d repin_interval=%llu "
-            "mode=resident-ram rows16=hot-pins\n", pin_count,
-            (unsigned long long)policy->repin_interval);
+            "mode=resident-ram rows16=hot-pins pack=%s\n", pin_count,
+            (unsigned long long)policy->repin_interval,
+            pack_unlocked ? "unlocked" : "locked");
     /* Prewarm reports what it did, always. Previously it printed only on partial failure, so a
      * run where prewarm was requested but silently skipped -- because no usage history had been
      * seeded -- was indistinguishable from one where it ran and simply did not help. E133b hit
