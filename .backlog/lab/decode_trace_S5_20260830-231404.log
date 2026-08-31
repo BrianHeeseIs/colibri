@@ -1,0 +1,70 @@
+v4_kernels active=attn_sparse,router
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/Users/cptn/workbench/ai/colibri/models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_autopin warmed=688 requested=688 bytes=8.566GiB time=1.941s
+v4_cli mode=chat memory=limited target_only=1
+v4_dense_resident layers=43 bytes=6.267GiB
+You have accurately described the core mechanics of Mixture of Experts (MoE) in transformers, and your observation about the prefill phase is spot on. 
+
+To build on your summary, here is
+v4_profile phase=embed total_ms=2.065 calls=39
+v4_profile phase=hc_norm total_ms=405.619 calls=3354
+v4_profile phase=attention total_ms=5849.189 calls=1677
+v4_profile phase=rope total_ms=35.896 calls=1677
+v4_profile phase=compressor total_ms=547.026 calls=1599
+v4_profile phase=indexer total_ms=452.201 calls=819
+v4_profile phase=router total_ms=128.493 calls=1677
+v4_profile phase=shared_expert total_ms=957.976 calls=1677
+v4_profile phase=expert_wait total_ms=1405.459 calls=20124
+v4_profile phase=expert_forward total_ms=7510.598 calls=10062
+v4_profile phase=head total_ms=498.263 calls=39
+v4_profile phase=attn_qkv total_ms=1768.747 calls=1677
+v4_profile phase=attn_kv_assembly total_ms=13.695 calls=1677
+v4_profile phase=attn_sparse total_ms=232.161 calls=1677
+v4_profile phase=attn_out total_ms=3782.638 calls=1677
+v4_profile phase=attn_other total_ms=51.948 calls=1677
+v4_profile phase=other total_ms=170.147
+v4_profile decode_tokens=39 decode_wall_ms=17927.037 accounted_pct=99.1
+v4_profile decode_trace config decode_tokens=39 decode_wall_ms=17927.037 stages=26
+v4_profile decode_trace table=wait stage=wait_start_lock total_ms=1.370 calls=10062 mean_ns=136.2 pct_decode=0.008
+v4_profile decode_trace table=wait stage=wait_start_scan total_ms=1.298 calls=10062 mean_ns=129.0 pct_decode=0.007
+v4_profile decode_trace table=wait stage=wait_start_idle_block total_ms=0.000 calls=0 mean_ns=0.0 pct_decode=0.000
+v4_profile decode_trace table=wait stage=wait_start_publish total_ms=18.000 calls=10062 mean_ns=1788.9 pct_decode=0.100
+v4_profile decode_trace table=wait stage=wait_finish_lock total_ms=0.479 calls=10062 mean_ns=47.6 pct_decode=0.003
+v4_profile decode_trace table=wait stage=wait_finish_complete_block total_ms=1382.867 calls=10062 mean_ns=137434.6 pct_decode=7.714
+v4_profile decode_trace table=wait stage=wait_finish_release total_ms=0.506 calls=10062 mean_ns=50.3 pct_decode=0.003
+v4_profile decode_trace table=wait stage=total total_ms=1404.520 pct_decode=7.835
+v4_profile decode_trace table=wait_counters stage=start_calls count=10062 calls=10062
+v4_profile decode_trace table=wait_counters stage=start_slept_calls count=0 calls=0
+v4_profile decode_trace table=wait_counters stage=finish_calls count=10062 calls=10062
+v4_profile decode_trace table=wait_counters stage=finish_completed_at_entry count=9352 calls=9352
+v4_profile decode_trace table=wait_counters stage=finish_slept_calls count=710 calls=710
+v4_profile decode_trace table=wait_counters stage=finish_wake_iterations count=106 calls=49
+v4_profile decode_trace table=store_nested stage=store_lock total_ms=599.980 calls=10062 mean_ns=59628.3 pct_decode=3.347
+v4_profile decode_trace table=store_nested stage=store_hit_scan total_ms=43.466 calls=9328 mean_ns=4659.8 pct_decode=0.242
+v4_profile decode_trace table=store_nested stage=store_miss_select total_ms=3.297 calls=734 mean_ns=4491.1 pct_decode=0.018
+v4_profile decode_trace table=store_nested stage=store_slab_alloc total_ms=6.831 calls=466 mean_ns=14659.3 pct_decode=0.038
+v4_profile decode_trace table=store_nested stage=store_disk_read total_ms=2859.391 calls=734 mean_ns=3895628.1 pct_decode=15.950
+v4_profile decode_trace table=store_nested stage=store_publish total_ms=22.032 calls=10062 mean_ns=2189.6 pct_decode=0.123
+v4_profile decode_trace table=store_nested stage=store_pack total_ms=740.827 calls=3887 mean_ns=190590.9 pct_decode=4.132
+v4_profile decode_trace note=store_nested_is_nonadditive_due_to_worker_overlap
+v4_profile decode_trace table=omp stage=omp_hc_pre_wall total_ms=296.004 calls=3354 mean_ns=88253.9 pct_decode=1.651
+v4_profile decode_trace table=omp stage=omp_head_wall total_ms=0.000 calls=0 mean_ns=0.0 pct_decode=0.000
+v4_profile decode_trace table=omp stage=omp_sparse_wall total_ms=231.259 calls=1677 mean_ns=137900.6 pct_decode=1.290
+v4_profile decode_trace table=control stage=tensor_lookup total_ms=2.740 calls=1677 mean_ns=1634.1 pct_decode=0.015
+v4_profile decode_trace table=control stage=decode_alloc total_ms=4.791 calls=5070 mean_ns=945.0 pct_decode=0.027
+v4_profile decode_trace table=io stage=io_crosscheck total_ms=2859.391 calls=734 mean_ns=3895628.1 pct_decode=15.950
+v4_profile decode_trace_total_calls=138392 stages_nonzero=23/26
+v4_tokens prompt=184 generated=40 total=224 expert_requests=21676 hits=15245 misses=6252 hit_rate=70.331 bytes=83585138688 target_only=1
+generated_text=You have accurately described the core mechanics of Mixture of Experts (MoE) in transformers, and your observation about the prefill phase is spot on. 
+
+To build on your summary, here is
+timing time_to_first_token=41.437s after_first=17.927s
+v4_rows16 packed_slots=959 expert_calls_rows16=4433 expert_calls_scalar=10826
+v4_direct reads=6940 flock_reads=0 fallbacks=0 payload_bytes=87325409280
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=644 metal_fp8_upload_mb=1.1
+metal_fp8_ms total=5602.6 memcpy_in=25.1 dispatch_wait=5517.4 memcpy_out=59.9
+fp8_qdq_ms=1144.6 fp8_qdq_melems=137.7

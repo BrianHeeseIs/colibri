@@ -1,0 +1,21 @@
+binary md5: a6f6726e205a6fd7b491505d46725df3
+== golden.sh (sacred, expect 5d04890413ff539e802985ce8c727814) ==
+golden_rc=0
+WARMUP golden max_tokens=1
+RUN golden max_tokens=60
+PASS golden md5=5d04890413ff539e802985ce8c727814
+== golden_default.sh (shipping, expect cc09015d089d9a25d10d75753f9e849a) ==
+golden_default_rc=0
+RUN golden_default max_tokens=60 (engine defaults, no COLI_V4_BASELINE)
+PASS golden_default md5=cc09015d089d9a25d10d75753f9e849a
+== arm=headwall env='<defaults>' ==
+  rc=0  log=e134_headwall_20260831-113717.log
+  (c) omp_head_wall: stage=omp_head_wall total_ms=495.967 calls=39
+  (a) prewarm line : <none>
+  misses/wall      : stage=store_disk_read total_ms=2942.141 calls=765
+== arm=prewarm env='COLI_V4_PREWARM=1' ==
+  rc=0  log=e134_prewarm_20260831-113717.log
+  (c) omp_head_wall: stage=omp_head_wall total_ms=476.367 calls=39
+  (a) prewarm line : v4_hot_policy prewarm=ran partial=0
+  misses/wall      : stage=store_disk_read total_ms=2927.741 calls=734
+E134_VERIFY_DONE

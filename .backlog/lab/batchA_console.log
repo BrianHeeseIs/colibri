@@ -1,0 +1,56 @@
+batchA  tokens=40 prompt=p256.txt binary_md5=7d454de9ba229e0ea083845a7a9e594b
+  R0  rc=0   mem=96   env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_R0_20260831-112615.log
+verify_field: decode_trace_R0_20260831-112615.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_R0_20260831-112615.log target_slots = 164 (actual 164)
+verify_field: decode_trace_R0_20260831-112615.log head_tier = resident-bf16 (actual resident-bf16)
+  R1  rc=0   mem=96   env=COLI_V4_HOT_PACK_UNLOCKED=1      text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_R1_20260831-112718.log
+verify_field: decode_trace_R1_20260831-112718.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_R1_20260831-112718.log target_slots = 164 (actual 164)
+verify_field: decode_trace_R1_20260831-112718.log head_tier = resident-bf16 (actual resident-bf16)
+  R2  rc=0   mem=96   env=COLI_V4_HOT_PACK_UNLOCKED=1      text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_R2_20260831-112819.log
+verify_field: decode_trace_R2_20260831-112819.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_R2_20260831-112819.log target_slots = 164 (actual 164)
+verify_field: decode_trace_R2_20260831-112819.log head_tier = resident-bf16 (actual resident-bf16)
+  R3  rc=0   mem=96   env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_R3_20260831-112920.log
+verify_field: decode_trace_R3_20260831-112920.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_R3_20260831-112920.log target_slots = 164 (actual 164)
+verify_field: decode_trace_R3_20260831-112920.log head_tier = resident-bf16 (actual resident-bf16)
+  M1  rc=0   mem=108  env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_M1_20260831-113022.log
+verify_field: decode_trace_M1_20260831-113022.log target_slots != 164 (actual 186)
+verify_field: decode_trace_M1_20260831-113022.log head_tier = resident-bf16 (actual resident-bf16)
+  M2  rc=0   mem=120  env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_M2_20260831-113123.log
+verify_field: decode_trace_M2_20260831-113123.log target_slots != 164 (actual 183)
+verify_field: decode_trace_M2_20260831-113123.log head_tier = resident-bf16 (actual resident-bf16)
+  R4  rc=0   mem=96   env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_R4_20260831-113225.log
+verify_field: decode_trace_R4_20260831-113225.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_R4_20260831-113225.log target_slots = 164 (actual 164)
+verify_field: decode_trace_R4_20260831-113225.log head_tier = resident-bf16 (actual resident-bf16)
+
+binary md5 before=7d454de9ba229e0ea083845a7a9e594b after=7d454de9ba229e0ea083845a7a9e594b (unchanged: both golden verdicts still hold)
+
+arm     lock_ms    pack_ms hitscan_ms waitblk_ms    disk_ms    misses  expfwd_ms   rows16   wall_ms
+R0      453.427    714.981     44.937   1519.539   3041.047       764   7562.076     4478 18045.323
+R1       36.708    776.163     44.994   1573.352   2968.497       765   7156.032     4445 17659.881
+R2       36.714    776.287     45.207   1571.531   2968.705       765   7190.069     4447 17667.376
+R3      455.234    706.169     44.991   1440.634   2932.217       765   7481.485     4492 17847.326
+M1      443.608    703.055     45.594   1409.780   2675.738       705   7492.750     4511 17865.059
+M2      470.091    714.079     45.108   1404.372   2706.015       718   7498.560     4491 17823.469
+R4      451.686    709.739     44.695   1431.814   2918.178       765   7473.603     4481 17815.614
+
+arm      ttft_s   decode_s    tok_s   packed_slots pack_calls
+R0       43.051     18.045   2.1613            909 3903
+R1       42.527     17.660   2.2084            886 3906
+R2       42.219     17.667   2.2075            882 3913
+R3       42.789     17.847   2.1852            903 3910
+M1       42.602     17.865   2.1830            913 3911
+M2       42.676     17.823   2.1882            907 3913
+R4       42.654     17.816   2.1890            905 3911
+
+md5 R0  d06053793d8f66d4f69a3f7c810441e1
+md5 R1  d06053793d8f66d4f69a3f7c810441e1
+md5 R2  d06053793d8f66d4f69a3f7c810441e1
+md5 R3  d06053793d8f66d4f69a3f7c810441e1
+md5 M1  d06053793d8f66d4f69a3f7c810441e1
+md5 M2  d06053793d8f66d4f69a3f7c810441e1
+md5 R4  d06053793d8f66d4f69a3f7c810441e1
+batchA: COMPLETE (all arms ran and applied their requested settings)

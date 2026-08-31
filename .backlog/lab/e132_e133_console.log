@@ -1,0 +1,57 @@
+envsweep  tokens=40 prompt=p256.txt binary_md5=7d454de9ba229e0ea083845a7a9e594b
+  S0  rc=0   mem=96   env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_S0_20260830-230857.log
+verify_field: decode_trace_S0_20260830-230857.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_S0_20260830-230857.log target_slots = 164 (actual 164)
+verify_field: decode_trace_S0_20260830-230857.log head_tier = resident-bf16 (actual resident-bf16)
+  S1  rc=0   mem=96   env=COLI_V4_HOT_PACK_UNLOCKED=1      text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_S1_20260830-230958.log
+verify_field: decode_trace_S1_20260830-230958.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_S1_20260830-230958.log target_slots = 164 (actual 164)
+verify_field: decode_trace_S1_20260830-230958.log head_tier = resident-bf16 (actual resident-bf16)
+  S2  rc=0   mem=96   env=COLI_V4_HOT_PACK_UNLOCKED=1      text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_S2_20260830-231059.log
+verify_field: decode_trace_S2_20260830-231059.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_S2_20260830-231059.log target_slots = 164 (actual 164)
+verify_field: decode_trace_S2_20260830-231059.log head_tier = resident-bf16 (actual resident-bf16)
+  S3  rc=0   mem=96   env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_S3_20260830-231200.log
+verify_field: decode_trace_S3_20260830-231200.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_S3_20260830-231200.log target_slots = 164 (actual 164)
+verify_field: decode_trace_S3_20260830-231200.log head_tier = resident-bf16 (actual resident-bf16)
+  S4  rc=0   mem=48   env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_S4_20260830-231301.log
+verify_field: decode_trace_S4_20260830-231301.log target_slots != 164 (actual 74)
+verify_field: decode_trace_S4_20260830-231301.log head_tier = resident-bf16 (actual resident-bf16)
+  S5  rc=0   mem=96   env=COLI_V4_PREWARM=1                text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_S5_20260830-231404.log
+verify_field: decode_trace_S5_20260830-231404.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_S5_20260830-231404.log target_slots = 164 (actual 164)
+verify_field: decode_trace_S5_20260830-231404.log head_tier = resident-bf16 (actual resident-bf16)
+  S6  rc=0   mem=96   env=<defaults>                       text_md5=d06053793d8f66d4f69a3f7c810441e1 log=decode_trace_S6_20260830-231507.log
+verify_field: decode_trace_S6_20260830-231507.log pin_slots_applied = 16 (actual 16)
+verify_field: decode_trace_S6_20260830-231507.log target_slots = 164 (actual 164)
+verify_field: decode_trace_S6_20260830-231507.log head_tier = resident-bf16 (actual resident-bf16)
+
+binary md5 before=7d454de9ba229e0ea083845a7a9e594b after=7d454de9ba229e0ea083845a7a9e594b (unchanged: both golden verdicts still hold)
+
+arm     lock_ms    pack_ms hitscan_ms waitblk_ms    disk_ms    misses  expfwd_ms   rows16   wall_ms
+S0      487.674    701.982     44.021   1444.540   2909.908       765   7358.366     4497 17590.189
+S1       35.021    779.433     44.094   1527.684   2897.784       765   7059.949     4449 17376.284
+S2       36.174    772.591     43.909   1538.469   2903.804       765   7098.558     4457 17441.344
+S3      441.174    710.593     44.286   1427.307   2912.127       765   7436.282     4482 17685.132
+S4      434.703    711.722     36.919   3773.646   9395.807      2364   7440.179     4426 20045.164
+S5      599.980    740.827     43.466   1382.867   2859.391       734   7510.598     4433 17927.037
+S6      539.859    773.956     42.711   1475.790   2938.253       765   7603.018     4497 18182.173
+
+arm      ttft_s   decode_s    tok_s   packed_slots pack_calls
+S0       42.754     17.590   2.2172            907 3913
+S1       42.318     17.376   2.2445            887 3915
+S2       42.375     17.441   2.2361            886 3920
+S3       42.544     17.685   2.2053            909 3911
+S4       42.741     20.045   1.9456           1046 3786
+S5       41.437     17.927   2.1755            959 3887
+S6       42.692     18.182   2.1450            909 3916
+
+md5 S0  d06053793d8f66d4f69a3f7c810441e1
+md5 S1  d06053793d8f66d4f69a3f7c810441e1
+md5 S2  d06053793d8f66d4f69a3f7c810441e1
+md5 S3  d06053793d8f66d4f69a3f7c810441e1
+md5 S4  d06053793d8f66d4f69a3f7c810441e1
+md5 S5  d06053793d8f66d4f69a3f7c810441e1
+md5 S6  d06053793d8f66d4f69a3f7c810441e1
+envsweep: COMPLETE (all arms ran and applied their requested settings)
