@@ -1,0 +1,41 @@
+== KAT: extractor against the committed E130 arm ==
+  ok    store_disk_read_calls              765
+  ok    store_disk_read_ms                 2987.867
+  ok    wait_finish_complete_ms            1488.243
+  ok    finish_slept_calls                 723
+  ok    finish_completed_at_entry          9339
+  ok    start_slept_calls                  0
+  ok    expert_forward_ms                  7485.917
+  ok    decode_wall_ms                     17885.966
+  ok    expert_calls_rows16                4484
+  ok    expert_calls_scalar                10775
+  ok    pin_slots_applied                  16
+== GUARD: verify_applied must reject a clamped arm ==
+  ok    verify_applied 16 (true)           0
+  ok    verify_applied 48 (clamped)        rejected as required (rc=1)
+== KAT: E132/E133 fields (store_lock is the E132 gate quantity) ==
+  FAIL  store_pack_ms                      expected=697.363 actual=UNKNOWN_FIELD
+  FAIL  store_pack_calls                   expected=3910 actual=UNKNOWN_FIELD
+  FAIL  store_lock_ms                      expected=471.319 actual=UNKNOWN_FIELD
+  FAIL  store_hit_scan_ms                  expected=44.877 actual=UNKNOWN_FIELD
+  FAIL  packed_slots                       expected=902 actual=UNKNOWN_FIELD
+  FAIL  target_slots                       expected=164 actual=UNKNOWN_FIELD
+  FAIL  head_tier                          expected=resident-bf16 actual=UNKNOWN_FIELD
+  FAIL  ram_available_gib                  expected=96.00 actual=UNKNOWN_FIELD
+== KAT: cross-log, parsers must track the arm not a constant ==
+  FAIL  on1_store_lock_ms                  expected=466.225 actual=UNKNOWN_FIELD
+  FAIL  on1_store_pack_calls               expected=3908 actual=UNKNOWN_FIELD
+  FAIL  on1_packed_slots                   expected=904 actual=UNKNOWN_FIELD
+  FAIL  a2_store_lock_ms                   expected=981.905 actual=UNKNOWN_FIELD
+  FAIL  a2_store_pack_ms                   expected=1760.313 actual=UNKNOWN_FIELD
+  FAIL  a2_store_pack_calls                expected=8370 actual=UNKNOWN_FIELD
+  FAIL  a2_store_hit_scan_ms               expected=757.773 actual=UNKNOWN_FIELD
+  FAIL  a2_packed_slots                    expected=4568 actual=UNKNOWN_FIELD
+== GUARD: verify_field, equality and inequality ==
+  FAIL  verify_field slots = 164           expected=0 actual=2
+  ok    verify_field slots != 164          rejected as required
+  ok    verify_field head demoted          rejected as required
+== GUARD: pgrep -x must not match a caller that merely names c/deepseek_v4 ==
+  ok    pgrep -x vs own cmdline            no false positive
+pinsweep_extract: 17 checks failed
+rc=1
