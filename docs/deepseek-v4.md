@@ -106,6 +106,10 @@ Metal environment variable a silent no-op — check with
 | `COLI_V4_METAL_STATS=1` | off | print dispatch, reject and `simd_exact` counters at exit |
 | `COLI_V4_MOE_GROUPED_STATS=1` | off | print group counts, `metal_row_share` and the group-size histogram |
 | `COLI_V4_FP8_ROWS16` | **on** | NEON rows16 fp8 matvec for DECODE attention projections. Bit-exact, +10.18% tok/s (E125) |
+| `COLI_V4_HOT_PACK_UNLOCKED` | **on** | pack experts outside `state->mutex`, the mutex the loader needs to publish. Removes 91.92% of main-thread lock time; bit-exact, both goldens unchanged. Decode wall -1.58% (E136). The engine reports which policy is live as `pack=locked\|unlocked` on the `v4_hot_policy` line |
+| `COLI_V4_DECODE_TRACE=1` | off | decompose decode into 26 stages under the `v4_profile ` prefix. Use with `COLI_V4_PROFILE=1`. Costs 0.26% of tok/s, so profile before guessing (E130) |
+| `COLI_V4_PREWARM=1` | off | prewarm history-pinned experts before the run. Reports `prewarm=ran partial=N` or `prewarm=skipped reason=no-history-seed` so a silent no-op is distinguishable from a null result. Measured a weak null: misses -4.05% (E133b) |
+| `COLI_V4_PIN_SLOTS` | `16` | pinned experts per layer. **Do not raise it** — dead on both axes: kernel coverage (1.00-1.14x) and miss rate (E131 measured it actively harmful, tok/s -3.15%/-4.22%) |
 | `COLI_V4_FP8_ROWS16_MAXMB` | 8192 | legacy cap from the rejected shadow-copy design; the in-place permute uses no extra memory |
 | `COLI_V4_HEAD_ILP` | **on** | four vocabulary rows in flight in the LM head. Bit-exact, head phase -62% (E126) |
 | `COLI_V4_HC_OMP` | **on** | parallelise the hyper-connection mix matvec. Bit-exact, phase -63% (E126) |

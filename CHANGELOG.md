@@ -8,7 +8,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 DeepSeek-V4 performance on Apple silicon — prefill and decode. Measured end to end against the
 historical engine (`COLI_V4_BASELINE=1`) at p256, N=3, both arms deterministic: **tok/s +54.83%
 (1.3948 to 2.1596), time to first token -62.4%, net wall at 40 tokens -57.1%**. Full evidence in
-`experiments_results.md` E114-E128.
+`experiments_results.md` E114-E128 and `.backlog/E13x-*.md` for E130-E136.
+
+Since then the decode path has been **measured rather than inferred**. A 26-stage decode trace
+(`COLI_V4_DECODE_TRACE=1`) established that main-thread wait is 8.47% of decode wall, that 98.5% of
+it is a single condvar park, and that the park happens if and only if an expert misses the cache
+(723 parks against 765 disk reads). `store_disk_read` is the largest single stage at 16.7% of decode
+wall, and the async loader already hides half of it. Three levers were then closed on measurement
+rather than argument, and one previously rejected lever was resurrected.
 
 That headline is the whole stack, not any single change, and it is worth reading twice before it is
 quoted. `COLI_V4_BASELINE=1` also disables `COLI_V4_KERNELS=all`, so it starts below the CPU arm the
@@ -36,6 +43,27 @@ individual experiments were measured from. Referenced to that arm instead, the p
 
 ### Changed
 
+- **`COLI_V4_HOT_PACK_UNLOCKED` now defaults on** (E136). Expert packing moves out of
+  `state->mutex`, the mutex the loader needs to publish a completed read, which removes **91.92%**
+  of main-thread lock time (`store_lock` 454.331 to 36.711 ms at p256). Output is byte-identical
+  and both golden gates are unchanged, so `bench/GOLDEN_DEFAULT_MD5` did not need re-recording.
+  The end-to-end gain is deliberately reported as modest: decode wall -1.58%, tok/s +1.60%, the
+  latter inside the noise floor. `wait_finish_complete_block` actually *rose* 6.24%, because
+  freeing the lock lets the main thread reach the finish barrier sooner and wait longer for disk.
+  Disk, not the lock, is the binding constraint. Its earlier rejection as "worthless" measured
+  **TTFT at p064** — the prefill axis — before any decode instrument existed.
+- **The engine reports which pack policy is live**, as `pack=locked|unlocked` on the existing
+  `v4_hot_policy` line, and **reports what prewarm did** (`prewarm=ran partial=0` /
+  `prewarm=skipped reason=no-history-seed`). Both close silent-state gaps that had already forced
+  one experiment to an INDETERMINATE verdict.
+- **`omp_head_wall` is now wired to the resident head path.** It previously recorded zero calls
+  because only the non-resident bf16 site was instrumented while the shipping build takes resident
+  `head_ilp` — the region was *unmeasured*, not zero. Measured: 2.78% of decode wall, which takes
+  OpenMP master-side from a recorded 2.90% to **5.72%**.
+- **`v4_prefill_trace` added to every `generated_text` strip list** (5 lab harnesses and both golden
+  gates). Enabling `COLI_V4_PREFILL_TRACE` during a `tokps.sh` run previously leaked trace lines
+  into the extracted text and manufactured a false "not bit-exact" verdict. Both golden hashes are
+  unchanged by the fix, which is the proof the added prefix is inert for current output.
 - **The engine now ships the measured-fastest stack by default.** `COLI_V4_KERNELS=all`,
   `COLI_V4_MOE_GROUPED`, `COLI_V4_MOE_BATCHED`, `COLI_V4_MOE_BATCHED_ROWS16`,
   `COLI_V4_MOE_WHOLE_PROMPT`, `COLI_V4_METAL_ATTN` and `COLI_V4_METAL_VARIANT=simd_exact_cold` all
