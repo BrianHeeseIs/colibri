@@ -8978,10 +8978,21 @@ int COLI_V4_ROWS16_STORE_OPEN(
             "v4_hot_policy pin_slots_per_layer=%d repin_interval=%llu "
             "mode=resident-ram rows16=hot-pins\n", pin_count,
             (unsigned long long)policy->repin_interval);
+    /* Prewarm reports what it did, always. Previously it printed only on partial failure, so a
+     * run where prewarm was requested but silently skipped -- because no usage history had been
+     * seeded -- was indistinguishable from one where it ran and simply did not help. E133b hit
+     * exactly that ambiguity and had to be recorded INDETERMINATE rather than as a result.
+     * Rides the existing v4_hot_policy prefix, which is already in the harness strip lists. */
     const char *prewarm = getenv("COLI_V4_PREWARM");
-    if (policy->history_seeded && prewarm && atoi(prewarm) != 0 &&
-        hot_prewarm_history(policy, state))
-        fprintf(stderr, "v4_autopin warning=partial-warmup; continuing\n");
+    int prewarm_requested = prewarm && *prewarm && atoi(prewarm) != 0;
+    if (prewarm_requested && !policy->history_seeded) {
+        fprintf(stderr, "v4_hot_policy prewarm=skipped reason=no-history-seed\n");
+    } else if (prewarm_requested) {
+        int partial = hot_prewarm_history(policy, state);
+        fprintf(stderr, "v4_hot_policy prewarm=ran partial=%d\n", partial);
+        if (partial)
+            fprintf(stderr, "v4_autopin warning=partial-warmup; continuing\n");
+    }
     return 0;
 }
 
@@ -10182,6 +10193,14 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
                 COLI_V4_DT_DECODE_ALLOC,
                 coli_v4_decode_trace_clock_ns() - dt_head_alloc_began);
         if (!scores) return -1;
+        /* Decode trace, table=omp. E130 reported omp_head_wall with ZERO calls because the only
+         * instrumented head site was the non-resident bf16 path, while the shipping build takes
+         * this resident one -- so the head OMP region was UNMEASURED, not measured-as-zero, and
+         * the 2.90% OpenMP total was a floor. This wraps the resident region, covering both the
+         * head_ilp and the plain bf16 branch below, master-side only and without touching either
+         * region body. */
+        const int dt_head = coli_v4_decode_trace_on;
+        uint64_t dt_head_began = dt_head ? coli_v4_decode_trace_clock_ns() : 0;
         if (coli_v4_head_ilp_enabled()) {
             const int blocks = vocab / 4;
             #pragma omp parallel for schedule(static)
@@ -10204,6 +10223,10 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
             scores[row] = head_bf16_dot(weight, hidden, d);
         }
         }
+        if (dt_head)
+            coli_v4_decode_trace_note(
+                COLI_V4_DT_OMP_HEAD_WALL,
+                coli_v4_decode_trace_clock_ns() - dt_head_began);
         int winner = -1;
         float maximum = -FLT_MAX;
         for (int row = 0; row < vocab; row++)
