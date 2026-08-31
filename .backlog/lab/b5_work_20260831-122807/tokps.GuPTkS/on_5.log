@@ -1,0 +1,17 @@
+v4_kernels active=attn_sparse,router
+ram_tiers available=96.00GiB dense=resident(6.27GiB) target_slots=164 target_cache=87.81GiB head=resident-bf16 projected=95.95GiB
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/Users/cptn/workbench/ai/colibri/models/deepseek-v4-flash/.coli_usage selections=14190
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_cli mode=chat memory=limited target_only=1
+v4_dense_resident layers=43 bytes=6.267GiB
+You have provided a paragraph that is repeated four times. It describes the core concepts of **Mixture of Experts (MoE)** in transformer models, specifically focusing on the efficiency benefits during the **pre
+v4_tokens prompt=366 generated=40 total=406 expert_requests=24278 hits=16172 misses=7791 hit_rate=66.612 bytes=104160559104 target_only=1
+generated_text=You have provided a paragraph that is repeated four times. It describes the core concepts of **Mixture of Experts (MoE)** in transformer models, specifically focusing on the efficiency benefits during the **pre
+timing time_to_first_token=68.027s after_first=17.829s
+v4_rows16 packed_slots=961 expert_calls_rows16=4598 expert_calls_scalar=10094
+v4_direct reads=7791 flock_reads=0 fallbacks=0 payload_bytes=98033467392
+metal_fp8_cache_full_events=0
+metal_fp8_dispatches=1289 metal_fp8_upload_mb=1.1
+metal_fp8_ms total=10275.8 memcpy_in=48.6 dispatch_wait=10146.3 memcpy_out=80.4
+fp8_qdq_ms=2290.1 fp8_qdq_melems=274.0

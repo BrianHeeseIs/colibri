@@ -1,0 +1,21 @@
+seed md5: 599f3d12e9347ef30541bd6f9ba18bde  (expect 599f3d12e9347ef30541bd6f9ba18bde)
+tok/s A/B  tokens=40  N=5  prompt=p512.txt
+  run1 off                    ttft=  90.959s decode=  30.070s tok/s=1.2970   md5=d7f7c51a0421eb149360131e10450a6b
+  run1 on                     ttft=  68.341s decode=  17.936s tok/s=2.1744   md5=d7f7c51a0421eb149360131e10450a6b
+  run2 off                    ttft=  83.387s decode=  21.186s tok/s=1.8408   md5=d7f7c51a0421eb149360131e10450a6b
+  run2 on                     ttft=  68.117s decode=  17.844s tok/s=2.1856   md5=d7f7c51a0421eb149360131e10450a6b
+  run3 off                    ttft=  83.328s decode=  20.976s tok/s=1.8593   md5=d7f7c51a0421eb149360131e10450a6b
+  run3 on                     ttft=  68.063s decode=  17.823s tok/s=2.1882   md5=d7f7c51a0421eb149360131e10450a6b
+  run4 off                    ttft=  83.422s decode=  20.954s tok/s=1.8612   md5=d7f7c51a0421eb149360131e10450a6b
+  run4 on                     ttft=  67.977s decode=  17.817s tok/s=2.1889   md5=d7f7c51a0421eb149360131e10450a6b
+  run5 off                    ttft=  83.377s decode=  20.928s tok/s=1.8635   md5=d7f7c51a0421eb149360131e10450a6b
+  run5 on                     ttft=  68.027s decode=  17.829s tok/s=2.1874   md5=d7f7c51a0421eb149360131e10450a6b
+
+SUMMARY (median tok/s)
+  off                      1.8593 tok/s  baseline            deterministic  md5=d7f7c51a0421eb149360131e10450a6b 
+  on                       2.1874 tok/s  +17.65% tok/s       deterministic  md5=d7f7c51a0421eb149360131e10450a6b 
+logs: /Users/cptn/workbench/ai/colibri/.backlog/lab/b5_work_20260831-122807/tokps.GuPTkS
+tokps_rc=0
+work dir retained: .backlog/lab/b5_work_20260831-122807
+tokps.GuPTkS
+E135_B5_DONE

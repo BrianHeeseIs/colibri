@@ -112,7 +112,13 @@ budget ~20 min for the pair. Report BOTH axes with N and the determinism verdict
 will NOT share an output md5 — the shipping path is capability-equivalent, not token-identical, so
 judge it with `.backlog/lab/taskcheck.sh`, never by hash equality.
 
-## B5 — p512 decode generalisation of E126/E127  (~16 min, PARKED)
+## B5 — p512 decode generalisation of E126/E127  *** DONE 2026-08-31, see E135 ***
+**RESULT: CONFIRMED.** D = +17.65% tok/s (off 1.8593 -> on 2.1874), non-overlapping ranges, N=5.
+TTFT -18.38%, net wall @40 tokens -17.70%. All ten runs across both arms shared ONE md5
+d7f7c51a0421eb149360131e10450a6b, so E126/E127 bit-exactness generalises to 512 tokens (8 chunks).
+Series is monotonic: p064 +13.20%, p256 +15.27%, p512 +17.65%. Full working in
+`.backlog/E135-b5-p512-generalisation.md`.
+
 Operator decision 2026-08-30: backlog for now.
 Third data point after p064 (+13.20%) and p256 (+15.27%). Cheaper than the old B1 estimate because
 tonight's work cut p512 TTFT substantially.
